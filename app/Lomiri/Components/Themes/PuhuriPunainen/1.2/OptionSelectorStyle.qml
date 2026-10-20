@@ -1,8 +1,8 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later
-// Modified 2026-10-16 by Puhuri 2 (fi.reijo.puhuri2): the module name, the type
-// names and the file names were renamed from Canonical's RevontuliSininen theme, and
-// the palette values come from ../ubuntu-touch-teemat. See README.md in
-// this directory and THIRD_PARTY_NOTICES.md in the repository.
+// SPDX-License-Identifier: LGPL-3.0-only
+// Modified by the ubuntu-touch-teemat project (colours and palette values,
+// 2026-10-03 -> 2026-10-16); this notice was added 2026-10-16. The original
+// Copyright and LGPL-3.0-only licence notice are kept below. This file is not
+// relicensed under the project's own LICENSE; see THIRD_PARTY_NOTICES.md.
 /*
  * Copyright 2013 Canonical Ltd.
  *

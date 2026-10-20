@@ -212,10 +212,14 @@ def wav_bytes(pcm, rate=48_000, channels=1):
 
 
 def peer_is_allowed(uid, label, expected_uid):
-    """Only Puhuri 2's enforced main-app profile may control the microphone."""
+    """Only Puhuri 2's enforced app profiles may control the microphone."""
+    allowed_profile = (
+        label.startswith("fi.reijo.puhuri2_puhuri_")
+        or label.startswith("fi.reijo.puhuri2_puhuri-daemon_")
+    )
     return (
         uid == expected_uid
-        and label.startswith("fi.reijo.puhuri2_puhuri_")
+        and allowed_profile
         and "(enforce)" in label
     )
 

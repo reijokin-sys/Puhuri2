@@ -4,10 +4,13 @@ Puhuri 2 is an XMPP messenger for Ubuntu Touch. It is a separate application
 with its own click identity (`fi.reijo.puhuri2`), configuration and application
 data. The original Puhuri project is not required.
 
-This is version 0.1.1, an early release. It supports one-to-one XMPP chat,
+This is version 0.1.6, an early release. It supports one-to-one XMPP chat,
 OMEMO encryption, message archive management (MAM), image attachments, voice
 messages and message notifications. The interface is available in English and
 Finnish.
+
+The interface includes three selectable themes: blue-black (default), red and
+green. Page headers follow the selected theme.
 
 ## Background messages
 
@@ -27,6 +30,8 @@ Build requirements and the exact commands are in the project tooling. A click
 contains:
 
 - the QML user interface and its Python socket client;
+- the arm64 Qt 5 QML recorder, built from
+  `tools/qaudio-plugin/puhuri_audio_plugin.cpp`;
 - the Rust XMPP daemon;
 - the confined daemon and push hooks;
 - the notifications helper and push helper.

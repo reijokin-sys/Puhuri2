@@ -159,7 +159,7 @@ def build_bundle() -> str:
         external_file(
             PROJECT / "app/Lomiri/Components/Themes/LICENSE.LGPL-3.0",
             "Puhuri 2 Lomiri theme modules",
-            "LGPL-3.0-or-later",
+            "LGPL-3.0-only",
         ),
     ]
 

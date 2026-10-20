@@ -776,6 +776,25 @@ impl Store {
             .is_some()
     }
 
+    /// Is this the id of a message **we** sent in this conversation?
+    ///
+    /// A sent carbon carries the original stanza's client id. When the
+    /// server sends our own stanza back (or has no stanza-id for it), this
+    /// check recognises the local outgoing row before either the timestamp
+    /// or the OMEMO ratchet is consulted.
+    pub fn has_outgoing_message(&self, thread: &str, id: &str) -> bool {
+        self.lock()
+            .query_row(
+                "SELECT 1 FROM messages WHERE thread = ?1 AND id = ?2 AND outgoing = 1",
+                params![thread, id],
+                |_| Ok(()),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
     /// Is there already a message at this exact moment in this conversation?
     ///
     /// The archive (MAM, XEP-0313) and the other devices' copies (carbons,

@@ -4,7 +4,7 @@ Type=Application
 Terminal=false
 Name=Puhuri 2
 Comment=Natiivi XMPP-viestinsovellus
-Exec=qmlscene %U qml/Main.qml
+Exec=qmlscene -I . %U qml/Main.qml
 Icon=assets/puhuri.png
 X-Ubuntu-Touch=true
 # Kaynnistysikkunan vari (2026-10-16 ilta 8, ks. docs/TEEMAT.md).
@@ -12,8 +12,6 @@ X-Ubuntu-Touch=true
 # Tassa oli aiemmin sahke-ajoilta peritty X-Ubuntu-Splash-Color=#2C001E, joka
 # ohitti teeman - se poistettiin siksi. Nyt Puhurilla on **omat** teemat eika
 # se enaa seuraa puhelimen teemaa, joten ikkunan varikin on kiinnitettava:
-# tassa on **punaisen teeman taustavari** (#3F1714), koska punainen on
-# oletusteema. Sovelluksen oma valinta ei vality kuorelle asti, joten
-# vihrean teeman kayttaja nakee hetken punaisen kaynnistysikkunan - se on
-# tietoinen valinta ja kirjattu (docs/DECISIONS.md).
-X-Ubuntu-Splash-Color=#3F1714
+# tassa on **sinimustan teeman taustavari** (#000000), koska sinimusta on
+# nyt oletusteema. Sovelluksen oma valinta ei vality kuorelle asti.
+X-Ubuntu-Splash-Color=#000000

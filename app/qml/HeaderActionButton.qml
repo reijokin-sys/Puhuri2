@@ -6,7 +6,6 @@
 
 import QtQuick 2.7
 import Lomiri.Components 1.3
-import "theme.js" as Themejs
 
 /*!
   The button the header's action bar draws an action with.
@@ -44,11 +43,9 @@ AbstractButton {
         // that only names its icon.
         source: button.iconSource
         name: button.action && button.action.iconName ? button.action.iconName : ""
-        // Puhurin oma vihreä: paneeli on Puhurin lila kaikissa teemoissa
-        // (app/qml/PuhuriHeader.qml), joten kuvakkeet ovat samaa vihreää kuin
-        // paneelin teksti. Estetty kuvake on himmennetty (opacity) eikä eri
-        // väri, jotta väri pysyy yhtenä.
-        color: Themejs.BRAND_GREEN
+        // The header uses the theme's base surface, so its icons use the
+        // matching text colour. Disabled icons are dimmed instead of recoloured.
+        color: theme.palette.normal.baseText
         opacity: button.enabled ? 1.0 : 0.4
     }
 }

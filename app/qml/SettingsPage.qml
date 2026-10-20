@@ -45,9 +45,9 @@ Page {
     signal deleteDataRequested()
     /// The user picked a language: "en" or "fi".
     signal languageRequested(string code)
-    /// The theme the user picked: "punainen" or "vihrea". Puhuri 2 has its own
-    /// two themes and does not follow the phone's (docs/TEEMAT.md).
-    property string themeKey: "punainen"
+    /// The theme the user picked: "punainen", "vihrea" or "sininen". Puhuri 2
+    /// has its own three themes and does not follow the phone's.
+    property string themeKey: "sininen"
     signal themeRequested(string key)
 
     header: PuhuriHeader {
@@ -95,10 +95,13 @@ Page {
 
             OptionSelector {
                 width: parent.width
-                model: [tr("settings.themeRed"), tr("settings.themeGreen")]
-                selectedIndex: page.themeKey === "vihrea" ? 1 : 0
+                model: [tr("settings.themeRed"), tr("settings.themeGreen"),
+                        tr("settings.themeBlue")]
+                selectedIndex: page.themeKey === "vihrea" ? 1
+                               : page.themeKey === "sininen" ? 2 : 0
                 onSelectedIndexChanged: {
-                    var key = selectedIndex === 1 ? "vihrea" : "punainen"
+                    var keys = ["punainen", "vihrea", "sininen"]
+                    var key = keys[selectedIndex] || "punainen"
                     if (key !== page.themeKey)
                         page.themeRequested(key)
                 }

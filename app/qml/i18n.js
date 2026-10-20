@@ -117,6 +117,7 @@ var strings = {
         "settings.theme": "Theme",
         "settings.themeRed": "Revontuli red",
         "settings.themeGreen": "Revontuli green",
+        "settings.themeBlue": "Revontuli blue-black",
         // New conversation / roster
         "roster.title": "New conversation",
         "roster.refresh": "Refresh",
@@ -234,6 +235,7 @@ var strings = {
         "settings.theme": "Teema",
         "settings.themeRed": "Revontuli punainen",
         "settings.themeGreen": "Revontuli vihreä",
+        "settings.themeBlue": "Revontuli sinimusta",
         "roster.title": "Uusi keskustelu",
         "roster.refresh": "Päivitä",
         "roster.address": "nimi@palvelin",

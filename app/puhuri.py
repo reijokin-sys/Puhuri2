@@ -433,6 +433,34 @@ def stop_voice():
     return _backend.request("message.stopVoice")
 
 
+def new_voice_path():
+    """Create the private destination for a QML audio recording."""
+    data_home = os.environ.get("XDG_DATA_HOME") or os.path.join(
+        os.path.expanduser("~"), ".local", "share")
+    directory = os.path.join(data_home, APP_ID, "recordings")
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    path = os.path.join(directory, "voice-%d.ogg" % int(time.time() * 1000))
+    try:
+        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(descriptor)
+    except OSError as error:
+        return {"ok": False, "error": {"code": "recording", "message": str(error)}}
+    return {"ok": True, "result": path}
+
+
+def stage_voice(thread, path, seconds):
+    """Stage a completed QML recording as the daemon's voice draft."""
+    if not os.path.isfile(str(path)):
+        return {
+            "ok": False,
+            "error": {"code": "recording", "message": "äänitiedostoa ei löytynyt"},
+        }
+    return _backend.request(
+        "message.stageVoice",
+        {"thread": str(thread), "path": str(path), "seconds": int(seconds)},
+    )
+
+
 def stage_image(thread, path):
     """Take the picked picture as a draft, so it can be looked at before it
     is sent. Nothing leaves the phone yet."""

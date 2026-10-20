@@ -12,6 +12,7 @@ import "fonts.js" as Fonts
 import "messages.js" as Messages
 import "i18n.js" as I18n
 import "theme.js" as Themejs
+import Puhuri.Audio 1.0
 import Qt.labs.settings 1.0
 
 MainView {
@@ -19,10 +20,10 @@ MainView {
     /// The strings of this page in the language the user chose.
     property string language: "en"
 
-    /// The theme the user chose ("punainen" or "vihrea"). Puhuri 2 does not
+    /// The theme the user chose ("sininen", "punainen" or "vihrea"). Puhuri 2 does not
     /// follow the phone's theme: the choice is ours, and the default is the
     /// red one (docs/TEEMAT.md).
-    property string themeKey: "punainen"
+    property string themeKey: "sininen"
 
     function tr(key) {
         return I18n.t(language, key)
@@ -80,11 +81,35 @@ MainView {
     property var conversationPageItem: null
     /// A local-data purge is running; a second confirmation must not race it.
     property bool deletingLocalData: false
+    property string voiceThread: ""
+    property string voicePath: ""
+    property real voiceStarted: 0
+    property bool voiceFinishPending: false
 
     ListModel { id: conversationModel }
     ListModel { id: rosterModel }
     ListModel { id: trustModel }
     ListModel { id: messageModel }
+
+    AudioRecorder {
+        id: voiceRecorder
+
+        onRecorderStateChanged: {
+            if (root.voiceFinishPending
+                    && recorderState === AudioRecorder.StoppedState) {
+                root.voiceFinishPending = false
+                root.finishVoice()
+            }
+        }
+        onErrorChanged: {
+            if (errorCode === AudioRecorder.NoError)
+                return
+            root.voiceFinishPending = false
+            if (root.conversationPageItem)
+                root.conversationPageItem.recording = false
+            root.showError(errorString)
+        }
+    }
 
     function showError(message) {
         if (!message)
@@ -491,9 +516,14 @@ MainView {
 
     function startVoice() {
         appLog("äänitys alkaa")
-        py.call("puhuri.start_voice", [root.currentThread], function (result) {
+        root.voiceThread = root.currentThread
+        py.call("puhuri.new_voice_path", [], function (result) {
             if (root.applyError(result))
                 return
+            root.voicePath = String(result.result || "")
+            root.voiceStarted = Date.now()
+            voiceRecorder.outputLocation = "file://" + root.voicePath
+            voiceRecorder.record()
             if (pageStack.currentPage === conversationPageItem)
                 conversationPageItem.recording = true
         })
@@ -506,7 +536,17 @@ MainView {
         appLog("äänitys lopetetaan")
         if (pageStack.currentPage === conversationPageItem)
             conversationPageItem.recording = false
-        py.call("puhuri.stop_voice", [], function (result) {
+        root.voiceFinishPending = true
+        voiceRecorder.stop()
+    }
+
+    function finishVoice() {
+        var seconds = Math.round(voiceRecorder.duration / 1000)
+        if (seconds < 1)
+            seconds = Math.max(1, Math.round((Date.now() - root.voiceStarted) / 1000))
+        appLog("äänitys valmis: " + seconds + " s")
+        py.call("puhuri.stage_voice",
+                [root.voiceThread, root.voicePath, seconds], function (result) {
             if (root.applyError(result))
                 return
             root.showDraft(result.result || null)
@@ -528,7 +568,7 @@ MainView {
     }
 
     /// Set the toolkit theme to one of ours - and keep it there. Puhuri 2 has
-    /// its own two themes and must not follow the phone's (docs/TEEMAT.md);
+    /// its own three themes and must not follow the phone's;
     /// the modules travel inside the click, so this is the same on every
     /// phone.
     function applyTheme(key) {
@@ -721,8 +761,8 @@ MainView {
             root.pushService = ""
             root.pushActive = false
             root.language = "en"
-            root.themeKey = "punainen"
-            root.applyTheme("punainen")
+            root.themeKey = "sininen"
+            root.applyTheme("sininen")
             root.resetToLogin()
             PopupUtils.open(errorDialog, root,
                             { text: I18n.t(root.language,
@@ -878,7 +918,7 @@ MainView {
     Settings {
         id: themeSettings
         fileName: "/home/phablet/.config/fi.reijo.puhuri2/theme.conf"
-        property string theme: "punainen"
+        property string theme: "sininen"
     }
 
     QtObject {

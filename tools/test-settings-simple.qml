@@ -79,6 +79,7 @@ Item {
                 "Teema",
                 "Revontuli punainen",
                 "Revontuli vihreä",
+                "Revontuli sinimusta",
                 "Ilmoitukset",
                 "Pidä yhteys auki",
                 "Push-ilmoitukset",

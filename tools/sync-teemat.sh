@@ -4,7 +4,8 @@
 #
 #   tools/sync-teemat.sh
 #
-# Puhuri 2 ei seuraa järjestelmän teemaa vaan valitsee itse oman moduulinsa
+# Puhuri 2 ei seuraa järjestelmän teemaa vaan valitsee itse kolmesta omasta
+# moduulistaan
 # (`docs/TEEMAT.md`). Moduulit toimitetaan klikin sisällä, joten sovellus
 # toimii samalla tavalla missä tahansa puhelimessa; **teemat-projekti on vain
 # värien lähde**, ei ajonaikainen riippuvuus. Kun väriä muutetaan siellä, tämä
@@ -58,7 +59,7 @@ copy_theme() {
         if ! head -1 "$file" | grep -q "SPDX-License-Identifier"; then
             tmp=$(mktemp)
             {
-                echo "// SPDX-License-Identifier: LGPL-3.0-or-later"
+                echo "// SPDX-License-Identifier: LGPL-3.0-only"
                 echo "// Modified $today by Puhuri 2 (fi.reijo.puhuri2): the module name, the type"
                 echo "// names and the file names were renamed from Canonical's $src theme, and"
                 echo "// the palette values come from ../ubuntu-touch-teemat. See README.md in"
@@ -71,8 +72,9 @@ copy_theme() {
 }
 
 copy_theme RevontuliSininen PuhuriPunainen RevontuliSininen PuhuriPunainen
-copy_theme RevontuliPurppura PuhuriVihrea   RevontuliPurppura PuhuriVihrea
-copy_theme Revontuli       PuhuriPerus     Revontuli         PuhuriPerus
+copy_theme RevontuliPurppura PuhuriVihrea RevontuliPurppura PuhuriVihrea
+copy_theme RevontuliMustavalkoinenSininen PuhuriSininen RevontuliMustavalkoinenSininen PuhuriSininen
+copy_theme Revontuli PuhuriPerus Revontuli PuhuriPerus
 
 # The LGPL-3.0 text travels with the files it covers (the QML files above carry
 # Canonical's LGPL header, and the licence says the text has to come along).
@@ -88,9 +90,10 @@ fi
 # ja perusteema nojaa työkalupakin omaan SuruDarkiin, joka on aina asennettu.
 echo "Lomiri.Components.Themes.PuhuriPerus" >"$TARGET/PuhuriPunainen/parent_theme"
 echo "Lomiri.Components.Themes.PuhuriPerus" >"$TARGET/PuhuriVihrea/parent_theme"
+echo "Lomiri.Components.Themes.PuhuriPerus" >"$TARGET/PuhuriSininen/parent_theme"
 echo "Lomiri.Components.Themes.SuruDark" >"$TARGET/PuhuriPerus/parent_theme"
 
-for module in PuhuriPunainen PuhuriVihrea PuhuriPerus; do
+for module in PuhuriPunainen PuhuriVihrea PuhuriSininen PuhuriPerus; do
     echo "--- $module"
     head -1 "$TARGET/$module/qmldir"
     echo "    parent: $(cat "$TARGET/$module/parent_theme")"

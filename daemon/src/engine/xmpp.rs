@@ -995,7 +995,7 @@ impl Engine for XmppEngine {
         let (content_type, voice, image) = super::kind_of_file(path);
         let target = self.copy_into_attachments(source, content_type)?;
         let draft = AttachmentDraft {
-            kind: "image".to_string(),
+            kind: if voice { "voice" } else { "image" }.to_string(),
             thread: thread.to_string(),
             path: target.to_string_lossy().to_string(),
             content_type: content_type.to_string(),
@@ -4536,6 +4536,19 @@ fn forwarded_context(
             (from.to_bare().to_string(), from.to_bare())
         }
     };
+    // A sent carbon carries the client id of the stanza we already stored as
+    // our outgoing row. The timestamps can differ and the server does not
+    // necessarily add a stanza-id, so this id is the reliable local-echo
+    // check. It must happen before OMEMO decryption: this device cannot open
+    // its own sent ciphertext, and attempting it used to create a visible
+    // "cannot decrypt" placeholder.
+    if outgoing {
+        if let Some(id) = forwarded.message.id.as_ref() {
+            if store.has_outgoing_message(&thread, &id.0) {
+                return None;
+            }
+        }
+    }
     // The same second: the message is already stored (our own sent message and
     // the carbon of it, for instance). A cheap check before decrypting.
     if store.has_message_at(&thread, ts) {

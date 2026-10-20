@@ -35,7 +35,11 @@ cp LICENSE THIRD_PARTY_NOTICES.md THIRD_PARTY_LICENSES.txt "$stage/"
 # module on the QML import paths, and `qmlscene` finds it in the working
 # directory, which for a click is the click root (measured on the phone
 # 2026-10-16, docs/TEEMAT-TOTEUTUS.md).
-cp -r app/qml app/assets app/lib app/Lomiri "$stage/"
+cp -r app/qml app/assets app/lib app/Lomiri app/Puhuri "$stage/"
+[ -f app/Puhuri/Audio/libpuhuriaudio.so ] || {
+    echo "Puuttuu app/Puhuri/Audio/libpuhuriaudio.so. Aja tools/build-qaudio-plugin.sh" >&2
+    exit 1
+}
 # Python test and source imports can leave bytecode beside bundled helpers.
 # Never put interpreter caches into the click: apart from being regenerated,
 # they can make removed helper names appear to remain in the package.

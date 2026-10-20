@@ -286,6 +286,15 @@ impl Server {
                 let path = arg_str(request, "path")?;
                 Ok(json!(self.engine.stage_image(&thread, &path)?))
             }
+            "message.stageVoice" => {
+                let thread = arg_str(request, "thread")?;
+                let path = arg_str(request, "path")?;
+                let mut draft = self.engine.stage_image(&thread, &path)?;
+                if draft.voice {
+                    draft.seconds = arg_u64(request, "seconds").unwrap_or(0) as u32;
+                }
+                Ok(json!(draft))
+            }
             "message.draft" => Ok(json!(self.engine.draft()?)),
             // `text` is the caption the user wrote with the picture or the
             // voice message; it is optional, because sending a file with

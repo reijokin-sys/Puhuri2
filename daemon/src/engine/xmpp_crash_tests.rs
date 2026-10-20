@@ -987,6 +987,96 @@ fn a_forwarded_encrypted_message_is_decrypted_and_keeps_the_stanza_id() {
     );
 }
 
+/// **2026-10-21:** a server may send the sender's own stanza back as a
+/// XEP-0280 sent carbon. The local outgoing row and the carbon have the same
+/// client message id, but not necessarily the same timestamp, and `example.org`
+/// does not add a stanza-id here. The carbon must therefore be recognised
+/// from the id already stored locally **before** its OMEMO envelope is
+/// decrypted. Otherwise the same device tries to open its own sent
+/// ciphertext and the user gets an unreadable-message placeholder.
+#[test]
+fn an_outgoing_carbon_with_the_local_message_id_is_not_imported_again() {
+    let (me_dir, me, me_device) = install("carbon-own-me");
+    let my_bundle = me.bundle().unwrap();
+    let (_dir, sender, _) = install("carbon-own-sender");
+    sender.remember_bundle("me@test", &my_bundle).unwrap();
+    let mut broken = sender
+        .encrypt_message(
+            &[RecipientDevice {
+                jid: "me@test".to_string(),
+                device_id: me_device,
+                bundle: my_bundle,
+            }],
+            canary("CARBON").as_bytes(),
+        )
+        .unwrap();
+    // The envelope is valid XML but cannot be decrypted. If the carbon is
+    // handled, the old path records the visible "cannot decrypt" placeholder.
+    let last = broken.header.keys[0].data.len() - 1;
+    broken.header.keys[0].data[last] ^= 0xff;
+    let payload = xml_of(&encrypted_element(&broken));
+    let xml = format!(
+        "<forwarded xmlns='urn:xmpp:forward:0'>\
+         <delay xmlns='urn:xmpp:delay' stamp='2026-10-21T12:00:00Z'/>\
+         <message xmlns='jabber:client' from='me@test' to='peer@test' id='p-carbon-self'>\
+         <body>I sent you an OMEMO encrypted message but your client doesn't seem to support that.</body>\
+         {payload}\
+         </message></forwarded>"
+    );
+    let forwarded = xmpp_parsers::forwarding::Forwarded::try_from(
+        xmpp_parsers::minidom::Element::from_str(&xml).unwrap(),
+    )
+    .unwrap();
+    drop(me);
+
+    let store = Arc::new(Store::open(me_dir.path()).unwrap());
+    let local = Message {
+        id: "p-carbon-self".to_string(),
+        thread: "peer@test".to_string(),
+        outgoing: true,
+        sender: "minä".to_string(),
+        text: "oma viesti".to_string(),
+        ts: 1,
+        delivered: false,
+        state: crate::engine::message_state_complete(),
+        attachment: None,
+    };
+    store.record(&local, "Peer").unwrap();
+    let omemo = Omemo::open_shared(store.shared_db(), me_dir.path()).unwrap();
+    let shared = Arc::new(Shared {
+        status: Mutex::new(Status::default()),
+        events: Mutex::new(Vec::new()),
+        roster: Mutex::new(std::collections::HashMap::new()),
+        upload_service: Mutex::new(None),
+    });
+    let own = BareJid::from_str("me@test").unwrap();
+    let mut downloads = Vec::new();
+
+    import_forwarded(
+        &forwarded,
+        true,
+        "carbon",
+        &store,
+        &shared,
+        Some(&omemo),
+        &own,
+        &mut downloads,
+    );
+
+    let messages = store.messages("peer@test", 10);
+    assert_eq!(
+        messages.len(),
+        1,
+        "oman viestin carbon tallentui uudelleen: {messages:?}"
+    );
+    assert_eq!(messages[0].id, "p-carbon-self");
+    assert_eq!(messages[0].text, "oma viesti");
+    assert!(
+        !messages[0].text.contains("Saapui salattu viesti"),
+        "omasta carbonista syntyi purkuvirhepaikkamerkki"
+    );
+}
+
 /// **Varapolku (L1b).** Palvelin, joka ei leimaa stanza-id:tä: kaksoiskappaletta
 /// ei voi tunnistaa ennen purkua, joten se tunnistetaan kirjaston omasta
 /// vastauksesta (`SG_ERR_DUPLICATE_MESSAGE`). Se ei ole käyttäjälle virhe eikä
