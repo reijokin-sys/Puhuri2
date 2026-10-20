@@ -24,7 +24,8 @@ import Lomiri.Components 1.3
 import Lomiri.Components.Themes 1.3
 
 PaletteValues {
-    // Revontuli Mustasininen: vain #000000 ja #4A9EFF (musta ja sininen).
+    // Revontuli Mustasininen: musta tausta, hieman vaaleammat #151515
+    // tekstikentat ja sininen #4A9EFF korostus.
     // Taustakuva on musta-sininen viivapiirros
     // (tools/taustakuva-mustavalkoinen.py), joten kayttoliittyma pysyy
     // samassa kahdessa arvossa.
@@ -42,7 +43,7 @@ PaletteValues {
     overlay: "#000000"
     overlayText: "#4A9EFF"
     overlaySecondaryText: "#4A9EFF"
-    field: "#000000"
+    field: "#151515"
     fieldText: "#4A9EFF"
     // Aksentti on sininen: paneelin tekstit, kellon ja kuvakkeet.
     // Kontrasti mustaa vasten on noin 7.8:1 (WCAG AAA).

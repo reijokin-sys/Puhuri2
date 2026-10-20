@@ -65,7 +65,7 @@ Palette {
                 foregroundText: "#4A9EFF",
                 overlay: "#000000",
                 overlayText: "#4A9EFF",
-                field: "#000000",
+                field: "#151515",
                 fieldText: "#4A9EFF",
                 raised: "#4A9EFF",
                 raisedText: "#000000",

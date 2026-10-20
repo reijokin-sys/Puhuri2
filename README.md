@@ -4,7 +4,7 @@ Puhuri 2 is an XMPP messenger for Ubuntu Touch. It is a separate application
 with its own click identity (`fi.reijo.puhuri2`), configuration and application
 data. The original Puhuri project is not required.
 
-This is version 0.1.6, an early release. It supports one-to-one XMPP chat,
+This is version 0.1.7, an early release. It supports one-to-one XMPP chat,
 OMEMO encryption, message archive management (MAM), image attachments, voice
 messages and message notifications. The interface is available in English and
 Finnish.

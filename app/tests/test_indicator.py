@@ -52,13 +52,13 @@ class IndicatorTest(unittest.TestCase):
 
     def test_the_installed_click_version_comes_from_the_current_symlink(self):
         with tempfile.TemporaryDirectory() as directory:
-            versioned = pathlib.Path(directory) / "0.1.6"
+            versioned = pathlib.Path(directory) / "0.1.7"
             versioned.mkdir()
             current = pathlib.Path(directory) / "current"
-            current.symlink_to("0.1.6")
+            current.symlink_to("0.1.7")
             with mock.patch.object(self.indicator, "manifest", return_value={}):
                 with mock.patch.object(self.indicator, "click_root", return_value=str(current)):
-                    self.assertEqual(self.indicator.app_version(), "0.1.6")
+                    self.assertEqual(self.indicator.app_version(), "0.1.7")
 
     def test_the_source_is_generic_variant_with_the_unread_count(self):
         source = self.indicator.Indicator._source_value(3, 1790000000)
@@ -172,7 +172,7 @@ class IndicatorTest(unittest.TestCase):
         self.assertEqual(card["body"], "New message")
         self.assertEqual(
             card["actions"],
-            ["appid://fi.reijo.puhuri2/puhuri/0.1.6"],
+            ["appid://fi.reijo.puhuri2/puhuri/0.1.7"],
         )
 
     def test_postal_channel_and_path_identify_puhuri2(self):
@@ -241,13 +241,13 @@ class IndicatorTest(unittest.TestCase):
     def test_recording_socket_accepts_only_the_confined_daemon(self):
         uid = os.getuid()
         self.assertTrue(self.indicator.peer_is_allowed(
-            uid, "fi.reijo.puhuri2_puhuri-daemon_0.1.6 (enforce)", uid))
+            uid, "fi.reijo.puhuri2_puhuri-daemon_0.1.7 (enforce)", uid))
         self.assertTrue(self.indicator.peer_is_allowed(
-            uid, "fi.reijo.puhuri2_puhuri_0.1.6 (enforce)", uid))
+            uid, "fi.reijo.puhuri2_puhuri_0.1.7 (enforce)", uid))
         self.assertFalse(self.indicator.peer_is_allowed(
             uid, "unconfined", uid))
         self.assertFalse(self.indicator.peer_is_allowed(
-            uid + 1, "fi.reijo.puhuri2_puhuri-daemon_0.1.6 (enforce)", uid))
+            uid + 1, "fi.reijo.puhuri2_puhuri-daemon_0.1.7 (enforce)", uid))
 
 
 if __name__ == "__main__":

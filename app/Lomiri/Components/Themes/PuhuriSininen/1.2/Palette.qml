@@ -26,7 +26,7 @@ import Lomiri.Components.Themes 0.1
 Palette {
     normal: PaletteValues {
         // Revontuli Mustasininen (1.2-kuluttajille): musta pinta,
-        // sininen teksti ja sininen aksentti - ei muita vareja.
+        // hieman vaaleammat #151515 tekstikentat ja sininen aksentti.
         background: "#000000"
         backgroundText: "#4A9EFF"
         base: "#000000"
@@ -35,7 +35,7 @@ Palette {
         foregroundText: "#4A9EFF"
         overlay: "#000000"
         overlayText: "#4A9EFF"
-        field: "#000000"
+        field: "#151515"
         fieldText: "#4A9EFF"
     }
     selected: PaletteValues {

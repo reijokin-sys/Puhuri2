@@ -43,6 +43,21 @@ class BlueBlackThemeTest(unittest.TestCase):
         self.assertIn('background: "#4A9EFF"', selected)
         self.assertIn('baseText: "#000000"', selected)
 
+    def test_normal_text_fields_are_lighter_black_with_blue_text(self):
+        normal = (
+            THEME_DIR / "1.3/PuhuriSininenNormal.qml"
+        ).read_text()
+        self.assertIn('field: "#151515"', normal)
+        self.assertIn('fieldText: "#4A9EFF"', normal)
+
+    def test_12_palette_has_lighter_black_normal_text_fields(self):
+        palette = (THEME_DIR / "1.2/Palette.qml").read_text()
+        normal = palette.split("normal: PaletteValues {", 1)[1].split(
+            "\n    }", 1
+        )[0]
+        self.assertIn('field: "#151515"', normal)
+        self.assertIn('fieldText: "#4A9EFF"', normal)
+
     def test_sync_script_reproduces_the_third_module(self):
         sync = (PROJECT / "tools/sync-teemat.sh").read_text()
         self.assertIn(
