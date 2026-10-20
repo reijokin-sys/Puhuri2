@@ -1,0 +1,10 @@
+{
+    "policy_groups": [
+        "networking",
+        "audio",
+        "microphone",
+        "content_exchange",
+        "push-notification-client"
+    ],
+    "policy_version": 2404.2
+}

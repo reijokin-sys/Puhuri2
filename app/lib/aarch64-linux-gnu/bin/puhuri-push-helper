@@ -1,0 +1,170 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""Puhurin push-avustaja Ubuntu Touchille.
+
+Lomirin push-palvelu kutsuu tätä, kun palvelimelta tulee push:
+
+    puhuri-push-helper <sisään.json> <ulos.json>
+
+Sisään tulee push-palvelun oma kuori, ulos kirjoitetaan UBportsin
+push-helper-muodon mukainen ilmoitus ja sisältöä paljastamaton viestimerkintä.
+Tämä avustaja ei pura viestin sisältöä - ja salattua OMEMO-viestiä se ei
+voisikaan purkaa ilman avainvarastoa. Sovellus hakee viestit, kun käyttäjä
+avaa ilmoituksen.
+"""
+
+import json
+import os
+import re
+import sys
+
+
+APP_ID = "fi.reijo.puhuri2"
+APP_NAME = "Puhuri 2"
+NEW_MESSAGE_MARKER = "puhuri.new-message"
+ORIGIN_KEY = "sent-by"
+ORIGIN_VALUE = "fi.reijo.puhuri2"
+
+
+def click_root():
+    return os.path.abspath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
+
+
+def app_version():
+    try:
+        with open(os.path.join(click_root(), "manifest.json"), encoding="utf-8") as handle:
+            version = str(json.load(handle).get("version") or "")
+        if version:
+            return version
+    except (OSError, ValueError):
+        pass
+    # An installed click has no manifest at its root: `__file__` resolves
+    # through `current` to /opt/click.ubuntu.com/fi.reijo.puhuri2/<version>.
+    installed = os.path.basename(os.path.realpath(click_root()))
+    return installed if installed not in ("app", "current") else ""
+
+
+def app_action():
+    version = app_version()
+    if not version:
+        return ""
+    return "appid://%s/puhuri/%s" % (APP_ID, version)
+
+
+def read_payload(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def payload_shape(value, depth=0):
+    """Describe a push payload without exposing any of its values.
+
+    Lomiri's push journal is the only place where the helper can distinguish
+    a real chat message from a receipt, carbon, retraction or another
+    `<message>` stanza. Keep message bodies, JIDs and tokens out of it.
+    """
+    if depth >= 5:
+        return type(value).__name__
+    if isinstance(value, dict):
+        shape = {}
+        for key, item in sorted(value.items(), key=lambda pair: str(pair[0])):
+            key = str(key)
+            if key == "type" and isinstance(item, str) and re.fullmatch(
+                    r"[a-z][a-z0-9._-]{0,63}", item):
+                shape[key] = "str:" + item
+            else:
+                shape[key] = payload_shape(item, depth + 1)
+        return shape
+    if isinstance(value, list):
+        return {
+            "items": len(value),
+            "shape": payload_shape(value[0], depth + 1) if value else None,
+        }
+    return type(value).__name__
+
+
+def write_payload(path, payload):
+    """Kirjoita ulostulo atomisesti; jätä aina ehjä tiedosto."""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    temp = path + ".tmp.%d" % os.getpid()
+    try:
+        with open(temp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        os.replace(temp, path)
+    except OSError:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+
+
+def is_new_message(payload):
+    """The server marker must identify a real chat message.
+
+    Public `ubpush.agnos.is` currently sends the generic `xmpp-wake` marker
+    for wake-ups that are not tied to a new message. Showing that marker as
+    "Uusi viesti" caused false notifications.
+    """
+    message = payload.get("message")
+    return (
+        isinstance(message, dict)
+        and message.get("type") == NEW_MESSAGE_MARKER
+    )
+
+
+def is_puhuri_originated(payload):
+    return payload.get(ORIGIN_KEY) == ORIGIN_VALUE
+
+
+def main(argv):
+    if len(argv) < 3:
+        return 0
+    source, destination = argv[1], argv[2]
+    payload = read_payload(source)
+    if not payload:
+        write_payload(destination, {})
+        return 0
+    print("puhuri-push-helper: payload " + json.dumps(payload_shape(payload)),
+          file=sys.stderr, flush=True)
+    if is_puhuri_originated(payload):
+        write_payload(destination, payload)
+        return 0
+    if not is_new_message(payload):
+        write_payload(destination, {})
+        return 0
+
+    # UBports expects a `notification` object plus an optional `message`
+    # queued for PushClient. Do not forward arbitrary server data into the app:
+    # XMPP and OMEMO content stays on the XMPP path.
+    action = app_action()
+    card = {
+        "summary": APP_NAME,
+        "body": "Uusi viesti",
+        "popup": True,
+        "persist": True,
+    }
+    if action:
+        # Lomiri's push service validates this URL with its URL Dispatcher
+        # before showing the notification. `/current` does not resolve there;
+        # the installed hook version does.
+        card["actions"] = [action]
+    notification = {
+        "tag": "fi.reijo.puhuri2.message",
+        "card": card,
+        "vibrate": True,
+        "emblem-counter": {"count": 1, "visible": True},
+    }
+    write_payload(destination, {
+        "notification": notification,
+        "message": {"type": "puhuri.new-message"},
+    })
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

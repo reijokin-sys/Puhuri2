@@ -1,0 +1,7 @@
+libsignal-protocol-c v2.3.3
+commit 3a83a4f4ed2302ff6e68ab569c88793b50c22d28
+source https://github.com/signalapp/libsignal-protocol-c.git (tag v2.3.3)
+vendored 2026-10-11; built by tools/build-libsignal-c.sh
+integrity check 2026-10-11: git clone --depth 1 --branch v2.3.3 of the upstream
+repository, then 'diff -r' against this directory: the only difference is this
+VENDOR.txt - the vendored source is byte-identical to the pinned tag.

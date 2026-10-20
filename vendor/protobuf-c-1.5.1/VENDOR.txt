@@ -1,0 +1,7 @@
+protobuf-c 1.5.1 - the runtime, one C file (the protoc generator is not needed)
+source https://github.com/protobuf-c/protobuf-c/releases/download/v1.5.1/protobuf-c-1.5.1.tar.gz
+vendored 2026-10-11
+20d1dc257da96f8ddff8be4dd9779215bbd0a6069ed53bbe9de38fa7629be06b  pb-c.tar.gz
+integrity check 2026-10-11: the two vendored files are byte-identical to the
+1.5.1 release tarball (cmp), whose sha256 is the line above; LICENSE copied from
+the same tarball.

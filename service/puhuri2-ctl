@@ -1,0 +1,18 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# The Puhuri 2 command line client, where the PATH finds it.
+#
+# The real binary lives with the service in ~/.local/lib/fi.reijo.puhuri2/, and
+# the socket it talks to is in the session's runtime directory. A login shell
+# on the phone reads ~/.profile, which puts ~/.local/bin on the PATH - so this
+# wrapper is what makes `puhuri2-ctl status` work in the Terminal app.
+#
+#   puhuri2-ctl status | conversations | messages <keskustelu> | send <keskustelu> <teksti>
+#   puhuri2-ctl sendimage <keskustelu> <kuvatiedosto> | listen
+
+set -eu
+
+: "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
+export XDG_RUNTIME_DIR
+
+exec "${HOME:-/home/phablet}/.local/lib/fi.reijo.puhuri2/puhuri-ctl" "$@"

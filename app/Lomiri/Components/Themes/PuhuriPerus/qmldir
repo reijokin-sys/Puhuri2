@@ -1,0 +1,8 @@
+module Lomiri.Components.Themes.PuhuriPerus
+
+#version 1.1
+Palette 1.1 ./1.2/Palette.qml
+
+#version 1.3
+Palette 1.3 ./1.3/Palette.qml
+PuhuriPerusNormal 1.3 ./1.3/PuhuriPerusNormal.qml

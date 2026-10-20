@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+[Unit]
+Description=Puhuri 2 - message notifications
+PartOf=puhurid2.service
+After=puhurid2.service
+ConditionPathExists=@ROOT@/lib/aarch64-linux-gnu/bin/puhuri-indicator
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/fi.reijo.puhuri2/puhurid.env
+Environment=PUHURI_PURGE_REQUEST_DIR=%t/fi.reijo.puhuri2
+UMask=0077
+NoNewPrivileges=yes
+Restart=on-failure
+RestartSec=5
+ExecStart=/usr/bin/aa-exec -p @UI_PROFILE@ -- @ROOT@/lib/aarch64-linux-gnu/bin/puhuri-indicator --notifications-only
+
+[Install]
+WantedBy=graphical-session.target

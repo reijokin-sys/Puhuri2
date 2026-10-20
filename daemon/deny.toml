@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# cargo-deny: Puhurin riippuvuuksien lisenssi- ja tietoturvakäytäntö.
+#
+#   (cd daemon && cargo deny check licenses)      # lisenssit
+#   (cd daemon && cargo deny check advisories)    # tunnettuja haavoittuvuuksia
+#
+# Miksi juuri nämä luvat: Puhuri 2 on AGPL-3.0-or-later, joten käyttöön
+# kelpaavat sallivat lisenssit (MIT, Apache-2.0, BSD, ISC, Zlib, BSL-1.0,
+# Unlicense, CC0-1.0, CDLA-Permissive-2.0), datalisenssit (Unicode-3.0) ja
+# heikko copyleft (MPL-2.0, LGPL-2.1-or-later). Vahva copyleft tai tuntematon
+# lisenssi pysäyttää tarkistuksen ja luetaan käsin - niin ei pääse käymään
+# vahingossa. Luettelo on luettu riippuvuuksien omista LICENSE-tiedostoista
+# (`cargo metadata` + craten lähde), ks. THIRD_PARTY_NOTICES.md. C-puolen
+# lisenssit (libsignal-protocol-c GPL-3.0, protobuf-c BSD-2-Clause) eivät ole
+# tässä listassa, koska cargo-deny katsoo vain Rust-krateja - ne ovat
+# THIRD_PARTY_NOTICES.md:n taulukossa.
+
+[graph]
+# Myös valinnaiset riippuvuudet (OMEMO: hmac, sha2, aes, cbc, ctr, aes-gcm,
+# rxml) ovat mukana - muuten juuri ne jäisivät tarkistamatta.
+all-features = true
+
+[licenses]
+confidence-threshold = 0.9
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "Unlicense",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
+    "LGPL-2.1-or-later",
+    "AGPL-3.0-or-later",
+]
+
+[advisories]
+# Ei ohitettuja haavoittuvuuksia. Jos jokin on pakko ohittaa, se tehdään
+# tähän perusteluineen - ei koskaan hiljaisesti.
+ignore = []
+
+[sources]
+# Riippuvuudet tulevat vain crates.io:sta. Git-lähteestä tai tuntemattomasta
+# rekisteristä tuleva krate on virhe, ei varoitus.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

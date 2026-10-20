@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+[Unit]
+Description=Puhuri 2 - XMPP background service
+ConditionPathExists=@ROOT@/lib/aarch64-linux-gnu/bin/puhurid
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/fi.reijo.puhuri2/puhurid.env
+Environment=PUHURI_RESTART_AFTER_PURGE=1
+Environment=PUHURI_CLICK_WATCHDOG=1
+UMask=0077
+NoNewPrivileges=yes
+Restart=always
+RestartSec=5
+ExecStart=/usr/bin/aa-exec -p @DAEMON_PROFILE@ -- @ROOT@/lib/aarch64-linux-gnu/bin/puhurid --engine xmpp
+
+[Install]
+WantedBy=graphical-session.target

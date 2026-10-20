@@ -1,0 +1,24 @@
+{
+    "name": "fi.reijo.puhuri2",
+    "title": "Puhuri 2",
+    "version": "0.1.0",
+    "description": "Puhuri 2 - natiivi XMPP-viestinsovellus Ubuntu Touchille",
+    "maintainer": "Reijo Kinnunen <reijokin-sys@users.noreply.github.com>",
+    "framework": "ubuntu-touch-24.04-2.x",
+    "architecture": "arm64",
+    "icon": "assets/puhuri.png",
+    "hooks": {
+        "puhuri": {
+            "apparmor": "fi.reijo.puhuri2.apparmor",
+            "desktop": "puhuri.desktop"
+        },
+        "puhuri-daemon": {
+            "apparmor": "puhuri-daemon.apparmor",
+            "desktop": "puhuri-daemon.desktop"
+        },
+        "push": {
+            "apparmor": "push.apparmor",
+            "push-helper": "push.json"
+        }
+    }
+}

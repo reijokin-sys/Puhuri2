@@ -1,0 +1,806 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""Show Puhuri 2's unread messages in the Lomiri notifications indicator.
+
+The freedesktop notification server only shows the transient bubble and plays
+the sound; the envelope in the panel is the Ayatana messaging menu. It is fed
+by applications that export ``org.ayatana.indicator.messages.application``
+and register themselves with the indicator service. This helper does that for
+Puhuri 2 and keeps one "inbox" source in sync with the daemon's unread
+counters.
+
+It runs as a child of the confined click UI, reads the same unix socket as the
+user interface, and never touches the message store itself. The source text is deliberately generic:
+the indicator can be visible on the lock screen, so no message body or
+contact name is put there.
+"""
+
+import json
+import os
+import pathlib
+import re
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+import dbus
+import dbus.mainloop.glib
+import dbus.service
+from gi.repository import Gio, GLib
+
+APP_ID = "fi.reijo.puhuri2"
+POSTAL_BUS = "com.lomiri.Postal"
+POSTAL_PATH = "/com/lomiri/Postal/fi_2ereijo_2epuhuri2"
+INDICATOR_BUS = "org.ayatana.indicator.messages"
+INDICATOR_SERVICE_PATH = "/org/ayatana/indicator/messages/service"
+OBJECT_PATH = "/fi/reijo/puhuri/indicator"
+SOURCE_ID = "inbox"
+POLL_SECONDS = 2
+REQUEST_TIMEOUT = 5.0
+APP_ICON = "/opt/click.ubuntu.com/fi.reijo.puhuri2/current/assets/puhuri.png"
+DEFAULT_SOUND = "/usr/share/sounds/lomiri/notifications/Sintonia.ogg"
+NOTIFICATION_TIMEOUT_MS = 10000
+
+
+def click_root():
+    return os.path.abspath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
+
+
+def manifest():
+    try:
+        with open(os.path.join(click_root(), "manifest.json"), encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+def app_version():
+    version = str(manifest().get("version") or "")
+    if version:
+        return version
+    # The installed click has no manifest.json at its root: `current` is a
+    # symlink to the versioned directory (…/fi.reijo.puhuri2/<version>).
+    installed = os.path.basename(os.path.realpath(click_root()))
+    if installed and installed not in ("app", "current"):
+        return installed
+    # Last resort: the desktop entry clickd generated for the main hook.
+    data_home = os.environ.get("XDG_DATA_HOME") or os.path.join(
+        os.path.expanduser("~"), ".local/share")
+    try:
+        for name in os.listdir(os.path.join(data_home, "applications")):
+            if (name.startswith("fi.reijo.puhuri2_puhuri_")
+                    and name.endswith(".desktop")
+                    and "service" not in name):
+                return name[len("fi.reijo.puhuri2_puhuri_"):-len(".desktop")]
+    except OSError:
+        pass
+    return ""
+
+
+def desktop_id():
+    """The derived desktop entry clickd created for the main hook."""
+    return "%s_puhuri_%s.desktop" % (APP_ID, app_version())
+
+
+def app_id():
+    return "%s_puhuri_%s" % (APP_ID, app_version())
+
+
+def socket_path():
+    override = os.environ.get("PUHURI_SOCKET")
+    if override:
+        return override
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+    if os.path.basename(runtime.rstrip("/")) == APP_ID:
+        return os.path.join(runtime, "socket")
+    return os.path.join(runtime, APP_ID, "socket")
+
+
+def language():
+    config = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+        os.path.expanduser("~"), ".config")
+    try:
+        with open(os.path.join(config, APP_ID, "language"), encoding="utf-8") as handle:
+            return handle.read().strip() or "en"
+    except OSError:
+        return "en"
+
+
+def summary_text():
+    return "Uusi viesti" if language() == "fi" else "New message"
+
+
+def postal_channel():
+    return "%s_puhuri" % APP_ID
+
+
+def notification_payload(summary, body):
+    version = app_version()
+    action = ""
+    if version:
+        action = "appid://%s/puhuri/%s" % (APP_ID, version)
+    card = {
+        "icon": APP_ICON,
+        "summary": summary,
+        "body": body,
+        "popup": True,
+        "persist": True,
+    }
+    if action:
+        card["actions"] = [action]
+    return {
+        "sent-by": APP_ID,
+        "message": "Puhuri 2",
+        "notification": {
+            "tag": "%s.message" % APP_ID,
+            "card": card,
+            "sound": True,
+            "vibrate": True,
+        },
+    }
+
+
+def app_dir(base, environment):
+    root = os.environ.get(environment) or os.path.join(os.path.expanduser("~"), base)
+    path = pathlib.Path(root)
+    return path if path.name == APP_ID else path / APP_ID
+
+
+def purge_marker_path():
+    root = os.environ.get("PUHURI_PURGE_REQUEST_DIR")
+    if root:
+        return pathlib.Path(root) / "purge-ui-dirs"
+    runtime = pathlib.Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp")
+    return runtime / APP_ID / "purge-ui-dirs"
+
+
+def remove_tree(path):
+    path = pathlib.Path(path)
+    if not path.exists():
+        return
+    for entry in path.rglob("*"):
+        if entry.is_file() and not entry.is_symlink():
+            try:
+                size = entry.stat().st_size
+                with entry.open("r+b") as handle:
+                    remaining = size
+                    block = b"\0" * 65536
+                    while remaining > 0:
+                        handle.write(block[:min(remaining, len(block))])
+                        remaining -= min(remaining, len(block))
+            except OSError:
+                pass
+    shutil.rmtree(path)
+
+
+def cleanup_after_purge(marker, config, cache):
+    marker = pathlib.Path(marker)
+    if not marker.exists():
+        return False
+    remove_tree(config)
+    remove_tree(cache)
+    marker.unlink(missing_ok=True)
+    return True
+
+
+def recording_socket_path():
+    return os.path.join(os.path.dirname(socket_path()), "record.sock")
+
+
+def recording_dir(name):
+    path = app_dir(".local/share", "XDG_DATA_HOME") / name
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def wav_bytes(pcm, rate=48_000, channels=1):
+    header = struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF", 36 + len(pcm), b"WAVE", b"fmt ", 16, 1, channels,
+        rate, rate * channels * 2, channels * 2, 16, b"data", len(pcm),
+    )
+    return header + pcm
+
+
+def peer_is_allowed(uid, label, expected_uid):
+    """Only Puhuri 2's enforced main-app profile may control the microphone."""
+    return (
+        uid == expected_uid
+        and label.startswith("fi.reijo.puhuri2_puhuri_")
+        and "(enforce)" in label
+    )
+
+
+def connection_is_daemon(connection):
+    try:
+        raw = connection.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        pid, uid, _gid = struct.unpack("3i", raw)
+        with open("/proc/%d/attr/current" % pid, encoding="utf-8") as handle:
+            label = handle.read().strip()
+    except (OSError, struct.error):
+        return False
+    return peer_is_allowed(uid, label, os.getuid())
+
+
+class RecordingServer(object):
+    """The confined sidecar for voice recording.
+
+    The daemon asks this same-profile process to run `parec` and write the
+    resulting WAV into the app's private attachments directory. The socket is
+    owner-only and accepts only start/stop/cancel.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._child = None
+        self._raw = None
+        self._file = None
+        self._started = 0.0
+
+    def start(self):
+        path = recording_socket_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(path)
+        os.chmod(path, 0o600)
+        server.listen(1)
+        threading.Thread(target=self._serve, args=(server,), daemon=True).start()
+
+    def _serve(self, server):
+        while True:
+            connection, _ = server.accept()
+            with connection:
+                if not connection_is_daemon(connection):
+                    connection.sendall(
+                        b'{"ok": false, "error": "unauthorized"}\n')
+                    continue
+                try:
+                    line = connection.makefile("rwb").readline()
+                    request = json.loads(line.decode("utf-8"))
+                    reply = self._handle(str(request.get("cmd") or ""))
+                except Exception as error:
+                    reply = {"ok": False, "error": str(error)}
+                connection.sendall(
+                    (json.dumps(reply) + "\n").encode("utf-8"))
+
+    def _handle(self, command):
+        with self._lock:
+            if command == "start":
+                return self._start()
+            if command == "stop":
+                return self._stop()
+            if command == "cancel":
+                self._kill()
+                return {"ok": True}
+            return {"ok": False, "error": "tuntematon äänityskomento"}
+
+    def _start(self):
+        if self._child is not None:
+            return {"ok": False, "error": "äänitys on jo käynnissä"}
+        raw = recording_dir("recordings") / ("rec-%d.raw" % int(time.time() * 1000))
+        handle = open(raw, "wb")
+        child = subprocess.Popen(
+            ["parec", "--format=s16le", "--rate=48000", "--channels=1"],
+            stdout=handle, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+        time.sleep(0.25)
+        if child.poll() is not None:
+            handle.close()
+            raw.unlink(missing_ok=True)
+            return {"ok": False, "error": "äänitystä ei saatu käyntiin"}
+        self._child = child
+        self._raw = raw
+        self._file = handle
+        self._started = time.time()
+        return {"ok": True}
+
+    def _kill(self):
+        if self._child is None:
+            return
+        self._child.terminate()
+        try:
+            self._child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self._child.kill()
+            self._child.wait()
+        if self._file is not None:
+            self._file.close()
+        if self._raw is not None:
+            self._raw.unlink(missing_ok=True)
+        self._child = None
+        self._raw = None
+        self._file = None
+
+    def _stop(self):
+        if self._child is None or self._raw is None:
+            return {"ok": False, "error": "äänitys ei ole käynnissä"}
+        self._child.terminate()
+        try:
+            self._child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self._child.kill()
+            self._child.wait()
+        self._file.close()
+        pcm = self._raw.read_bytes()
+        self._raw.unlink(missing_ok=True)
+        self._child = None
+        self._raw = None
+        self._file = None
+        if not pcm:
+            return {"ok": False, "error": "äänitys jäi tyhjäksi"}
+        maximum = 120 * 48_000 * 2
+        pcm = pcm[:maximum]
+        output = recording_dir("attachments") / ("%d.wav" % int(time.time()))
+        output.write_bytes(wav_bytes(pcm))
+        os.chmod(output, 0o600)
+        return {
+            "ok": True,
+            "path": str(output),
+            "seconds": len(pcm) // (48_000 * 2),
+        }
+
+
+def plain_text(value, limit):
+    """Keep peer-controlled text from becoming markup or control input."""
+    text = re.sub(r"<[^>]*>", "", str(value or ""))
+    text = re.sub(r"[<>\x00-\x1f\x7f]", "", text).strip()
+    return text[:limit]
+
+
+def plain_label(value):
+    return plain_text(value, 80) or "Puhuri 2"
+
+
+def notification_sound():
+    configured = os.environ.get("PUHURI_NOTIFICATION_SOUND", "").strip()
+    if configured:
+        return configured
+    try:
+        result = subprocess.run(
+            ["gsettings", "get", "com.lomiri.touch.sound",
+             "incoming-message-sound"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        value = result.stdout.strip().strip("'\"")
+        if value and os.path.exists(value):
+            return value
+    except OSError:
+        pass
+    return DEFAULT_SOUND
+
+
+def notification_arguments(summary, body, sound):
+    return (
+        "Puhuri 2",
+        0,
+        APP_ICON,
+        summary,
+        body,
+        [],
+        {"sound-file": sound},
+        NOTIFICATION_TIMEOUT_MS,
+    )
+
+
+class NotificationTracker(object):
+    """Turn increasing per-conversation unread counts into one popup each.
+
+    The popup says only that a message arrived: the indicator requests the
+    daemon's body-free conversation view, and the text is generic even if a
+    caller passes rows that still carry a message body.
+    """
+
+    def __init__(self):
+        self._seen = {}
+
+    def observe(self, conversations, enabled=True):
+        popups = []
+        for conversation in conversations or []:
+            try:
+                thread = str(conversation.get("id") or "")
+                unread = int(conversation.get("unread") or 0)
+                newest = int(conversation.get("last_ts") or 0)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if not thread:
+                continue
+            previous = self._seen.get(thread)
+            self._seen[thread] = (unread, newest)
+            if previous is None or unread <= previous[0] or not enabled:
+                continue
+            popups.append((
+                plain_label(conversation.get("name")),
+                summary_text(),
+            ))
+        return popups
+
+
+class NotificationService(object):
+    def __init__(self, bus):
+        self._bus = bus
+
+    def notify(self, summary, body):
+        self._bus.call_blocking(
+            POSTAL_BUS,
+            POSTAL_PATH,
+            POSTAL_BUS,
+            "Post",
+            "ss",
+            (
+                postal_channel(),
+                json.dumps(notification_payload(summary, body)),
+            ),
+        )
+
+
+class DaemonClient(object):
+    """The small request/response client for puhurid's unix socket."""
+
+    def __init__(self):
+        self._socket = None
+        self._stream = None
+        self._next_id = 0
+
+    def close(self):
+        for resource in (self._stream, self._socket):
+            if resource is not None:
+                try:
+                    resource.close()
+                except OSError:
+                    pass
+        self._stream = None
+        self._socket = None
+
+    def _open(self):
+        if self._socket is not None:
+            return
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection.settimeout(REQUEST_TIMEOUT)
+        connection.connect(socket_path())
+        self._socket = connection
+        self._stream = connection.makefile("rwb")
+
+    def request(self, command, arguments=None):
+        try:
+            self._open()
+            self._next_id += 1
+            request_id = self._next_id
+            line = json.dumps({
+                "id": request_id,
+                "cmd": command,
+                "args": arguments or {},
+            }).encode("utf-8") + b"\n"
+            self._stream.write(line)
+            self._stream.flush()
+            while True:
+                answer = self._stream.readline()
+                if not answer:
+                    raise OSError("service closed the socket")
+                message = json.loads(answer.decode("utf-8"))
+                if message.get("id") != request_id:
+                    continue
+                if not message.get("ok"):
+                    error = message.get("error") or {}
+                    raise RuntimeError(error.get("message") or "service error")
+                return message.get("result")
+        except Exception:
+            self.close()
+            raise
+
+
+def unread_state(conversations):
+    """Total unread count and the newest message time."""
+    unread = 0
+    newest = 0
+    for conversation in conversations or []:
+        try:
+            unread += int(conversation.get("unread") or 0)
+            newest = max(newest, int(conversation.get("last_ts") or 0))
+        except (AttributeError, TypeError, ValueError):
+            continue
+    return unread, newest
+
+
+class Indicator(dbus.service.Object):
+    """One messaging-menu application with one source: the Puhuri 2 inbox."""
+
+    def __init__(self, bus):
+        # The messaging-menu service records the caller's unique bus name when
+        # RegisterApplication runs. A well-known name is unnecessary, and the
+        # confined main profile refuses to let this child own one.
+        super(Indicator, self).__init__(bus, OBJECT_PATH)
+        self._source = None
+        self._messages = {}
+        self._newest = 0
+        self._dismissed_until = 0
+
+    @staticmethod
+    def _source_value(unread, newest):
+        return dbus.Struct((
+            SOURCE_ID,
+            "Puhuri 2",
+            dbus.Array([], signature="v"),
+            dbus.UInt32(max(unread, 0)),
+            dbus.Int64(max(newest, 0)),
+            summary_text(),
+            dbus.Boolean(unread > 0),
+        ), signature="ssavuxsb")
+
+    @staticmethod
+    def _message_value(conversation):
+        """One row for the notifications page: sender, generic text, time."""
+        thread = str(conversation.get("id") or "")
+        title = plain_label(conversation.get("name") or thread)
+        newest = int(conversation.get("last_ts") or 0)
+        return dbus.Struct((
+            thread,
+            dbus.Array([], signature="v"),
+            title,
+            "",
+            summary_text(),
+            dbus.Int64(max(newest, 0)),
+            dbus.Array([], signature="a{sv}"),
+            dbus.Boolean(True),
+        ), signature="savsssxaa{sv}b")
+
+    @dbus.service.method(
+        "org.ayatana.indicator.messages.application",
+        out_signature="a(ssavuxsb)")
+    def ListSources(self):
+        if self._source is None:
+            return dbus.Array([], signature="(ssavuxsb)")
+        return dbus.Array([self._source], signature="(ssavuxsb)")
+
+    @dbus.service.method(
+        "org.ayatana.indicator.messages.application",
+        out_signature="a(savsssxaa{sv}b)")
+    def ListMessages(self):
+        return dbus.Array(list(self._messages.values()),
+                          signature="(savsssxaa{sv}b)")
+
+    @dbus.service.method(
+        "org.ayatana.indicator.messages.application",
+        in_signature="s")
+    def ActivateSource(self, source_id):
+        self._clear()
+        try:
+            subprocess.Popen(
+                ["lomiri-app-launch", app_id()],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as error:
+            print("puhuri-indicator: sovelluksen avaus epäonnistui: %s" % error,
+                  file=sys.stderr, flush=True)
+
+    @dbus.service.method(
+        "org.ayatana.indicator.messages.application",
+        in_signature="ssav")
+    def ActivateMessage(self, message_id, action_id, parameter):
+        self.ActivateSource(SOURCE_ID)
+
+    @dbus.service.method(
+        "org.ayatana.indicator.messages.application",
+        in_signature="asas")
+    def Dismiss(self, sources, messages):
+        if SOURCE_ID in [str(source) for source in sources]:
+            # Do not bring the same unread state back on the next poll: it
+            # reappears only when a newer message arrives.
+            self._dismissed_until = self._newest
+            self._clear()
+            self._clear_messages()
+
+    @dbus.service.signal(
+        "org.ayatana.indicator.messages.application",
+        signature="u(ssavuxsb)")
+    def SourceAdded(self, position, source):
+        pass
+
+    @dbus.service.signal(
+        "org.ayatana.indicator.messages.application",
+        signature="(ssavuxsb)")
+    def SourceChanged(self, source):
+        pass
+
+    @dbus.service.signal(
+        "org.ayatana.indicator.messages.application",
+        signature="s")
+    def SourceRemoved(self, source_id):
+        pass
+
+    @dbus.service.signal(
+        "org.ayatana.indicator.messages.application",
+        signature="(savsssxaa{sv}b)")
+    def MessageAdded(self, message):
+        pass
+
+    @dbus.service.signal(
+        "org.ayatana.indicator.messages.application",
+        signature="s")
+    def MessageRemoved(self, message_id):
+        pass
+
+    def update(self, unread, newest, conversations=None):
+        self._newest = max(newest, 0)
+        if unread <= 0 or self._newest <= self._dismissed_until:
+            self._clear()
+            self._clear_messages()
+            return
+        source = self._source_value(unread, self._newest)
+        if self._source is None:
+            self._source = source
+            self.SourceAdded(dbus.UInt32(0), source)
+        elif self._source != source:
+            self._source = source
+            self.SourceChanged(source)
+        if conversations is not None:
+            self._sync_messages(conversations)
+
+    def _clear(self):
+        if self._source is not None:
+            self._source = None
+            self.SourceRemoved(SOURCE_ID)
+
+    def reset_for_registration(self):
+        """Forget what was announced before the service was listening."""
+        self._source = None
+        self._messages = {}
+
+    def _sync_messages(self, conversations):
+        wanted = {}
+        for conversation in conversations or []:
+            try:
+                if int(conversation.get("unread") or 0) <= 0:
+                    continue
+            except (AttributeError, TypeError, ValueError):
+                continue
+            thread = str(conversation.get("id") or "")
+            if thread:
+                wanted[thread] = self._message_value(conversation)
+        for message_id in list(self._messages):
+            if message_id not in wanted or self._newest <= self._dismissed_until:
+                del self._messages[message_id]
+                self.MessageRemoved(message_id)
+        for message_id, message in wanted.items():
+            if self._messages.get(message_id) != message:
+                self._messages[message_id] = message
+                self.MessageAdded(message)
+
+    def _clear_messages(self):
+        for message_id in list(self._messages):
+            del self._messages[message_id]
+            self.MessageRemoved(message_id)
+
+
+def main():
+    notifications_only = "--notifications-only" in sys.argv[1:]
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    bus = dbus.SessionBus()
+    indicator = None if notifications_only else Indicator(bus)
+    daemon = DaemonClient()
+    tracker = NotificationTracker()
+    notifications = NotificationService(bus)
+    RecordingServer().start()
+    loop = GLib.MainLoop()
+    registered = {"ok": False, "error": None}
+    service = None
+
+    def registration_done():
+        registered["ok"] = True
+        # The poll may already have announced the source and its rows before
+        # RegisterApplication completed; the service was not listening yet.
+        # Forget them so the next poll emits SourceAdded/MessageAdded again.
+        indicator.reset_for_registration()
+
+    def registration_failed(error):
+        # The call is asynchronous on purpose: the indicator service calls
+        # ListSources on this object while it handles RegisterApplication, and
+        # a blocking call would deadlock the single-threaded main loop.
+        registered["error"] = error
+        print("puhuri-indicator: viesti-indikaattoriin ei saada yhteyttä: %s" % error,
+              file=sys.stderr, flush=True)
+        loop.quit()
+
+    def register_application():
+        try:
+            service = bus.get_object(INDICATOR_BUS, INDICATOR_SERVICE_PATH)
+            service.RegisterApplication(
+                desktop_id(), dbus.ObjectPath(OBJECT_PATH),
+                dbus_interface="org.ayatana.indicator.messages.service",
+                reply_handler=registration_done,
+                error_handler=registration_failed)
+        except Exception as error:
+            registration_failed(error)
+
+    def indicator_appeared(connection, name, owner, *args):
+        # The service may restart (it has crashed once after a menu update).
+        # It reloads the desktop-id list from GSettings, but the proxy to this
+        # process is only rebuilt when the application registers again.
+        register_application()
+
+    if not notifications_only:
+        Gio.bus_watch_name(
+            Gio.BusType.SESSION, INDICATOR_BUS, Gio.BusNameWatcherFlags.NONE,
+            indicator_appeared, None)
+
+    def poll():
+        try:
+            cleanup_after_purge(
+                purge_marker_path(),
+                app_dir(".config", "XDG_CONFIG_HOME"),
+                app_dir(".cache", "XDG_CACHE_HOME"),
+            )
+        except Exception as error:
+            print("puhuri-indicator: purge-siivous epäonnistui: %s" % error,
+                  file=sys.stderr, flush=True)
+        try:
+            # Only the counters: `conversations.list` carries the message
+            # bodies, which this confined helper does not need.
+            conversations = daemon.request("conversations.indicator")
+            unread, newest = unread_state(conversations)
+            try:
+                settings = daemon.request("settings.get")
+                enabled = bool(settings.get("notifications", True))
+            except Exception:
+                enabled = True
+            for summary, body in tracker.observe(conversations, enabled=enabled):
+                try:
+                    notifications.notify(summary, body)
+                except Exception as error:
+                    print("puhuri-indicator: ilmoituksen lähetys epäonnistui: %s"
+                          % error, file=sys.stderr, flush=True)
+            if indicator is not None:
+                indicator.update(unread, newest, conversations)
+        except Exception as error:
+            if not isinstance(error, (OSError, socket.timeout)):
+                print("puhuri-indicator: palvelu ei vastannut: %s" % error,
+                      file=sys.stderr, flush=True)
+            if indicator is not None:
+                indicator.update(0, 0)
+        return True
+
+    # One immediate poll, then the steady two-second one. Passing `poll`
+    # itself to timeout_add(0, ...) re-armed a zero-millisecond timer on every
+    # return, so the helper span at ~68 % CPU and hammered puhurid's socket.
+    def poll_once():
+        poll()
+        return False
+
+    GLib.timeout_add(0, poll_once)
+    GLib.timeout_add_seconds(POLL_SECONDS, poll)
+
+    def stop(*_args):
+        loop.quit()
+
+    for received in (signal.SIGTERM, signal.SIGINT):
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, received, stop)
+    try:
+        loop.run()
+    finally:
+        if service is not None:
+            try:
+                service.UnregisterApplication(
+                    desktop_id(), dbus_interface="org.ayatana.indicator.messages.service")
+            except Exception:
+                pass
+        daemon.close()
+    return 0 if notifications_only or registered["ok"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
