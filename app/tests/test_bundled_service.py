@@ -53,7 +53,7 @@ class ConfinedProcessTest(unittest.TestCase):
 
     def test_push_helper_outputs_lomiri_string_actions(self):
         with tempfile.TemporaryDirectory() as directory:
-            click_root = pathlib.Path(directory) / "0.1.0"
+            click_root = pathlib.Path(directory) / "0.1.1"
             bindir = click_root / "lib/aarch64-linux-gnu/bin"
             bindir.mkdir(parents=True)
             helper = bindir / "puhuri-push-helper"
@@ -79,7 +79,7 @@ class ConfinedProcessTest(unittest.TestCase):
         # Lomiri's URL Dispatcher does not resolve `current` for this click;
         # it requires the concrete hook version when it validates the push
         # notification. The version comes from the installed click.
-        self.assertEqual(card["actions"], ["appid://fi.reijo.puhuri2/puhuri/0.1.0"])
+        self.assertEqual(card["actions"], ["appid://fi.reijo.puhuri2/puhuri/0.1.1"])
         self.assertTrue(all(isinstance(action, str) for action in card["actions"]))
         self.assertNotIn("/current", card["actions"][0])
         self.assertEqual(output["message"], {"type": "puhuri.new-message"})
@@ -125,7 +125,7 @@ class ConfinedProcessTest(unittest.TestCase):
                         "body": "Uusi viesti",
                         "popup": True,
                         "persist": True,
-                        "actions": ["appid://fi.reijo.puhuri2/puhuri/0.1.0"],
+                        "actions": ["appid://fi.reijo.puhuri2/puhuri/0.1.1"],
                     },
                 },
             }

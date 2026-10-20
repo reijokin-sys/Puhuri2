@@ -39,8 +39,8 @@ def app_version():
             return version
     except (OSError, ValueError):
         pass
-    # An installed click has no manifest at its root: `__file__` resolves
-    # through `current` to /opt/click.ubuntu.com/fi.reijo.puhuri2/<version>.
+    # An installed click has no manifest at its root: the `current` symlink
+    # resolves the helper path to a click version directory before this runs.
     installed = os.path.basename(os.path.realpath(click_root()))
     return installed if installed not in ("app", "current") else ""
 

@@ -52,13 +52,13 @@ class IndicatorTest(unittest.TestCase):
 
     def test_the_installed_click_version_comes_from_the_current_symlink(self):
         with tempfile.TemporaryDirectory() as directory:
-            versioned = pathlib.Path(directory) / "0.1.0"
+            versioned = pathlib.Path(directory) / "0.1.1"
             versioned.mkdir()
             current = pathlib.Path(directory) / "current"
-            current.symlink_to("0.1.0")
+            current.symlink_to("0.1.1")
             with mock.patch.object(self.indicator, "manifest", return_value={}):
                 with mock.patch.object(self.indicator, "click_root", return_value=str(current)):
-                    self.assertEqual(self.indicator.app_version(), "0.1.0")
+                    self.assertEqual(self.indicator.app_version(), "0.1.1")
 
     def test_the_source_is_generic_variant_with_the_unread_count(self):
         source = self.indicator.Indicator._source_value(3, 1790000000)
@@ -153,7 +153,7 @@ class IndicatorTest(unittest.TestCase):
         args = self.indicator.notification_arguments(
             "Maija", "Hei", "/tmp/Sintonia.ogg")
         self.assertEqual(args[0], "Puhuri 2")
-        self.assertEqual(args[2], self.indicator.APP_ICON)
+        self.assertEqual(args[2], self.indicator.app_icon())
         self.assertEqual(args[3], "Maija")
         self.assertEqual(args[4], "Hei")
         self.assertEqual(args[6]["sound-file"], "/tmp/Sintonia.ogg")
@@ -172,7 +172,7 @@ class IndicatorTest(unittest.TestCase):
         self.assertEqual(card["body"], "New message")
         self.assertEqual(
             card["actions"],
-            ["appid://fi.reijo.puhuri2/puhuri/0.1.0"],
+            ["appid://fi.reijo.puhuri2/puhuri/0.1.1"],
         )
 
     def test_postal_channel_and_path_identify_puhuri2(self):

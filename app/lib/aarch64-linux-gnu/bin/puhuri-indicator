@@ -42,7 +42,6 @@ OBJECT_PATH = "/fi/reijo/puhuri/indicator"
 SOURCE_ID = "inbox"
 POLL_SECONDS = 2
 REQUEST_TIMEOUT = 5.0
-APP_ICON = "/opt/click.ubuntu.com/fi.reijo.puhuri2/current/assets/puhuri.png"
 DEFAULT_SOUND = "/usr/share/sounds/lomiri/notifications/Sintonia.ogg"
 NOTIFICATION_TIMEOUT_MS = 10000
 
@@ -50,6 +49,10 @@ NOTIFICATION_TIMEOUT_MS = 10000
 def click_root():
     return os.path.abspath(
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
+
+
+def app_icon():
+    return os.path.join(click_root(), "assets", "puhuri.png")
 
 
 def manifest():
@@ -126,7 +129,7 @@ def notification_payload(summary, body):
     if version:
         action = "appid://%s/puhuri/%s" % (APP_ID, version)
     card = {
-        "icon": APP_ICON,
+        "icon": app_icon(),
         "summary": summary,
         "body": body,
         "popup": True,
@@ -386,7 +389,7 @@ def notification_arguments(summary, body, sound):
     return (
         "Puhuri 2",
         0,
-        APP_ICON,
+        app_icon(),
         summary,
         body,
         [],

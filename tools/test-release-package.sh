@@ -70,8 +70,11 @@ done
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-ar p "$PACKAGE" data.tar.gz | tar -xz -C "$work" \
-    ./LICENSE ./THIRD_PARTY_NOTICES.md ./THIRD_PARTY_LICENSES.txt
+ar p "$PACKAGE" data.tar.gz | tar -xz -C "$work"
+if grep -R -I -F -q '/opt/click.ubuntu.com/' "$work"; then
+    echo "FAIL: click sisältää OpenStoren hylkäämän kovan click-asennuspolun" >&2
+    exit 1
+fi
 for file in LICENSE THIRD_PARTY_NOTICES.md THIRD_PARTY_LICENSES.txt; do
     cmp -s "$PROJECT/$file" "$work/$file" || {
         echo "FAIL: clickin $file ei vastaa projektin tiedostoa" >&2
