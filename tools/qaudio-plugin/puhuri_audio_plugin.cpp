@@ -15,6 +15,8 @@ class PuhuriAudioRecorder : public QObject
     Q_PROPERTY(QString outputLocation READ outputLocation WRITE setOutputLocation NOTIFY outputLocationChanged)
     Q_PROPERTY(QString actualLocation READ actualLocation NOTIFY actualLocationChanged)
     Q_PROPERTY(qint64 duration READ duration NOTIFY durationChanged)
+    Q_PROPERTY(QStringList supportedAudioCodecs READ supportedAudioCodecs CONSTANT)
+    Q_PROPERTY(QStringList supportedContainers READ supportedContainers CONSTANT)
 
 public:
     enum State {
@@ -49,8 +51,9 @@ public:
           m_recorder(new QAudioRecorder(this)),
           m_settings(m_recorder->audioSettings())
     {
-        m_settings.setCodec(QStringLiteral("audio/x-vorbis"));
-        m_settings.setQuality(QMultimedia::VeryHighQuality);
+        m_settings.setCodec(QStringLiteral("audio/x-opus"));
+        m_settings.setEncodingMode(QMultimedia::ConstantBitRateEncoding);
+        m_settings.setBitRate(32000);
         m_settings.setSampleRate(48000);
         m_settings.setChannelCount(1);
         m_recorder->setEncodingSettings(m_settings);
@@ -59,13 +62,29 @@ public:
 
         connect(m_recorder, &QMediaRecorder::stateChanged, this,
                 &PuhuriAudioRecorder::recorderStateChanged);
+        connect(m_recorder, &QMediaRecorder::stateChanged, this,
+                [this](QMediaRecorder::State state) {
+                    if (state == QMediaRecorder::RecordingState)
+                        m_hasRecorded = true;
+                    finishIfReady();
+                });
         connect(m_recorder, &QMediaRecorder::statusChanged, this,
                 &PuhuriAudioRecorder::recorderStatusChanged);
+        connect(m_recorder, &QMediaRecorder::statusChanged, this,
+                [this](QMediaRecorder::Status) { finishIfReady(); });
         connect(m_recorder,
                 QOverload<QMediaRecorder::Error>::of(&QMediaRecorder::error),
-                this, [this](QMediaRecorder::Error) { Q_EMIT errorChanged(); });
+                this, [this](QMediaRecorder::Error) {
+                    m_finishPending = false;
+                    Q_EMIT errorChanged();
+                });
         connect(m_recorder, &QMediaRecorder::durationChanged, this,
                 &PuhuriAudioRecorder::durationChanged);
+        connect(m_recorder, &QMediaRecorder::durationChanged, this,
+                [this](qint64 duration) {
+                    if (duration >= 120000)
+                        m_recorder->stop();
+                });
         connect(m_recorder, &QMediaRecorder::actualLocationChanged, this,
                 &PuhuriAudioRecorder::actualLocationChanged);
     }
@@ -77,6 +96,8 @@ public:
     QString outputLocation() const { return m_recorder->outputLocation().toString(); }
     QString actualLocation() const { return m_recorder->actualLocation().toString(); }
     qint64 duration() const { return m_recorder->duration(); }
+    QStringList supportedAudioCodecs() const { return m_recorder->supportedAudioCodecs(); }
+    QStringList supportedContainers() const { return m_recorder->supportedContainers(); }
 
     void setOutputLocation(const QString &location)
     {
@@ -85,7 +106,11 @@ public:
     }
 
 public Q_SLOTS:
-    void record() { m_recorder->record(); }
+    void record() {
+        m_hasRecorded = false;
+        m_finishPending = true;
+        m_recorder->record();
+    }
     void stop() { m_recorder->stop(); }
     void pause() { m_recorder->pause(); }
 
@@ -96,8 +121,25 @@ Q_SIGNALS:
     void outputLocationChanged();
     void actualLocationChanged(const QUrl &);
     void durationChanged(qint64);
+    void finished();
 
 private:
+    void finishIfReady() {
+        // StoppedState can precede the muxer's final page. Wait for the
+        // backend to leave FinalizingStatus before the file is staged.
+        const auto status = m_recorder->status();
+        if (m_finishPending && m_hasRecorded
+                && m_recorder->state() == QMediaRecorder::StoppedState
+                && (status == QMediaRecorder::LoadedStatus
+                    || status == QMediaRecorder::UnloadedStatus)
+                && m_recorder->error() == QMediaRecorder::NoError) {
+            m_finishPending = false;
+            Q_EMIT finished();
+        }
+    }
+
+    bool m_finishPending = false;
+    bool m_hasRecorded = false;
     QAudioRecorder *m_recorder;
     QAudioEncoderSettings m_settings;
 };

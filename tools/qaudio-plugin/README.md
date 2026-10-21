@@ -19,7 +19,28 @@ tools/build-qaudio-plugin.sh
 `ziglang` Python package is installed. The sysroot must provide the Qt 5.15
 headers and arm64 libraries for `QtCore`, `QtQml` and `QtMultimedia`.
 
-The module records Ogg/Vorbis, 48 kHz mono at very-high quality. The file is
-written to a private application directory and is staged as a draft before
-sending. This component is licensed under `AGPL-3.0-or-later`, like the rest
-of Puhuri 2's own source.
+The module records Ogg/Opus, 48 kHz mono with a 32,000 bit/s target. Qt's
+bitrate-based encoding mode is selected explicitly; the GStreamer backend
+sets the Opus bitrate (its constrained VBR can vary the final size).
+Recording stops after approximately 120 seconds. The `finished` signal is
+emitted only after the backend has stopped and left finalization, so the
+last Ogg page is included before the draft is copied.
+
+Python removes its own temporary recording after successful draft staging.
+It tracks only paths created in the current UI process; old recordings and
+picked images are preserved. Failed staging keeps the temporary source;
+starting another recording or exiting normally discards uncommitted files
+from that process. A forced process termination can still leave a temporary
+file; there is deliberately no automatic scan/delete of old recordings.
+
+The private working repository retains the Qt build inputs in
+`build/qaudio-toolchain/`; the build script discovers them automatically.
+See that directory's README for provenance and rebuilding, and
+`docs/VOICE-COMPRESSION.md` for measured results and outstanding device checks.
+`probe.cpp` queries Qt's recorder formats without opening the microphone.
+`measure-opus.py` measures the system Opus encoder/decoder using generated
+noise without microphone input or speaker output.
+
+This component is licensed under `AGPL-3.0-or-later`, like the rest of
+Puhuri 2's own source. It uses the device's existing Qt/GStreamer/Opus
+libraries; no encoder library is embedded in the click.

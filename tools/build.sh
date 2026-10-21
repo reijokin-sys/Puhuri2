@@ -20,6 +20,13 @@ fi
 python3 tools/make-icon.py
 python3 tools/make-license-bundle.py --check
 
+# A changed recorder source must never silently ship an older plugin.
+plugin=app/Puhuri/Audio/libpuhuriaudio.so
+if [ ! -s "$plugin" ] || [ tools/qaudio-plugin/puhuri_audio_plugin.cpp -nt "$plugin" ] \
+        || [ tools/build-qaudio-plugin.sh -nt "$plugin" ]; then
+    tools/build-qaudio-plugin.sh
+fi
+
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 

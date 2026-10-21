@@ -4,18 +4,20 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """The user interface's client for the Puhuri 2 background service.
 
-The service owns all XMPP state and speaks one JSON object per line over a
+The service owns all Signal state and speaks one JSON object per line over a
 unix socket; this module is the thin client for it. PyOtherSide runs every
 call in its own worker thread, so waiting for a reply never blocks the user
 interface.
 """
 
+import atexit
 import json
 import os
 import socket
 import subprocess
 import threading
 import time
+import uuid
 
 import pyotherside
 
@@ -35,6 +37,8 @@ CONFIG_DIR = os.path.join(
 LANGUAGE_FILE = os.path.join(CONFIG_DIR, "language")
 
 _children = {}
+_voice_paths = set()
+_voice_lock = threading.RLock()
 
 
 def ensure_confined_helpers():
@@ -439,10 +443,12 @@ def new_voice_path():
         os.path.expanduser("~"), ".local", "share")
     directory = os.path.join(data_home, APP_ID, "recordings")
     os.makedirs(directory, mode=0o700, exist_ok=True)
-    path = os.path.join(directory, "voice-%d.ogg" % int(time.time() * 1000))
+    path = os.path.join(directory, "voice-%s.ogg" % uuid.uuid4().hex)
     try:
         descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         os.close(descriptor)
+        with _voice_lock:
+            _voice_paths.add(path)
     except OSError as error:
         return {"ok": False, "error": {"code": "recording", "message": str(error)}}
     return {"ok": True, "result": path}
@@ -455,10 +461,38 @@ def stage_voice(thread, path, seconds):
             "ok": False,
             "error": {"code": "recording", "message": "äänitiedostoa ei löytynyt"},
         }
-    return _backend.request(
+    reply = _backend.request(
         "message.stageVoice",
         {"thread": str(thread), "path": str(path), "seconds": int(seconds)},
     )
+    if reply.get("ok") is True:
+        # The daemon now owns its attachment copy. Only remove recordings
+        # created by this UI process; historical recordings stay untouched.
+        discard_voice(path)
+    return reply
+
+
+def discard_voice(path):
+    """Remove only an uncommitted recording created in this process."""
+    with _voice_lock:
+        if path not in _voice_paths:
+            return
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # Retain ownership so exit cleanup can try again.
+            return
+        _voice_paths.discard(path)
+
+
+def _discard_unstaged_voices():
+    for path in list(_voice_paths):
+        discard_voice(path)
+
+
+atexit.register(_discard_unstaged_voices)
 
 
 def stage_image(thread, path):

@@ -170,9 +170,10 @@ class IndicatorTest(unittest.TestCase):
         card = notification["card"]
         self.assertEqual(card["summary"], "Maija")
         self.assertEqual(card["body"], "New message")
+        version = json.loads((APP_DIR / "manifest.json").read_text())["version"]
         self.assertEqual(
             card["actions"],
-            ["appid://fi.reijo.puhuri2/puhuri/0.1.7"],
+            ["appid://fi.reijo.puhuri2/puhuri/" + version],
         )
 
     def test_postal_channel_and_path_identify_puhuri2(self):

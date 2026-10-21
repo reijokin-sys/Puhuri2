@@ -1,7 +1,7 @@
 {
     "name": "fi.reijo.puhuri2",
     "title": "Puhuri 2",
-    "version": "0.1.7",
+    "version": "0.1.8",
     "description": "Puhuri 2 - natiivi XMPP-viestinsovellus Ubuntu Touchille",
     "maintainer": "Reijo Kinnunen <reijokin-sys@users.noreply.github.com>",
     "framework": "ubuntu-touch-24.04-2.x",

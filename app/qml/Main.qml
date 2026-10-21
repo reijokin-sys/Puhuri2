@@ -84,7 +84,7 @@ MainView {
     property string voiceThread: ""
     property string voicePath: ""
     property real voiceStarted: 0
-    property bool voiceFinishPending: false
+    property bool voiceBusy: false
 
     ListModel { id: conversationModel }
     ListModel { id: rosterModel }
@@ -94,17 +94,15 @@ MainView {
     AudioRecorder {
         id: voiceRecorder
 
-        onRecorderStateChanged: {
-            if (root.voiceFinishPending
-                    && recorderState === AudioRecorder.StoppedState) {
-                root.voiceFinishPending = false
-                root.finishVoice()
-            }
+        onFinished: {
+            if (root.conversationPageItem)
+                root.conversationPageItem.recording = false
+            root.finishVoice()
         }
         onErrorChanged: {
             if (errorCode === AudioRecorder.NoError)
                 return
-            root.voiceFinishPending = false
+            root.voiceBusy = false
             if (root.conversationPageItem)
                 root.conversationPageItem.recording = false
             root.showError(errorString)
@@ -515,17 +513,24 @@ MainView {
     }
 
     function startVoice() {
+        if (root.voiceBusy)
+            return
+        root.voiceBusy = true
         appLog("äänitys alkaa")
         root.voiceThread = root.currentThread
+        if (root.voicePath)
+            py.call("puhuri.discard_voice", [root.voicePath], function () {})
         py.call("puhuri.new_voice_path", [], function (result) {
-            if (root.applyError(result))
+            if (root.applyError(result)) {
+                root.voiceBusy = false
                 return
+            }
             root.voicePath = String(result.result || "")
             root.voiceStarted = Date.now()
             voiceRecorder.outputLocation = "file://" + root.voicePath
-            voiceRecorder.record()
             if (pageStack.currentPage === conversationPageItem)
                 conversationPageItem.recording = true
+            voiceRecorder.record()
         })
     }
 
@@ -536,7 +541,6 @@ MainView {
         appLog("äänitys lopetetaan")
         if (pageStack.currentPage === conversationPageItem)
             conversationPageItem.recording = false
-        root.voiceFinishPending = true
         voiceRecorder.stop()
     }
 
@@ -547,8 +551,10 @@ MainView {
         appLog("äänitys valmis: " + seconds + " s")
         py.call("puhuri.stage_voice",
                 [root.voiceThread, root.voicePath, seconds], function (result) {
+            root.voiceBusy = false
             if (root.applyError(result))
                 return
+            root.voicePath = ""
             root.showDraft(result.result || null)
         })
     }

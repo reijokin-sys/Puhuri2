@@ -9,9 +9,15 @@
 set -eu
 
 PROJECT=$(cd "$(dirname "$0")/.." && pwd)
-SYSROOT=${PUHURI_ARM64_SYSROOT:-}
+SYSROOT=${PUHURI_ARM64_SYSROOT:-"$PROJECT/build/qaudio-toolchain/sysroot"}
 MOC=${PUHURI_MOC:-moc}
 CXX=${PUHURI_ARM64_CXX:-aarch64-linux-gnu-g++}
+if [ -z "${PUHURI_MOC:-}" ] && ! command -v "$MOC" >/dev/null 2>&1; then
+    MOC="$PROJECT/build/qaudio-toolchain/host/usr/lib/qt5/bin/moc"
+fi
+if [ -z "${PUHURI_ARM64_CXX:-}" ] && ! command -v "$CXX" >/dev/null 2>&1; then
+    CXX="$PROJECT/tools/zig-cxx.sh"
+fi
 SOURCE="$PROJECT/tools/qaudio-plugin/puhuri_audio_plugin.cpp"
 OUTPUT=${PUHURI_QML_PLUGIN_OUTPUT:-"$PROJECT/app/Puhuri/Audio/libpuhuriaudio.so"}
 
@@ -25,6 +31,9 @@ OUTPUT=${PUHURI_QML_PLUGIN_OUTPUT:-"$PROJECT/app/Puhuri/Audio/libpuhuriaudio.so"
 }
 QT_INCLUDE="$SYSROOT/usr/include/aarch64-linux-gnu/qt5"
 QT_LIBRARY=${PUHURI_ARM64_QT_LIBRARY:-"$SYSROOT/usr/lib/aarch64-linux-gnu"}
+if [ -z "${PUHURI_ARM64_QT_LIBRARY:-}" ] && [ ! -f "$QT_LIBRARY/libQt5Core.so" ]; then
+    QT_LIBRARY="$PROJECT/build/qaudio-toolchain/runtime"
+fi
 [ -d "$QT_INCLUDE/QtCore" ] && [ -d "$QT_LIBRARY" ] || {
     echo "VIRHE: PUHURI_ARM64_SYSROOT ei sisällä Qt 5 -otsikoita tai kirjastoja" >&2
     exit 1
