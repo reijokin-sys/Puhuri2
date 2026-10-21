@@ -67,4 +67,17 @@ mkdir -p "$(dirname "$OUTPUT")"
     -lQt5Qml -lQt5Multimedia -lQt5Core \
     -o "$OUTPUT"
 
+# Zig may link its own prebuilt C++ runtime with debug sections even with
+# -g0. Strip those sections as well; retain the dynamic plugin symbols.
+if [ -n "${PUHURI_ARM64_OBJCOPY:-}" ]; then
+    "$PUHURI_ARM64_OBJCOPY" --strip-debug "$OUTPUT" "$work/plugin.so"
+elif command -v aarch64-linux-gnu-objcopy >/dev/null 2>&1; then
+    aarch64-linux-gnu-objcopy --strip-debug "$OUTPUT" "$work/plugin.so"
+elif command -v llvm-objcopy >/dev/null 2>&1; then
+    llvm-objcopy --strip-debug "$OUTPUT" "$work/plugin.so"
+else
+    python3 -m ziglang objcopy --strip-debug "$OUTPUT" "$work/plugin.so"
+fi
+cp "$work/plugin.so" "$OUTPUT"
+
 echo "rakennettu: $OUTPUT"
