@@ -24,6 +24,12 @@ FEATURES=${PUHURI_FEATURES:-}
 cd "$PROJECT/daemon"
 echo "--- kohde: $TARGET"
 
+# Panic locations and dependency debug information must not reveal the
+# builder's home directory in a distributed binary.
+export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=$HOME=/build/home"
+export CFLAGS_aarch64_unknown_linux_gnu="${CFLAGS_aarch64_unknown_linux_gnu:+$CFLAGS_aarch64_unknown_linux_gnu }-ffile-prefix-map=$HOME=/build/home -fdebug-prefix-map=$HOME=/build/home"
+export CXXFLAGS_aarch64_unknown_linux_gnu="${CXXFLAGS_aarch64_unknown_linux_gnu:+$CXXFLAGS_aarch64_unknown_linux_gnu }-ffile-prefix-map=$HOME=/build/home -fdebug-prefix-map=$HOME=/build/home"
+
 # Zig is the linker driver: it brings its own aarch64 toolchain and glibc
 # (2.39 matches Ubuntu Touch 24.04), so no apt and no root are needed. The
 # XMPP stack is pure Rust apart from its TLS backend (aws-lc-rs) and the

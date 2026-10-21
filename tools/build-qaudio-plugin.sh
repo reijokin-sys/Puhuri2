@@ -52,7 +52,9 @@ trap 'rm -rf "$work"' EXIT INT TERM
 "$MOC" "$SOURCE" -o "$work/puhuri_audio_plugin.moc"
 mkdir -p "$(dirname "$OUTPUT")"
 "$CXX" \
-    -std=c++17 -fPIC -shared -O2 -g \
+    -std=c++17 -fPIC -shared -O2 -g0 \
+    "-ffile-prefix-map=$HOME=/build/home" \
+    "-fdebug-prefix-map=$HOME=/build/home" \
     -I"$work" \
     -I"$QT_INCLUDE" \
     -I"$QT_INCLUDE/QtCore" \
