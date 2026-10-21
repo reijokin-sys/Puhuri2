@@ -65,18 +65,24 @@ mkdir -p "$(dirname "$OUTPUT")"
     -Wl,-rpath,/usr/lib/aarch64-linux-gnu \
     -Wl,--no-undefined \
     -lQt5Qml -lQt5Multimedia -lQt5Core \
-    -o "$OUTPUT"
+    -o "$work/unstripped.so"
 
 # Zig may link its own prebuilt C++ runtime with debug sections even with
 # -g0. Strip those sections as well; retain the dynamic plugin symbols.
 if [ -n "${PUHURI_ARM64_OBJCOPY:-}" ]; then
-    "$PUHURI_ARM64_OBJCOPY" --strip-debug "$OUTPUT" "$work/plugin.so"
+    "$PUHURI_ARM64_OBJCOPY" --strip-debug "$work/unstripped.so" "$work/plugin.so"
 elif command -v aarch64-linux-gnu-objcopy >/dev/null 2>&1; then
-    aarch64-linux-gnu-objcopy --strip-debug "$OUTPUT" "$work/plugin.so"
+    aarch64-linux-gnu-objcopy --strip-debug "$work/unstripped.so" "$work/plugin.so"
 elif command -v llvm-objcopy >/dev/null 2>&1; then
-    llvm-objcopy --strip-debug "$OUTPUT" "$work/plugin.so"
+    llvm-objcopy --strip-debug "$work/unstripped.so" "$work/plugin.so"
 else
-    python3 -m ziglang objcopy --strip-debug "$OUTPUT" "$work/plugin.so"
+    local_objcopy="$PROJECT/build/release-binutils/usr/bin/aarch64-linux-gnu-objcopy"
+    [ -x "$local_objcopy" ] || {
+        echo "VIRHE: aseta PUHURI_ARM64_OBJCOPY arm64-tiedostoja tukevaan objcopy-työkaluun" >&2
+        exit 1
+    }
+    LD_LIBRARY_PATH="$PROJECT/build/release-binutils/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+        "$local_objcopy" --strip-debug "$work/unstripped.so" "$work/plugin.so"
 fi
 cp "$work/plugin.so" "$OUTPUT"
 

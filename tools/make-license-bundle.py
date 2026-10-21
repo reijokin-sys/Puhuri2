@@ -82,6 +82,7 @@ def metadata_packages() -> dict[tuple[str, str], dict]:
 def normalise_text(path: Path) -> str:
     text = path.read_text(encoding="utf-8", errors="replace")
     text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    text = '\n'.join(line.rstrip() for line in text.split('\n'))
     return text + "\n"
 
 
@@ -162,6 +163,16 @@ def build_bundle() -> str:
             "LGPL-3.0-only",
         ),
     ]
+    for filename, component, licence in [
+        ('Zig-MIT.txt', 'Zig compiler runtime', 'MIT'),
+        ('libcxx-LICENSE.txt', 'LLVM libc++ runtime', 'Apache-2.0 WITH LLVM-exception and retained upstream notices'),
+        ('libcxxabi-LICENSE.txt', 'LLVM libc++abi runtime', 'Apache-2.0 WITH LLVM-exception and retained upstream notices'),
+        ('libunwind-LICENSE.txt', 'LLVM libunwind runtime', 'Apache-2.0 WITH LLVM-exception and retained upstream notices'),
+        ('Rust-COPYRIGHT-library.html', 'Rust standard-library copyright report', 'MIT OR Apache-2.0; third-party terms in included report'),
+    ]:
+        external.append(external_file(
+            PROJECT / 'vendor/runtime-licenses' / filename, component, licence,
+        ))
 
     texts: dict[str, str] = {}
     for files in package_files.values():

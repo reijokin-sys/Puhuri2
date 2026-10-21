@@ -1,5 +1,22 @@
 # Third-party notices
 
+## Compiler runtimes checked for 1.0.0 (2026-10-21)
+
+The Qt plugin statically includes LLVM libc++, libc++abi and libunwind from
+the installed Zig distribution, confirmed from defined C++/unwind symbols.
+The upstream license files specify Apache-2.0 WITH LLVM-exception and retain
+historical license/copyright notices. Zig's compiler runtime is MIT-licensed.
+The Rust standard-library copyright report supplied by the Rust distribution
+is included as well. These runtime notices were missing from earlier audits;
+no runtime dependency was added or upgraded for 1.0.0.
+
+`vendor/runtime-licenses/` records the exact compiler versions, original
+license/copyright texts and SHA-256 provenance. All full texts are included
+by the deterministic licence-bundle generator and checked in the final click.
+The copyright report lists the Rust library distribution's components; it
+does not imply every optional component in the report is linked into this app.
+Build-only compiler executables and binutils are not shipped in the click.
+
 Puhuri is **AGPL-3.0-or-later** (the SPDX headers in the source files). This is
 compatible with the one copyleft library it links, which is why the whole
 application is distributed under those terms.

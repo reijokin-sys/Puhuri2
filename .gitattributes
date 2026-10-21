@@ -1,0 +1,3 @@
+# Preserve original upstream license documents and extracted tool files.
+vendor/runtime-licenses/* -whitespace
+build/release-binutils/** -whitespace

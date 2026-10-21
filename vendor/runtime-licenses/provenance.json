@@ -1,0 +1,27 @@
+{
+  "ziglang_version": "0.16.0",
+  "rustc_version": "rustc 1.99.0 (b940084d7 2026-09-28)",
+  "provenance": "Copied byte-for-byte from installed compiler distribution license/copyright files; no private paths retained.",
+  "files": [
+    {
+      "file": "Zig-MIT.txt",
+      "sha256": "5c537d6853e005298a285d508cff9ac7192cea23576c840d485b2b586a7ff177"
+    },
+    {
+      "file": "libcxx-LICENSE.txt",
+      "sha256": "539dd7aed86e8a4f12cbdd0e6c50c189c7d74847e4fecc64ce2c6ee3a01da38b"
+    },
+    {
+      "file": "libcxxabi-LICENSE.txt",
+      "sha256": "e2b35be49f7284a45b7baca8fc7b3ab7440e7902392b2528a457816b5bb2a15c"
+    },
+    {
+      "file": "libunwind-LICENSE.txt",
+      "sha256": "b5efebcaca80879234098e52d1725e6d9eb8fb96a19fce625d39184b705f7b6d"
+    },
+    {
+      "file": "Rust-COPYRIGHT-library.html",
+      "sha256": "5647be074c8edf7339fd863055923a8fc80bc5610a8d4661ec3b767b9d392c27"
+    }
+  ]
+}
