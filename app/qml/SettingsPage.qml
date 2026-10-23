@@ -40,6 +40,7 @@ Page {
     /// (Not `pollSecondsChanged` - Qt already makes that one for the
     /// property, and re-declaring it is an error.)
     signal pollRequested(var seconds)
+    signal privacyRequested()
     signal logoutRequested()
     /// The irreversible removal of every piece of local Puhuri 2 data.
     signal deleteDataRequested()
@@ -105,6 +106,12 @@ Page {
                     if (key !== page.themeKey)
                         page.themeRequested(key)
                 }
+            }
+
+            Button {
+                width: parent.width
+                text: tr("privacy.title")
+                onClicked: page.privacyRequested()
             }
 
             ListItem {

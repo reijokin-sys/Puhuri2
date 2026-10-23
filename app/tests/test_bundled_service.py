@@ -51,7 +51,7 @@ class ConfinedProcessTest(unittest.TestCase):
         push_hook = json.loads((APP_DIR / "push.json").read_text())
         self.assertEqual(push_hook["exec"], "lib/aarch64-linux-gnu/bin/puhuri-push-helper")
 
-    def test_push_helper_outputs_lomiri_string_actions(self):
+    def test_server_push_cannot_bypass_contact_permissions(self):
         with tempfile.TemporaryDirectory() as directory:
             click_root = pathlib.Path(directory) / "0.1.7"
             bindir = click_root / "lib/aarch64-linux-gnu/bin"
@@ -75,13 +75,7 @@ class ConfinedProcessTest(unittest.TestCase):
             )
             output = json.loads(destination.read_text())
 
-        card = output["notification"]["card"]
-        # Lomiri's URL Dispatcher does not resolve `current` for this click;
-        # it requires the concrete hook version when it validates the push
-        # notification. The version comes from the installed click.
-        self.assertEqual(card["actions"], ["appid://fi.reijo.puhuri2/puhuri/0.1.7"])
-        self.assertTrue(all(isinstance(action, str) for action in card["actions"]))
-        self.assertNotIn("/current", card["actions"][0])
+        self.assertNotIn("notification", output)
         self.assertEqual(output["message"], {"type": "puhuri.new-message"})
         self.assertNotIn("private", json.dumps(output))
         self.assertIn(

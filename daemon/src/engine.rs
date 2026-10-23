@@ -8,6 +8,7 @@
 
 pub mod fake;
 pub mod xmpp;
+mod blocking;
 
 /// OMEMO (XEP-0384): the Signal ratchet through `libsignal-protocol-c`. Off
 /// until the layer above it is real (`--features omemo`).
@@ -390,6 +391,7 @@ pub const MESSAGE_LIMIT: usize = 1000;
 pub const TUTORIAL_THREAD: &str = "aloitus";
 
 pub trait Engine: Send + Sync {
+    fn privacy_changed(&self) {}
     fn name(&self) -> &'static str;
     fn status(&self) -> Status;
     /// Log in to the XMPP server (a bare JID and its password). The JID is

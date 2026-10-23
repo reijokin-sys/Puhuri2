@@ -63,6 +63,7 @@ use xmpp_parsers::pubsub::{ItemId, NodeName, PubSub};
 
 /// One message from the socket server to the worker thread.
 enum Command {
+    PrivacyChanged,
     /// `id` is the message row's own id, and it goes on the wire as the
     /// stanza's id: XEP-0184 answers with exactly that value, so it is what
     /// finds the row again when the receipt comes back.
@@ -216,7 +217,7 @@ struct OmemoSelfFetch {
     with_bundle: Vec<u32>,
 }
 
-struct Shared {
+pub(super) struct Shared {
     status: Mutex<Status>,
     events: Mutex<Vec<EngineEvent>>,
     /// bare JID -> the name the roster gives it.
@@ -226,7 +227,7 @@ struct Shared {
 }
 
 impl Shared {
-    fn push(&self, event: EngineEvent) {
+    pub(super) fn push(&self, event: EngineEvent) {
         self.events.lock().unwrap().push(event);
     }
 }
@@ -344,6 +345,15 @@ impl XmppEngine {
 
     /// The name a conversation is shown under, in the order the user set:
     /// the nickname they gave, then the roster name, then the bare JID.
+    fn prepare_contact_send(&self, thread: &str) -> EngineResult<()> {
+        let account = self.status().jid.ok_or("kirjaudu ensin sisään")?;
+        let peer = BareJid::from_str(thread).map_err(|_| "virheellinen XMPP-osoite")?;
+        self.store
+            .privacy_prepare_send(&account, &peer.to_string())?;
+        self.privacy_changed();
+        Ok(())
+    }
+
     fn name_for(&self, bare: &str) -> String {
         if let Some(nickname) = self.store.nickname(bare) {
             return nickname;
@@ -786,6 +796,11 @@ impl Engine for XmppEngine {
         status
     }
 
+    fn privacy_changed(&self) {
+        let _ = self.command(Command::PrivacyChanged);
+        self.shared.push(EngineEvent::StateChanged);
+    }
+
     fn connect(&self, jid: &str, password: &str) -> EngineResult<()> {
         let bare = BareJid::from_str(jid.trim())
             .map_err(|error| format!("tunnus ei kelpaa (muoto nimi@palvelin): {error}"))?;
@@ -867,6 +882,7 @@ impl Engine for XmppEngine {
     }
 
     fn send(&self, thread: &str, text: &str) -> EngineResult<Message> {
+        self.prepare_contact_send(thread)?;
         if self.status().jid.is_none() {
             return Err("kirjaudu ensin sisään".to_string());
         }
@@ -901,6 +917,7 @@ impl Engine for XmppEngine {
     /// message is recorded only when the encryption and the send went
     /// through, so nothing on screen claims to be sent that never left.
     fn send_encrypted(&self, thread: &str, text: &str) -> EngineResult<Message> {
+        self.prepare_contact_send(thread)?;
         #[cfg(feature = "omemo")]
         {
             if self.status().jid.is_none() {
@@ -1012,6 +1029,9 @@ impl Engine for XmppEngine {
     }
 
     fn send_draft(&self, caption: &str) -> EngineResult<Message> {
+        if let Some(draft) = self.draft.lock().unwrap().as_ref() {
+            self.prepare_contact_send(&draft.thread)?;
+        }
         let draft = self
             .draft
             .lock()
@@ -1086,6 +1106,8 @@ impl Engine for XmppEngine {
     }
 
     fn mark_read(&self, thread: &str) -> EngineResult<()> {
+        let account = self.status().jid.unwrap_or_default();
+        if self.store.privacy_admission(&account,thread) != Ok(crate::store::Admission::Allow) { return Ok(()); }
         // Tell the other side that their newest message was read (XEP-0184),
         // if they asked for a receipt.
         let newest = self.store.messages(thread, 5);
@@ -1108,6 +1130,8 @@ impl Engine for XmppEngine {
     }
 
     fn send_typing(&self, thread: &str, typing: bool) -> EngineResult<()> {
+        let account = self.status().jid.unwrap_or_default();
+        if self.store.privacy_admission(&account,thread) != Ok(crate::store::Admission::Allow) { return Ok(()); }
         if let Ok(to) = BareJid::from_str(thread) {
             let _ = self.command(Command::SendTyping { to, typing });
         }
@@ -1388,6 +1412,88 @@ enum SessionEnd {
 
 /// A short name for one of the client's events, for the debug switch
 /// (`PUHURI_LOG_EVENTS`).
+/// Resolve the effective peer before doing anything with a message. Carbon and
+/// archive envelopes are authoritative only from our own account/server.
+fn admit_stanza(raw: &ParsedMessage, own: &BareJid, store: &Store, shared: &Shared) -> bool {
+    use crate::store::Admission;
+    let account = own.to_string();
+    let mut copy = raw.clone();
+    let sent = copy.extract_valid_payload::<CarbonSent>();
+    let received = copy.extract_valid_payload::<CarbonReceived>();
+    let mam = copy.extract_valid_payload::<MamResult>();
+    let wrappers =
+        usize::from(sent.is_some()) + usize::from(received.is_some()) + usize::from(mam.is_some());
+    let own_origin = raw
+        .from
+        .as_ref()
+        .is_some_and(|j| !j.is_full() && j.to_bare() == *own);
+    if wrappers > 1
+        || ((sent.is_some() || received.is_some()) && !own_origin)
+        || (mam.is_some() && raw.from.is_some() && !own_origin)
+    {
+        return false;
+    }
+    let outgoing = sent.is_some()
+        || mam.as_ref().is_some_and(|m| {
+            m.forwarded
+                .message
+                .from
+                .as_ref()
+                .is_some_and(|f| f.to_bare() == *own)
+        });
+    let forwarded = sent
+        .as_ref()
+        .map(|s| &s.forwarded)
+        .or_else(|| received.as_ref().map(|r| &r.forwarded))
+        .or_else(|| mam.as_ref().map(|m| &m.forwarded));
+    if let Some(m) = &mam {
+        // Filtering a result still advances the archive, avoiding repeated spam.
+        let _ = store.set_mam_last_id(&m.id);
+        if forwarded.and_then(|f| f.delay.as_ref()).is_some_and(|d| {
+            store
+                .mam_floor()
+                .is_some_and(|floor| d.stamp.0.timestamp() < floor)
+        }) {
+            return false;
+        }
+    }
+    let message = forwarded.map(|f| &f.message).unwrap_or(raw);
+    let peer = if outgoing {
+        message.to.as_ref()
+    } else {
+        message.from.as_ref()
+    };
+    let Some(peer) = peer else {
+        return false;
+    };
+    let bare = peer.to_bare().to_string();
+    if outgoing {
+        // A sent carbon represents the user's deliberate send on another device.
+        if store.privacy_prepare_send(&account, &bare).is_err() {
+            return false;
+        }
+    }
+    match store.privacy_admission(&account, &peer.to_string()) {
+        Ok(Admission::Allow) => true,
+        Ok(Admission::Request) => {
+            let content = !message.bodies.is_empty()
+                || message.payloads.iter().any(|p| {
+                    p.ns().contains("omemo")
+                        || p.ns() == ns::LEGACY_OMEMO
+                        || p.is("x", "jabber:x:oob")
+                });
+            if content {
+                if let Ok(true) = store.privacy_queue(&account, &bare, &stanza_xml(raw), now()) {
+                    shared.push(EngineEvent::StateChanged);
+                }
+            }
+            false
+        }
+        // A storage failure is never interpreted as permission.
+        _ => false,
+    }
+}
+
 fn event_kind(event: &Event) -> &'static str {
     match event {
         Event::Online { .. } => "Online",
@@ -1560,12 +1666,22 @@ async fn connection(
 ) -> SessionEnd {
     // `Client::new` does the whole connection: SRV resolution, TCP, STARTTLS,
     // SASL, XEP-0198 and the reconnect.
+    // The isolated loopback check can use a free port without touching the
+    // machine's existing XMPP service. Release builds have no override.
+    #[cfg(debug_assertions)]
+    let mut client = match std::env::var("PUHURI_TEST_XMPP_PORT").ok().and_then(|s| s.parse::<u16>().ok()) {
+        Some(port) => Client::new_starttls(jid.clone(), password.clone(),
+            tokio_xmpp::connect::DnsConfig::no_srv(jid.domain().as_str(),port), Default::default()),
+        None => Client::new(jid.clone(), password.clone()),
+    };
+    #[cfg(not(debug_assertions))]
     let mut client = Client::new(jid.clone(), password.clone());
     let mut stop = false;
     // Set when the login really went through (Event::Online). It gates both
     // the login deadline and the polite goodbye at the end: without a session
     // there is nobody to say goodbye to.
     let mut online = false;
+    let mut blocking = super::blocking::Blocking::new();
     // Polling: when an interval is set, the session is closed a moment after
     // the login work (the archive read) is done, and the worker waits before
     // opening the next one. `SessionEnd::Stop` means "the session ended for
@@ -1596,19 +1712,30 @@ async fn connection(
     // journal into noise - but the limitation is not hidden either.
     #[cfg(feature = "omemo")]
     let mut warned_no_stanza_id = false;
+    let mut replayed_request: Option<i64> = None;
     while !stop {
+        if let Some(id) = replayed_request.take() {
+            let _ = store.privacy_finish_request(id);
+        }
+        let ready = if online { store.privacy_ready(&jid.to_string()).unwrap_or_default().into_iter().next() } else { None };
+        let replay = ready.and_then(|(id,xml)| {
+            let parsed = xml.parse::<xmpp_parsers::minidom::Element>().ok().and_then(|e| ParsedMessage::try_from(e).ok());
+            if parsed.is_none() { let _ = store.privacy_finish_request(id); }
+            parsed.map(|m| { replayed_request = Some(id); Event::Stanza(Stanza::Message(m)) })
+        });
             // Whether the select loop needs the one-second tick (see below); a
             // build without OMEMO never does.
             #[cfg(feature = "omemo")]
-            let fetch_pending = !omemo_fetches.is_empty();
+            let fetch_pending = !omemo_fetches.is_empty() || blocking.needs_tick();
             #[cfg(not(feature = "omemo"))]
-            let fetch_pending = false;
-            let event = tokio::select! {
+            let fetch_pending = blocking.needs_tick();
+            let event = if let Some(event) = replay { event } else { tokio::select! {
                 // While an OMEMO fetch waits for answers, tick once a second
                 // so its time budget is checked even if nothing arrives at
                 // all (a stalled fetch would otherwise wait for the caller's
                 // own timeout and look like a dead server).
                 _ = tokio::time::sleep(std::time::Duration::from_secs(1)), if fetch_pending => {
+                    if online { blocking.tick(&mut client, &jid, &store, &shared).await; }
                     #[cfg(feature = "omemo")]
                     if service_omemo_fetches(&mut client, &mut omemo_fetches).await {
                         // The fetch got no answer at all, which points at the
@@ -1674,6 +1801,10 @@ async fn connection(
                                 continue;
                             }
                             Command::EncryptAndSend { to: peer, text, id, name, reply } => {
+                                if store.privacy_admission(&jid.to_string(), &peer.to_string()) != Ok(crate::store::Admission::Allow) {
+                                    let _ = reply.send(Err("yhteystietoa ei ole hyväksytty tai se on estetty".into()));
+                                    continue;
+                                }
                                 let answer = encrypt_and_send(
                                     &mut client,
                                     &jid,
@@ -1700,6 +1831,9 @@ async fn connection(
                         // Push (XEP-0357) needs our own JID, which lives
                         // here, so it is handled in the loop as well.
                         match other {
+                            Command::PrivacyChanged => {
+                                if online { blocking.tick(&mut client, &jid, &store, &shared).await; }
+                            }
                             Command::EnablePush { settings } => {
                                 send_push_enable(&mut client, &jid, &settings).await;
                             }
@@ -1755,7 +1889,7 @@ async fn connection(
                 stop = true;
                 continue;
             }
-        };
+        } };
             let events = vec![event];
 
         let mut disconnect_reason = None;
@@ -1773,6 +1907,12 @@ async fn connection(
             match event {
                 Event::Online { .. } => {
                     online = true;
+                    if let Err(error) = store.privacy_init(&jid.to_string()) {
+                        shared.push(EngineEvent::Error { code:"privacy".into(), message:error });
+                        stop = true;
+                        continue;
+                    }
+                    blocking.start(&mut client, &jid, &store).await;
                     // A login that stalls leaves the whole session deaf, and
                     // the only visible symptom is "the answer never came".
                     // The steps are timed so a stall can be found instead of
@@ -1940,6 +2080,7 @@ async fn connection(
                     disconnect_reason = Some(error.to_string());
                 }
                 Event::Stanza(Stanza::Message(mut raw)) => {
+                    if !admit_stanza(&raw, &jid, &store, &shared) { continue; }
                     let bare = raw.from.as_ref().map(|jid| jid.to_bare());
                     let id = raw.id.as_ref().map(|id| id.0.clone());
                     let (typing, receipt) = chat_state_and_receipt(&mut raw);
@@ -2329,6 +2470,10 @@ async fn connection(
                     }
                 }
                 Event::Stanza(Stanza::Iq(iq)) => {
+                    if blocking.iq(&iq, &mut client, &jid, &store, &shared).await {
+                        blocking.tick(&mut client, &jid, &store, &shared).await;
+                        continue;
+                    }
                     handle_iq(
                         &iq,
                         &mut client,
@@ -2356,6 +2501,7 @@ async fn connection(
             }
         }
         for (to, id) in receipts_to_send {
+            if store.privacy_admission(&jid.to_string(), &to.to_string()) != Ok(crate::store::Admission::Allow) { continue; }
             send_chat(&mut client, to.into(), None, "", vec![Received { id }.into()]).await;
         }
         // A slow or hostile attachment server must not hold the engine after
@@ -2577,7 +2723,6 @@ fn chat_stanza(
 /// One stanza as XML - what the outbox stores and sends again.
 /// The stanza rendered back to XML: the outbox stores exactly these bytes, so
 /// a retry sends the same message the first attempt did.
-#[cfg(any(test, feature = "omemo", feature = "failpoints"))]
 fn stanza_xml(message: &ParsedMessage) -> String {
     let mut out = Vec::new();
     let element: xmpp_parsers::minidom::Element = message.clone().into();
@@ -2626,6 +2771,13 @@ async fn handle_command(
 ) {
     #[cfg(not(feature = "omemo"))]
     let _ = store;
+    if let Some(peer) = match &command {
+        Command::SendText { to,.. } | Command::SendTyping { to,.. } | Command::SendReceipt { to,.. } | Command::SendFile { to,.. } => Some(to),
+        _ => None,
+    } {
+        let account = shared.status.lock().unwrap().jid.clone().unwrap_or_default();
+        if store.privacy_admission(&account,&peer.to_string()) != Ok(crate::store::Admission::Allow) { return; }
+    }
     match command {
         Command::SendText { to, body, id } => {
             // XEP-0184: ask the other side to confirm it arrived, so the user
@@ -2706,6 +2858,7 @@ async fn handle_command(
                 aesgcm,
             });
         }
+        Command::PrivacyChanged => {}
         Command::Disconnect => {}
         // Ended in the session loop: it closes this session and starts a new
         // one, which the loop knows how to do.
@@ -2866,6 +3019,7 @@ async fn handle_iq(
             return;
         };
         let upload = uploads.remove(index);
+        if store.privacy_admission(&own.to_string(),&upload.to.to_string()) != Ok(crate::store::Admission::Allow) { return; }
         match SlotResult::try_from(payload) {
             Ok(slot) => {
                 // An encrypted conversation sends the file **encrypted**
@@ -3798,7 +3952,9 @@ async fn flush_outbox<C: ChatSink>(
     store: &Arc<Store>,
     shared: &Arc<Shared>,
 ) {
-    for (id, _thread, stanza, ts, attempts) in store.outbox_pending() {
+    for (id, thread, stanza, ts, attempts) in store.outbox_pending() {
+        let account = shared.status.lock().unwrap().jid.clone().unwrap_or_default();
+        if store.privacy_admission(&account,&thread) != Ok(crate::store::Admission::Allow) { continue; }
         if attempts >= OUTBOX_MAX_ATTEMPTS || now() - ts > OUTBOX_MAX_AGE_SECONDS {
             let _ = store.mark_outbox_failed(&id);
             shared.push(EngineEvent::Error {
@@ -4179,8 +4335,15 @@ async fn handle_download(
     caption: String,
     id: Option<String>,
 ) {
+    let account = shared.status.lock().unwrap().jid.clone().unwrap_or_default();
+    if store.privacy_admission(&account,&from.to_string()) != Ok(crate::store::Admission::Allow) { return; }
     match fetch_attachment(store, &from, &url, &caption, id.clone()).await {
         DownloadAttempt::Arrived(mut message) => {
+            if shared.status.lock().unwrap().jid.as_deref() != Some(account.as_str())
+                || store.privacy_admission(&account,&from.to_string()) != Ok(crate::store::Admission::Allow) {
+                if let Some(a) = &message.attachment { let _ = std::fs::remove_file(&a.path); }
+                return;
+            }
             let name = shared
                 .roster
                 .lock()
@@ -5513,3 +5676,7 @@ mod tests {
 #[cfg(all(test, feature = "omemo", feature = "failpoints"))]
 #[path = "xmpp_crash_tests.rs"]
 mod crash_tests;
+
+#[cfg(test)]
+#[path = "xmpp_privacy_tests.rs"]
+mod privacy_tests;

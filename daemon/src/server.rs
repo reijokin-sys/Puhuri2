@@ -193,6 +193,34 @@ impl Server {
         }
     }
 
+    fn event_allowed(&self, event: &EngineEvent) -> bool {
+        if self.engine.name() != "xmpp" {
+            return true;
+        }
+        let peer = match event {
+            EngineEvent::MessageReceived(m) => Some(m.thread.as_str()),
+            EngineEvent::Typing { thread, .. } | EngineEvent::MessageReceipt { thread, .. } => {
+                Some(thread.as_str())
+            }
+            _ => None,
+        };
+        peer.is_none_or(|jid| {
+            self.privacy_account().ok().is_some_and(|account| {
+                self.store.privacy_admission(&account, jid) == Ok(crate::store::Admission::Allow)
+            })
+        })
+    }
+
+    fn privacy_account(&self) -> Result<String, String> {
+        let status = self.engine.status();
+        let value = status
+            .account
+            .or_else(|| if status.connected { status.jid } else { None })
+            .ok_or("kirjaudu ensin sisään")?;
+        let jid: xmpp_parsers::jid::BareJid = value.parse().map_err(|_| "virheellinen tilin osoite")?;
+        Ok(jid.to_string())
+    }
+
     fn dispatch_inner(&self, request: &Request) -> Result<Value, String> {
         match request.cmd.as_str() {
             "status" => Ok(json!(self.engine.status())),
@@ -231,6 +259,42 @@ impl Server {
                 }
                 Ok(json!({"ok": true}))
             }
+            "privacy.get" => {
+                let account = self.privacy_account()?;
+                self.store.privacy_init(&account)?;
+                let contacts = self.store.privacy_contacts(&account)?.into_iter().map(|c| {
+                    let blocked = c.state == "blocked" || self.store.privacy_server_blocked(&account,&c.jid).unwrap_or(true);
+                    let mut row = json!(c);
+                    row["blocked"] = json!(blocked);
+                    row
+                }).collect::<Vec<_>>();
+                Ok(json!({"mode":self.store.privacy_mode(&account)?,
+                    "blocking_status":self.store.privacy_blocking_status(&account)?,
+                    "contacts":contacts,"requests":self.store.privacy_requests(&account)?}))
+            }
+            "privacy.mode" => {
+                let account = self.privacy_account()?;
+                self.store.privacy_set_mode(&account,&arg_str(request,"mode")?)?;
+                self.engine.privacy_changed();
+                Ok(json!({"ok":true}))
+            }
+            "privacy.contact" => {
+                let account = self.privacy_account()?;
+                let given = arg_str(request,"jid")?;
+                let peer: xmpp_parsers::jid::Jid = given.trim().parse().map_err(|_| "virheellinen XMPP-osoite")?;
+                let action = arg_str(request,"action")?;
+                let (jid,state) = match action.as_str() {
+                    "approve" => (peer.to_bare().to_string(),"approved"),
+                    "reject" => (peer.to_bare().to_string(),"rejected"),
+                    "block" => (peer.to_bare().to_string(),"blocked"),
+                    "unblock" => (peer.to_string(),"unknown"),
+                    "revoke" => (peer.to_bare().to_string(),"unknown"),
+                    _ => return Err("tuntematon yhteystietotoiminto".into()),
+                };
+                self.store.privacy_set_contact(&account,&jid,state)?;
+                self.engine.privacy_changed();
+                Ok(json!({"ok":true}))
+            }
             "conversations.list" => Ok(json!(self.engine.conversations()?)),
             // The notification indicator's view: the counters it needs to
             // light the envelope and one row per unread conversation, with no
@@ -239,6 +303,8 @@ impl Server {
                 .engine
                 .conversations()?
                 .into_iter()
+                .filter(|c| self.engine.name() != "xmpp" || self.privacy_account().ok().is_some_and(|account|
+                    self.store.privacy_admission(&account,&c.id) == Ok(crate::store::Admission::Allow)))
                 .map(|conversation| IndicatorConversation {
                     id: conversation.id,
                     name: conversation.name,
@@ -627,6 +693,7 @@ impl Server {
         loop {
             std::thread::sleep(Duration::from_millis(300));
             for event in self.engine.poll_events() {
+                if !self.event_allowed(&event) { continue; }
                 match event {
                     EngineEvent::Connected { jid } => {
                         eprintln!("puhurid: yhteys auki");

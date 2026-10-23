@@ -593,3 +593,15 @@ def push_register(token, module="ubports"):
 def push_wake():
     """Wake the XMPP session after the app consumes a queued push marker."""
     return _backend.request("push.wake")
+
+
+def privacy_get():
+    return _backend.request("privacy.get")
+
+
+def privacy_mode(mode):
+    return _backend.request("privacy.mode", {"mode": str(mode)})
+
+
+def privacy_contact(jid, action):
+    return _backend.request("privacy.contact", {"jid": str(jid), "action": str(action)})

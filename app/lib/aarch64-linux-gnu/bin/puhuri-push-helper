@@ -138,31 +138,10 @@ def main(argv):
         write_payload(destination, {})
         return 0
 
-    # UBports expects a `notification` object plus an optional `message`
-    # queued for PushClient. Do not forward arbitrary server data into the app:
-    # XMPP and OMEMO content stays on the XMPP path.
-    action = app_action()
-    card = {
-        "summary": APP_NAME,
-        "body": "Uusi viesti",
-        "popup": True,
-        "persist": True,
-    }
-    if action:
-        # Lomiri's push service validates this URL with its URL Dispatcher
-        # before showing the notification. `/current` does not resolve there;
-        # the installed hook version does.
-        card["actions"] = [action]
-    notification = {
-        "tag": "fi.reijo.puhuri2.message",
-        "card": card,
-        "vibrate": True,
-        "emblem-counter": {"count": 1, "visible": True},
-    }
-    write_payload(destination, {
-        "notification": notification,
-        "message": {"type": "puhuri.new-message"},
-    })
+    # A content-free server marker cannot prove that the sender passed the
+    # account's consent / blocking policy. Wake the app, but let only the
+    # daemon's admitted unread counters create a user-visible notification.
+    write_payload(destination, {"message": {"type": NEW_MESSAGE_MARKER}})
     return 0
 
 

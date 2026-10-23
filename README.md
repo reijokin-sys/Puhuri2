@@ -4,7 +4,14 @@ Puhuri 2 is an XMPP messenger for Ubuntu Touch. It is a separate application
 with its own click identity (`fi.reijo.puhuri2`), configuration and application
 data. The original Puhuri project is not required.
 
-This is version 1.0.0, the first stable release. It supports one-to-one XMPP chat,
+Version 1.1.0 adds message requests, explicit contact approval,
+reception from approved contacts only, and XEP-0191 blocking with separate
+local/server confirmation. Existing conversations remain approved on upgrade;
+roster membership alone does not approve a new sender. Unknown senders' messages
+stay in requests until accepted, with no attachment downloads or delivery receipts.
+Blocking remains local when the server does not support XEP-0191.
+
+Puhuri 2 supports one-to-one XMPP chat,
 OMEMO encryption, message archive management (MAM), image attachments, voice
 messages and message notifications. The interface is available in English and
 Finnish.
@@ -22,7 +29,8 @@ The application starts a confined XMPP daemon and a notifications-only helper.
 They continue running after the Puhuri 2 window is closed. Incoming messages
 are stored by the daemon and announced through Lomiri notifications without
 putting message text, sender details or decrypted OMEMO content into a push
-payload.
+payload. Server push markers only wake the app; they cannot create a
+notification before the daemon checks the sender’s contact permission.
 
 The persistent services start when Puhuri 2 is first launched. They normally
 remain active for the rest of the user session. Puhuri 2 does not install

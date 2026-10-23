@@ -21,6 +21,9 @@ Page {
 
     id: page
 
+    property bool contactBlocked: false
+    signal privacyRequested()
+
     property var messages
 
     signal sendRequested(string text)
@@ -260,6 +263,15 @@ Page {
         ]
     }
 
+    Button {
+        id: blockedButton
+        anchors { top: header.bottom; left: parent.left; right: parent.right }
+        visible: page.contactBlocked
+        height: visible ? units.gu(8) : 0
+        text: page.tr("privacy.blockedChat")
+        onClicked: page.privacyRequested()
+    }
+
     /// What the conversation is: encrypted or not. It is a bar under the
     /// header rather than a hidden setting, because "is this message going
     /// out in the clear" is the one thing a messenger must not leave the user
@@ -267,7 +279,7 @@ Page {
     Item {
         id: encryptionBar
         anchors {
-            top: header.bottom
+            top: blockedButton.bottom
             left: parent.left
             right: parent.right
         }
@@ -703,6 +715,7 @@ Page {
 
     Rectangle {
         id: composer
+        enabled: !page.contactBlocked
         anchors {
             left: parent.left
             right: parent.right

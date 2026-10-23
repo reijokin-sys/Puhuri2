@@ -23,6 +23,8 @@ Page {
 
     property var conversations
     property bool busy: false
+    property int requestCount: 0
+    signal privacyRequested()
 
     signal conversationActivated(string thread, string name)
     /// A conversation was held down: offer to delete it.
@@ -79,6 +81,13 @@ Page {
         ]
     }
 
+    Button {
+        id: requestsButton
+        anchors { top: header.bottom; left: parent.left; right: parent.right }
+        text: tr("privacy.requestsLink") + (page.requestCount ? " (" + page.requestCount + ")" : "")
+        onClicked: page.privacyRequested()
+    }
+
     ActivityIndicator {
         anchors {
             top: header.bottom
@@ -93,7 +102,7 @@ Page {
     ListView {
         id: listView
         anchors {
-            top: header.bottom
+            top: requestsButton.bottom
             left: parent.left
             right: parent.right
             bottom: parent.bottom

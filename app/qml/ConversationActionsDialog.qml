@@ -30,6 +30,9 @@ Dialog {
 
     title: dialog.conversationName ? dialog.conversationName : tr("conversation.title")
 
+    property bool blocked: false
+    signal blockRequested()
+
     property string thread
     property string conversationName
 
@@ -50,6 +53,16 @@ Dialog {
             onClicked: {
                 PopupUtils.close(dialog)
                 dialog.nicknameRequested()
+            }
+        }
+
+        Button {
+            width: parent.width
+            visible: dialog.thread !== "aloitus"
+            text: tr(dialog.blocked ? "privacy.unblock" : "privacy.block")
+            onClicked: {
+                PopupUtils.close(dialog)
+                dialog.blockRequested()
             }
         }
 

@@ -53,6 +53,9 @@ MainView {
     property bool hasAccount: false
     property var device: ({})
     property var settings: ({})
+    property var privacy: ({ mode: "requests", contacts: [], requests: [] })
+    property bool privacyBusy: false
+    property bool privacyLoading: false
     /// Battery-saving polling: null keeps the connection open (default); a
     /// number means "open it only now and then" and the messages may be late.
     property var pollSeconds: null
@@ -158,9 +161,56 @@ MainView {
         return false
     }
 
+    function refreshPrivacy() {
+        if (!root.pythonReady || root.privacyLoading) return
+        root.privacyLoading = true
+        py.call("puhuri.privacy_get", [], function (result) {
+            root.privacyLoading = false
+            if (result && result.ok === true) root.privacy = result.result
+        })
+    }
+
+    function showPrivacy() {
+        root.refreshPrivacy()
+        pageStack.push(privacyPage)
+    }
+
+    function privacyContact(jid, action) {
+        if (root.privacyBusy) return
+        root.privacyBusy = true
+        py.call("puhuri.privacy_contact", [jid, action], function (result) {
+            root.privacyBusy = false
+            if (root.applyError(result)) return
+            root.refreshPrivacy()
+            root.refreshConversations()
+        })
+    }
+
+    function privacyMode(mode) {
+        if (root.privacyBusy) return
+        root.privacyBusy = true
+        py.call("puhuri.privacy_mode", [mode], function (result) {
+            root.privacyBusy = false
+            if (root.applyError(result)) return
+            root.refreshPrivacy()
+        })
+    }
+
+    function contactBlocked(jid) {
+        var contacts = root.privacy.contacts || []
+        var domain = jid.substring(jid.indexOf("@") + 1)
+        for (var i = 0; i < contacts.length; i++) {
+            var c = contacts[i]
+            if (c.blocked && (c.jid === jid || c.jid === domain
+                             || c.jid.split("/")[0] === jid)) return true
+        }
+        return false
+    }
+
     function refreshConversations() {
         if (!root.pythonReady)
             return
+        root.refreshPrivacy()
         root.busy = true
         py.call("puhuri.conversations", [], function (result) {
             root.busy = false
@@ -458,7 +508,8 @@ MainView {
     function askDeleteConversation(thread, name) {
         PopupUtils.open(conversationActionsDialog, root, {
             thread: thread,
-            conversationName: name
+            conversationName: name,
+            blocked: root.contactBlocked(thread)
         })
     }
 
@@ -783,6 +834,7 @@ MainView {
         root.currentThread = ""
         root.currentName = ""
         root.conversationPageItem = null
+        root.privacy = ({ mode: "requests", contacts: [], requests: [] })
         root.conversationsPageItem = null
         messageModel.clear()
         pageStack.clear()
@@ -852,6 +904,7 @@ MainView {
                 root.pollSeconds = result.result.seconds
         })
         root.refreshPush()
+        root.refreshPrivacy()
     }
 
     function refreshPush() {
@@ -1148,6 +1201,8 @@ MainView {
         ConversationsPage {
             language: root.language
             conversations: conversationModel
+            requestCount: (root.privacy.requests || []).length
+            onPrivacyRequested: root.showPrivacy()
             busy: root.busy
             onConversationActivated: root.openConversation(thread, name)
             onConversationHoldRequested: root.askDeleteConversation(thread, name)
@@ -1185,6 +1240,8 @@ MainView {
     Component {
         id: conversationPage
         ConversationPage {
+            contactBlocked: root.contactBlocked(root.currentThread)
+            onPrivacyRequested: root.showPrivacy()
             language: root.language
             messages: messageModel
             title: root.currentName
@@ -1222,6 +1279,7 @@ MainView {
         ConversationActionsDialog {
             language: root.language
             onNicknameRequested: root.askNickname(thread, conversationName)
+            onBlockRequested: root.privacyContact(thread, blocked ? "unblock" : "block")
             onDeleteRequested: root.deleteConversation(thread)
         }
     }
@@ -1250,8 +1308,21 @@ MainView {
     }
 
     Component {
+        id: privacyPage
+        PrivacyPage {
+            language: root.language
+            privacy: root.privacy
+            busy: root.privacyBusy
+            onModeRequested: root.privacyMode(mode)
+            onContactRequested: root.privacyContact(jid, action)
+            onRefreshRequested: root.refreshPrivacy()
+        }
+    }
+
+    Component {
         id: settingsPage
         SettingsPage {
+            onPrivacyRequested: root.showPrivacy()
             language: root.language
             themeKey: root.themeKey
             pollSeconds: root.pollSeconds

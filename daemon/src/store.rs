@@ -6,6 +6,10 @@
 //! service's data directory. Attachments live next to it under
 //! `attachments/`, also private to the user.
 
+#[path = "privacy.rs"]
+mod privacy;
+pub use privacy::{Admission, MessageRequest, PrivacyContact};
+
 use crate::db::Db;
 use crate::engine::{Attachment, Conversation, Message, MESSAGE_LIMIT};
 use parking_lot::ReentrantMutexGuard;
@@ -50,7 +54,9 @@ pub struct Store {
 ///   remembers an explicit "plaintext" choice as well as an encrypted one.
 ///   New conversations can therefore default to encryption while a user's
 ///   deliberate unlock survives reopening and restarting.
-pub const SCHEMA_VERSION: i64 = 6;
+/// * **7 - contact consent (2026-10-23)**: account-scoped permissions,
+///   server block cache and bounded, undecrypted message requests.
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// Open (or create) `puhuri.db` and bring its schema up to
 /// [`SCHEMA_VERSION`]. `Store` and `OmemoStore` both go through here, so they
@@ -191,6 +197,7 @@ fn upgrade_to_current(connection: &Connection) -> Result<(), String> {
                 )
                 .map_err(|error| error.to_string())?;
         }
+        privacy::create_schema(connection)?;
         let after: i64 = connection
             .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
             .map_err(|error| error.to_string())?;
@@ -1110,6 +1117,10 @@ impl Store {
             "read_markers",
             "encrypted_threads",
             "settings",
+            "privacy_accounts",
+            "privacy_contacts",
+            "privacy_server_blocks",
+            "message_requests",
             "identity",
             "identities",
             "sessions",
