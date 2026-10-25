@@ -1,0 +1,2228 @@
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2842,8 +2842,6 @@
+ [[package]]
+ name = "xmpp-parsers"
+ version = "0.23.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "92b5d63bbd122ce3b5287d83efdd6916fb88bb274be23f6a9140238e0e1465b0"
+ dependencies = [
+  "base64",
+  "blake2",
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -241,3 +241,6 @@
+ level = "warn"
+ priority = 0
+ check-cfg = ["cfg(xmpprs_doc_build)"]
++
++[patch.crates-io]
++xmpp-parsers = { path = "../xmpp-parsers-0.23.0" }
+--- a/src/client/mod.rs
++++ b/src/client/mod.rs
+@@ -1,3 +1,5 @@
++// Modified for Puhuri 2, 2026-10-24: durable ingress constructor and EOF-safe cleanup.
++// SPDX-License-Identifier: MPL-2.0
+ // Copyright (c) 2019 Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>
+ //
+ // This Source Code Form is subject to the terms of the Mozilla Public
+@@ -13,7 +15,7 @@
+ use crate::Stanza;
+ use std::io;
+ use std::sync::Arc;
+-use tokio::sync::{mpsc, oneshot, Mutex};
++use tokio::sync::{mpsc, oneshot};
+ use tokio::task::JoinHandle;
+ use xmpp_parsers::{
+     jid::{FullJid, Jid},
+@@ -140,18 +142,48 @@
+     /// This performs an orderly stream shutdown, ensuring that all resources
+     /// are correctly cleaned up.
+     pub async fn send_end(self) -> Result<(), Error> {
+-        self.shutdown_tx.send(()).expect("ClientWorker crashed.");
+-
+-        let stream_rx = self.worker.await.unwrap();
++        let _ = self.shutdown_tx.send(());
++
++        let stream_rx = self
++            .worker
++            .await
++            .map_err(|_| Error::Io(io::Error::other("XMPP client worker ended unexpectedly")))?;
+         let stream = StanzaStream::reunite(self.stream_tx, stream_rx);
+         stream.close().await;
+ 
+         Ok(())
+     }
+ 
++    /// Quietly stop an owned client and capture SM plus unsent outbound work.
++    /// Requires a durable ingress callback; buffered events are already durable
++    /// before they can be discarded during worker shutdown. Persist the result
++    /// before another process takes over. This does not itself enable resume.
++    pub async fn detach_quiet(self) -> io::Result<Option<stanzastream::DetachedState>> {
++        let Self {
++            stream_tx,
++            mut stanza_rx,
++            shutdown_tx,
++            mut worker,
++            ..
++        } = self;
++        let _ = shutdown_tx.send(());
++        let stream_rx = loop {
++            tokio::select! {
++                biased;
++                result = &mut worker => break result.map_err(|_| io::Error::other("XMPP client worker failed"))?,
++                event = stanza_rx.recv() => if event.is_none() {
++                    break worker.await.map_err(|_| io::Error::other("XMPP client worker failed"))?;
++                },
++            }
++        };
++        StanzaStream::reunite(stream_tx, stream_rx)
++            .detach_quiet()
++            .await
++    }
++
+     /// Split the client into [`ClientSender`] and [`ClientReceiver`].
+     pub fn split(self) -> (ClientSender, ClientReceiver) {
+-        let client = Arc::new(Mutex::new(self));
++        let client = Arc::new(stanzastream::ReceiverMutex::new(self));
+ 
+         let sender = ClientSender(client.clone());
+         let receiver = ClientReceiver(client);
+@@ -265,7 +297,74 @@
+         connector: C,
+         timeouts: Timeouts,
+     ) -> Self {
+-        let stream = StanzaStream::new_c2s(connector, jid.into(), password.into(), timeouts, 16);
++        Self::new_with_connector_and_ingress(jid, password, connector, timeouts, None)
++    }
++
++    /// Like `new_with_connector`, with a synchronous durable ingress barrier.
++    /// Commit failure ends the incoming stream; no footer or reconnect is sent.
++    pub fn new_with_connector_and_ingress<J: Into<Jid>, P: Into<String>, C: ServerConnector>(
++        jid: J,
++        password: P,
++        connector: C,
++        timeouts: Timeouts,
++        ingress: Option<stanzastream::InboundCommit>,
++    ) -> Self {
++        let stream = StanzaStream::new_c2s_with_ingress(
++            connector,
++            jid.into(),
++            password.into(),
++            timeouts,
++            16,
++            ingress,
++        );
++        Self::from_stanza_stream(stream)
++    }
++
++    /// Restore a persisted handoff for the same authenticated full JID.
++    /// The caller enforces server expiry and supplies a durable ingress barrier.
++    pub fn new_with_connector_and_handoff<P: Into<String>, C: ServerConnector>(
++        jid: FullJid,
++        password: P,
++        connector: C,
++        timeouts: Timeouts,
++        ingress: stanzastream::InboundCommit,
++        handoff: stanzastream::DetachedState,
++    ) -> io::Result<Self> {
++        let stream = StanzaStream::new_c2s_with_handoff(
++            connector,
++            jid,
++            password.into(),
++            timeouts,
++            16,
++            ingress,
++            handoff,
++        )?;
++        Ok(Self::from_stanza_stream(stream))
++    }
++
++    /// Establish or restore a client with actual inbound checkpoint context.
++    /// Handoff expiry and original full-JID validation belong to the caller.
++    pub fn new_with_connector_and_checkpoint<P: Into<String>, C: ServerConnector>(
++        jid: FullJid,
++        password: P,
++        connector: C,
++        timeouts: Timeouts,
++        commit: stanzastream::CheckpointCommit,
++        handoff: Option<stanzastream::DetachedState>,
++    ) -> io::Result<Self> {
++        let stream = StanzaStream::new_c2s_with_checkpoint(
++            connector,
++            jid,
++            password.into(),
++            timeouts,
++            16,
++            commit,
++            handoff,
++        )?;
++        Ok(Self::from_stanza_stream(stream))
++    }
++
++    pub(crate) fn from_stanza_stream(stream: StanzaStream) -> Self {
+         let (stream_tx, stream_rx) = stream.split();
+ 
+         let iq_response_tracker = iq::IqResponseTracker::new();
+@@ -285,3 +384,45 @@
+         }
+     }
+ }
++
++#[cfg(test)]
++mod split_tests {
++    use super::*;
++    use futures::{SinkExt, StreamExt};
++    use std::pin::Pin;
++    #[derive(Default)]
++    struct WakeCounter(std::sync::atomic::AtomicUsize);
++    impl futures::task::ArcWake for WakeCounter {
++        fn wake_by_ref(this: &Arc<Self>) {
++            this.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
++        }
++    }
++    #[tokio::test]
++    async fn split_receiver_is_woken_when_client_sender_releases_lock() {
++        let (stream, mut server) = crate::stanzastream::tests::plain_pair().await.unwrap();
++        let (sender, mut receiver) = Client::from_stanza_stream(stream).split();
++        let held = sender.0.lock().await;
++        let counter = Arc::new(WakeCounter::default());
++        let waker = futures::task::waker(counter.clone());
++        let mut cx = std::task::Context::from_waker(&waker);
++        assert!(futures::Stream::poll_next(Pin::new(&mut receiver), &mut cx).is_pending());
++        drop(held);
++        assert!(
++            counter.0.load(std::sync::atomic::Ordering::SeqCst) > 0,
++            "client receiver returned Pending without registering an unlock wake"
++        );
++        server
++            .send(&xmpp_parsers::presence::Presence::new(
++                xmpp_parsers::presence::Type::Unavailable,
++            ))
++            .await
++            .unwrap();
++        assert!(matches!(
++            tokio::time::timeout(std::time::Duration::from_secs(2), receiver.next())
++                .await
++                .unwrap(),
++            Some(Event::Stanza(Stanza::Presence(_)))
++        ));
++        let _client = Client::reunite(sender, receiver);
++    }
++}
+--- a/src/client/receiver.rs
++++ b/src/client/receiver.rs
+@@ -1,21 +1,23 @@
++// Modified for Puhuri 2, 2026-10-24: register split receiver unlock wakes.
++// SPDX-License-Identifier: MPL-2.0
+ // Copyright (c) 2025 xmpp-rs contributors.
+ //
+ // This Source Code Form is subject to the terms of the Mozilla Public
+ // License, v. 2.0. If a copy of the MPL was not distributed with this
+ // file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
++use crate::stanzastream::ReceiverMutex;
+ use crate::Client;
+ use crate::Event;
+ use core::{pin::Pin, task::Context};
+ use futures::StreamExt;
+ use futures::{task::Poll, Stream};
+ use std::sync::Arc;
+-use tokio::sync::Mutex;
+ use xmpp_parsers::{jid::FullJid, stream_features::StreamFeatures};
+ 
+ /// Read half of a [`Client`](crate::Client).
+ #[derive(Debug)]
+-pub struct ClientReceiver(pub(super) Arc<Mutex<Client>>);
++pub struct ClientReceiver(pub(super) Arc<ReceiverMutex<Client>>);
+ 
+ impl ClientReceiver {
+     /// Return the bound JID.
+@@ -39,9 +41,7 @@
+     type Item = Event;
+ 
+     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+-        let Ok(mut client) = self.0.try_lock() else {
+-            return Poll::Pending;
+-        };
++        let mut client = futures::ready!(self.0.poll_lock(cx));
+ 
+         client.poll_next_unpin(cx)
+     }
+--- a/src/client/sender.rs
++++ b/src/client/sender.rs
+@@ -1,21 +1,23 @@
++// Modified for Puhuri 2, 2026-10-24: register split receiver unlock wakes.
++// SPDX-License-Identifier: MPL-2.0
+ // Copyright (c) 2025 xmpp-rs contributors.
+ //
+ // This Source Code Form is subject to the terms of the Mozilla Public
+ // License, v. 2.0. If a copy of the MPL was not distributed with this
+ // file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
++use crate::stanzastream::ReceiverMutex;
+ use crate::stanzastream::StanzaToken;
+ use crate::IqRequest;
+ use crate::IqResponseToken;
+ use crate::Stanza;
+ use std::io;
+ use std::sync::Arc;
+-use tokio::sync::Mutex;
+ use xmpp_parsers::jid::Jid;
+ 
+ /// Write half of a [`Client`](crate::Client).
+ #[derive(Debug)]
+-pub struct ClientSender(pub(super) Arc<Mutex<super::Client>>);
++pub struct ClientSender(pub(super) Arc<ReceiverMutex<super::Client>>);
+ 
+ impl ClientSender {
+     /// Send a stanza.
+--- a/src/client/worker.rs
++++ b/src/client/worker.rs
+@@ -1,3 +1,5 @@
++// Modified for Puhuri 2, 2026-10-24: propagate backend EOF.
++// SPDX-License-Identifier: MPL-2.0
+ // Copyright (c) 2025 xmpp-rs contributors.
+ //
+ // This Source Code Form is subject to the terms of the Mozilla Public
+@@ -61,9 +63,12 @@
+                 _ = &mut self.shutdown_rx => {
+                     return self.stream_rx;
+                 }
+-                Some(event) = self.stream_rx.next() => {
+-                    self.handle_event(event).await;
+-                }
++                event = self.stream_rx.next() => match event {
++                    Some(event) => self.handle_event(event).await,
++                    // Terminal ingress failure closes the backend channel.
++                    // Let Client::next() observe EOF instead of waiting forever.
++                    None => return self.stream_rx,
++                },
+             }
+         }
+     }
+@@ -93,11 +98,21 @@
+                     resumed: false,
+                 }
+             }
+-            StanzaStreamEvent::Stream(StreamEvent::Resumed) => Event::Online {
+-                bound_jid: self.bound_jid.as_ref().unwrap().clone().into(),
+-                features: self.features.as_ref().unwrap().clone(),
+-                resumed: true,
+-            },
++            StanzaStreamEvent::Stream(StreamEvent::Resumed {
++                bound_jid,
++                features,
++            }) => {
++                // A new process has never received Reset; do not unwrap caches.
++                self.bound_jid = bound_jid.try_as_full().ok().cloned();
++                self.features = Some(features.clone());
++                self.iq_response_tracker
++                    .set_account_jid(bound_jid.to_bare());
++                Event::Online {
++                    bound_jid,
++                    features,
++                    resumed: true,
++                }
++            }
+             StanzaStreamEvent::Stream(StreamEvent::Suspended) => return,
+         };
+ 
+--- a/src/stanzastream/connected.rs
++++ b/src/stanzastream/connected.rs
+@@ -1,3 +1,5 @@
++// Modified for Puhuri 2, 2026-10-24: transfer SM state on quiet detach.
++// SPDX-License-Identifier: MPL-2.0
+ // Copyright (c) 2019 Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>
+ //
+ // This Source Code Form is subject to the terms of the Mozilla Public
+@@ -144,6 +146,24 @@
+ }
+ 
+ impl ConnectedState {
++    pub fn ingress_snapshot(&self) -> (bool, Option<SmSnapshot>) {
++        match self {
++            Self::Ready { sm_state } => (true, sm_state.as_ref().map(SmState::snapshot)),
++            _ => (false, None),
++        }
++    }
++
++    pub fn into_sm_snapshot(self) -> Option<SmSnapshot> {
++        match self {
++            Self::Ready { sm_state }
++            | Self::Failed { sm_state, .. }
++            | Self::RemoteShutdown { sm_state } => sm_state.map(SmState::into_snapshot),
++            Self::Negotiating { substate } => substate.into_sm_snapshot(),
++            // No resumption state survives an intentional clean shutdown.
++            _ => None,
++        }
++    }
++
+     fn to_stream_error_state(&mut self, stream_error: StreamError) {
+         *self = Self::SendStreamError {
+             stream_error: Some(stream_error),
+@@ -410,7 +430,10 @@
+                         *self = Self::Ready {
+                             sm_state: Some(sm_state),
+                         };
+-                        Poll::Ready(Some(ConnectedEvent::Worker(WorkerEvent::Resumed)))
++                        Poll::Ready(Some(ConnectedEvent::Worker(WorkerEvent::Resumed {
++                            bound_jid: jid.clone(),
++                            features: features.clone(),
++                        })))
+                     }
+                     Break(NegotiationResult::StreamError { error }) => {
+                         self.to_stream_error_state(error);
+@@ -609,7 +632,9 @@
+                         if let Some(sm_state) = sm_state.as_mut() {
+                             sm_state.received();
+                         }
+-                        Poll::Ready(None)
++                        Poll::Ready(Some(ConnectedEvent::Worker(
++                            WorkerEvent::HandledInvalidStanza,
++                        )))
+                     }
+ 
+                     // Another easy case: Soft timeouts are passed through
+--- a/src/stanzastream/mod.rs
++++ b/src/stanzastream/mod.rs
+@@ -1,3 +1,5 @@
++// Modified for Puhuri 2, 2026-10-24: durable ingress and split receiver unlock wakes.
++// SPDX-License-Identifier: MPL-2.0
+ // Copyright (c) 2019 Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>
+ //
+ // This Source Code Form is subject to the terms of the Mozilla Public
+@@ -45,13 +47,52 @@
+ mod queue;
+ mod stream_management;
+ #[cfg(test)]
+-mod tests;
++pub(crate) mod tests;
+ mod worker;
+ 
+ use self::queue::QueueEntry;
+ pub use self::queue::{StanzaStage, StanzaState, StanzaToken};
++pub use self::stream_management::SmSnapshot;
+ pub use self::worker::{Connection, XmppStream};
+ use self::worker::{StanzaStreamWorker, LOCAL_SHUTDOWN_TIMEOUT};
++
++/// Synchronous durable ingress barrier, run on the sole transport worker.
++///
++/// Success must mean the stanza is durable or has a final policy disposition.
++/// The worker does not drive transport writes (including SM acks) while this
++/// callback runs. Failure is terminal: drop transport without a stream footer
++/// or reconnect. Do not include stanza content/credentials in error text.
++/// This does not itself provide snapshot/resume or durable outbound replay.
++/// Only parsed application stanzas reach the barrier: library-handled bind
++/// replies and malformed stanza parse errors do not. Pre-SM stanzas can reach
++/// it, so callback count must not be used as a protocol SM counter.
++pub type InboundCommit = Arc<dyn Fn(&Stanza) -> std::io::Result<()> + Send + Sync>;
++
++/// State at an inbound durability barrier, captured by the sole transport worker.
++/// `ready=false` means a pre-SM/bind negotiation stanza: persist the stanza,
++/// but do not replace a prior stream checkpoint with this provisional state.
++pub struct IngressContext {
++    /// Authenticated identity (bound identity once ready).
++    pub jid: Jid,
++    /// True only once the stream negotiation has completed.
++    pub ready: bool,
++    /// Actual protocol counters plus outbound state at this event boundary.
++    pub state: DetachedState,
++}
++
++/// Context-aware ingress. `None` is a malformed stanza the library has finally
++/// discarded and counted; checkpoint that disposition without storing XML.
++/// Success must make the incoming stanza/checkpoint durable before any ack.
++pub type CheckpointCommit =
++    Arc<dyn Fn(Option<&Stanza>, IngressContext) -> std::io::Result<()> + Send + Sync>;
++
++fn copy_stanza(stanza: &Stanza) -> Stanza {
++    match stanza {
++        Stanza::Iq(v) => v.clone().into(),
++        Stanza::Message(v) => v.clone().into(),
++        Stanza::Presence(v) => v.clone().into(),
++    }
++}
+ 
+ /// Event informing about the change of the [`StanzaStream`]'s status.
+ #[derive(Debug)]
+@@ -75,7 +116,12 @@
+     /// The stream was reestablished **without** loss of state.
+     ///
+     /// This is merely informative. Potentially useful to prolong timeouts.
+-    Resumed,
++    Resumed {
++        /// The identity retained by the resumed session.
++        bound_jid: Jid,
++        /// Features of the new transport.
++        features: StreamFeatures,
++    },
+ }
+ 
+ /// Event emitted by the [`StanzaStream`].
+@@ -91,11 +137,49 @@
+     Stanza(Stanza),
+ }
+ 
++/// Complete owned data returned by a quiet transport detach.
++/// Persist both SM and unsent work before another process takes ownership.
++#[derive(PartialEq)]
++pub struct DetachedState {
++    /// Negotiated SM state; its token may be absent when resumption was disallowed.
++    pub sm: Option<SmSnapshot>,
++    /// Not-yet-sent work, separate from the SM unacknowledged wire sequence.
++    pub pending: Vec<Stanza>,
++}
++
++impl std::fmt::Debug for DetachedState {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("DetachedState")
++            .field("sm", &self.sm)
++            .field("pending_count", &self.pending.len())
++            .finish()
++    }
++}
++
++#[derive(Debug, Default)]
++struct ConnectorTasks(std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>);
++impl ConnectorTasks {
++    fn take(&self) -> Vec<tokio::task::JoinHandle<()>> {
++        std::mem::take(&mut *self.0.lock().expect("connector task lock poisoned"))
++    }
++}
++impl Drop for ConnectorTasks {
++    fn drop(&mut self) {
++        for task in self.take() {
++            task.abort();
++        }
++    }
++}
++
+ /// Frontend interface to a reliable, always-online stanza stream.
+ #[derive(Debug)]
+ pub struct StanzaStream {
+     rx: mpsc::Receiver<Event>,
+     tx: mpsc::Sender<QueueEntry>,
++    detach: Option<oneshot::Sender<()>>,
++    worker: tokio::task::JoinHandle<Option<DetachedState>>,
++    durable_ingress: bool,
++    connector_tasks: Option<Arc<ConnectorTasks>>,
+ }
+ 
+ impl StanzaStream {
+@@ -124,12 +208,98 @@
+         timeouts: Timeouts,
+         queue_depth: usize,
+     ) -> Self {
++        Self::new_c2s_with_ingress(server, jid, password, timeouts, queue_depth, None)
++    }
++
++    /// Establish a c2s stream with an optional durable ingress barrier.
++    pub fn new_c2s_with_ingress<C: ServerConnector>(
++        server: C,
++        jid: Jid,
++        password: String,
++        timeouts: Timeouts,
++        queue_depth: usize,
++        ingress: Option<InboundCommit>,
++    ) -> Self {
++        Self::new_c2s_config(
++            server,
++            jid,
++            password,
++            timeouts,
++            queue_depth,
++            ingress,
++            None,
++            None,
++        )
++    }
++
++    /// Resume an owned handoff on the same authenticated full JID.
++    /// The caller must enforce server expiry and keep the original full JID.
++    pub fn new_c2s_with_handoff<C: ServerConnector>(
++        server: C,
++        jid: xmpp_parsers::jid::FullJid,
++        password: String,
++        timeouts: Timeouts,
++        queue_depth: usize,
++        ingress: InboundCommit,
++        handoff: DetachedState,
++    ) -> std::io::Result<Self> {
++        Self::validate_handoff(&handoff)?;
++        Ok(Self::new_c2s_config(
++            server,
++            jid.into(),
++            password,
++            timeouts,
++            queue_depth,
++            Some(ingress),
++            Some(handoff),
++            None,
++        ))
++    }
++
++    /// Establish or restore a c2s stream using actual protocol checkpoint context.
++    /// The caller must enforce handoff age and preserve the authenticated full JID.
++    pub fn new_c2s_with_checkpoint<C: ServerConnector>(
++        server: C,
++        jid: xmpp_parsers::jid::FullJid,
++        password: String,
++        timeouts: Timeouts,
++        queue_depth: usize,
++        commit: CheckpointCommit,
++        handoff: Option<DetachedState>,
++    ) -> std::io::Result<Self> {
++        if let Some(ref state) = handoff {
++            Self::validate_handoff(state)?;
++        }
++        Ok(Self::new_c2s_config(
++            server,
++            jid.into(),
++            password,
++            timeouts,
++            queue_depth,
++            None,
++            handoff,
++            Some(commit),
++        ))
++    }
++
++    fn new_c2s_config<C: ServerConnector>(
++        server: C,
++        jid: Jid,
++        password: String,
++        timeouts: Timeouts,
++        queue_depth: usize,
++        ingress: Option<InboundCommit>,
++        handoff: Option<DetachedState>,
++        checkpoint: Option<CheckpointCommit>,
++    ) -> Self {
++        let tasks = Arc::new(ConnectorTasks::default());
++        let captured_tasks = tasks.clone();
+         let reconnector = Box::new(
+             move |_preferred_location: Option<String>, slot: oneshot::Sender<Connection>| {
+                 let jid = jid.clone();
+                 let server = server.clone();
+                 let password = password.clone();
+-                tokio::spawn(async move {
++                let task = tokio::spawn(async move {
+                     const MAX_DELAY: Duration = Duration::new(30, 0);
+                     let mut delay = Duration::new(1, 0);
+                     loop {
+@@ -179,9 +349,17 @@
+                         }
+                     }
+                 });
++                let mut tasks = captured_tasks
++                    .0
++                    .lock()
++                    .expect("connector task lock poisoned");
++                tasks.retain(|task| !task.is_finished());
++                tasks.push(task);
+             },
+         );
+-        Self::new(reconnector, queue_depth)
++        let mut stream = Self::new_config(reconnector, queue_depth, ingress, handoff, checkpoint);
++        stream.connector_tasks = Some(tasks);
++        stream
+     }
+ 
+     /// Create a new stanza stream.
+@@ -217,12 +395,130 @@
+         connector: Box<dyn FnMut(Option<String>, oneshot::Sender<Connection>) + Send + 'static>,
+         queue_depth: usize,
+     ) -> Self {
++        Self::new_with_ingress(connector, queue_depth, None)
++    }
++
++    /// Create a stream whose received stanzas pass a durable ingress barrier
++    /// before delivery or any subsequent transport write. A failed commit
++    /// terminates this stream without a footer or automatic reconnection.
++    pub fn new_with_ingress(
++        connector: Box<dyn FnMut(Option<String>, oneshot::Sender<Connection>) + Send + 'static>,
++        queue_depth: usize,
++        ingress: Option<InboundCommit>,
++    ) -> Self {
++        Self::new_config(connector, queue_depth, ingress, None, None)
++    }
++
++    /// Restore a handoff using a custom authenticated connector.
++    /// It MUST produce the same authenticated full JID as the original session.
++    /// The caller must reject expired handoffs before using this constructor.
++    pub fn new_with_handoff(
++        connector: Box<dyn FnMut(Option<String>, oneshot::Sender<Connection>) + Send + 'static>,
++        queue_depth: usize,
++        ingress: InboundCommit,
++        handoff: DetachedState,
++    ) -> std::io::Result<Self> {
++        Self::validate_handoff(&handoff)?;
++        Ok(Self::new_config(
++            connector,
++            queue_depth,
++            Some(ingress),
++            Some(handoff),
++            None,
++        ))
++    }
++
++    /// Custom-connector variant of the context-aware durability barrier.
++    /// External connector tasks remain the caller's responsibility.
++    pub fn new_with_checkpoint(
++        connector: Box<dyn FnMut(Option<String>, oneshot::Sender<Connection>) + Send + 'static>,
++        queue_depth: usize,
++        commit: CheckpointCommit,
++        handoff: Option<DetachedState>,
++    ) -> std::io::Result<Self> {
++        if let Some(ref state) = handoff {
++            Self::validate_handoff(state)?;
++        }
++        Ok(Self::new_config(
++            connector,
++            queue_depth,
++            None,
++            handoff,
++            Some(commit),
++        ))
++    }
++
++    fn validate_handoff(handoff: &DetachedState) -> std::io::Result<()> {
++        if handoff.sm.as_ref().is_some_and(|sm| {
++            sm.unacked.len() >= (u32::MAX / 2) as usize
++                || sm.id.as_ref().is_some_and(|id| id.is_empty())
++        }) {
++            return Err(std::io::Error::new(
++                std::io::ErrorKind::InvalidInput,
++                "invalid SM handoff",
++            ));
++        }
++        Ok(())
++    }
++
++    fn new_config(
++        connector: Box<dyn FnMut(Option<String>, oneshot::Sender<Connection>) + Send + 'static>,
++        queue_depth: usize,
++        ingress: Option<InboundCommit>,
++        handoff: Option<DetachedState>,
++        checkpoint: Option<CheckpointCommit>,
++    ) -> Self {
+         // c2f = core to frontend, f2c = frontend to core
+-        let (f2c_tx, c2f_rx) = StanzaStreamWorker::spawn(connector, queue_depth);
++        let durable_ingress = ingress.is_some() || checkpoint.is_some();
++        let (f2c_tx, c2f_rx, detach, worker) =
++            StanzaStreamWorker::spawn(connector, queue_depth, ingress, handoff, checkpoint);
+         Self {
+             tx: f2c_tx,
+             rx: c2f_rx,
+-        }
++            detach: Some(detach),
++            worker,
++            durable_ingress,
++            connector_tasks: None,
++        }
++    }
++
++    /// Stop socket I/O without an XML footer and return all outbound work.
++    /// Requires a durable ingress callback: buffered frontend events can be
++    /// discarded only because they already committed before delivery.
++    /// This is not persistence or a cross-process resume operation by itself.
++    pub async fn detach_quiet(mut self) -> std::io::Result<Option<DetachedState>> {
++        if !self.durable_ingress {
++            return Err(std::io::Error::new(
++                std::io::ErrorKind::InvalidInput,
++                "quiet detach requires durable ingress",
++            ));
++        }
++        if let Some(detach) = self.detach.take() {
++            let _ = detach.send(());
++        }
++        let result = loop {
++            // Draining removes frontend backpressure, so the worker can leave
++            // a blocked channel send and observe the prioritized detach request.
++            tokio::select! {
++                biased;
++                result = &mut self.worker => break result.map_err(|_| std::io::Error::other("XMPP stream worker failed")),
++                event = self.rx.recv() => if event.is_none() {
++                    break (&mut self.worker).await.map_err(|_| std::io::Error::other("XMPP stream worker failed"));
++                },
++            }
++        };
++        // The stream worker is gone, so it can no longer start a connector.
++        // Abort and join every library-owned login/backoff task before handoff.
++        if let Some(tasks) = self.connector_tasks.take() {
++            let handles = tasks.take();
++            for handle in &handles {
++                handle.abort();
++            }
++            for handle in handles {
++                let _ = handle.await;
++            }
++        }
++        result
+     }
+ 
+     async fn assert_send(&self, cmd: QueueEntry) {
+@@ -263,7 +559,7 @@
+ 
+     /// Split the stream into the [`StanzaSender`] and [`StanzaReceiver`].
+     pub fn split(self) -> (StanzaSender, StanzaReceiver) {
+-        let stream = Arc::new(Mutex::new(self));
++        let stream = Arc::new(ReceiverMutex::new(self));
+ 
+         let tx = StanzaSender(stream.clone());
+         let rx = StanzaReceiver(stream);
+@@ -298,9 +594,75 @@
+     }
+ }
+ 
++/// Split-stream mutex with a registered receiver wake on writer release.
++/// The receiver never holds a lock future/reservation across cancellation or
++/// reunite. Register and retry closes the unlock-before-register race.
++pub(crate) struct ReceiverMutex<T> {
++    inner: Mutex<T>,
++    receiver: futures::task::AtomicWaker,
++}
++impl<T> std::fmt::Debug for ReceiverMutex<T> {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str("ReceiverMutex { .. }")
++    }
++}
++impl<T> ReceiverMutex<T> {
++    pub(crate) fn new(value: T) -> Self {
++        Self {
++            inner: Mutex::new(value),
++            receiver: futures::task::AtomicWaker::new(),
++        }
++    }
++    pub(crate) async fn lock(&self) -> ReceiverMutexGuard<'_, T> {
++        ReceiverMutexGuard {
++            guard: Some(self.inner.lock().await),
++            receiver: &self.receiver,
++        }
++    }
++    pub(crate) fn poll_lock(&self, cx: &mut Context<'_>) -> Poll<tokio::sync::MutexGuard<'_, T>> {
++        if let Ok(guard) = self.inner.try_lock() {
++            return Poll::Ready(guard);
++        }
++        self.receiver.register(cx.waker());
++        match self.inner.try_lock() {
++            Ok(guard) => {
++                self.receiver.take();
++                Poll::Ready(guard)
++            }
++            Err(_) => Poll::Pending,
++        }
++    }
++    pub(crate) fn into_inner(self) -> T {
++        self.inner.into_inner()
++    }
++}
++pub(crate) struct ReceiverMutexGuard<'a, T> {
++    guard: Option<tokio::sync::MutexGuard<'a, T>>,
++    receiver: &'a futures::task::AtomicWaker,
++}
++impl<T> std::ops::Deref for ReceiverMutexGuard<'_, T> {
++    type Target = T;
++    fn deref(&self) -> &T {
++        self.guard.as_deref().expect("live split guard")
++    }
++}
++impl<T> std::ops::DerefMut for ReceiverMutexGuard<'_, T> {
++    fn deref_mut(&mut self) -> &mut T {
++        self.guard.as_deref_mut().expect("live split guard")
++    }
++}
++impl<T> Drop for ReceiverMutexGuard<'_, T> {
++    fn drop(&mut self) {
++        // Wake only after releasing the mutex: waking while locked can cause
++        // the receiver to observe contention and miss the final unlock again.
++        drop(self.guard.take());
++        self.receiver.wake();
++    }
++}
++
+ /// Send half of the [`StanzaStream`]
+ #[derive(Debug)]
+-pub struct StanzaSender(pub(super) Arc<Mutex<StanzaStream>>);
++pub struct StanzaSender(pub(super) Arc<ReceiverMutex<StanzaStream>>);
+ 
+ impl StanzaSender {
+     /// Send a stanza via the stream.
+@@ -313,15 +675,13 @@
+ 
+ /// Receive half of the [`StanzaStream`]
+ #[derive(Debug)]
+-pub struct StanzaReceiver(pub(super) Arc<Mutex<StanzaStream>>);
++pub struct StanzaReceiver(pub(super) Arc<ReceiverMutex<StanzaStream>>);
+ 
+ impl Stream for StanzaReceiver {
+     type Item = Event;
+ 
+     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+-        let Ok(mut stream) = self.0.try_lock() else {
+-            return Poll::Pending;
+-        };
++        let mut stream = futures::ready!(self.0.poll_lock(cx));
+ 
+         stream.rx.poll_recv(cx)
+     }
+--- a/src/stanzastream/negotiation.rs
++++ b/src/stanzastream/negotiation.rs
+@@ -1,3 +1,5 @@
++// Modified for Puhuri 2, 2026-10-24: retain resumable state on quiet detach during negotiation.
++// SPDX-License-Identifier: MPL-2.0
+ // Copyright (c) 2019 Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>
+ //
+ // This Source Code Form is subject to the terms of the Mozilla Public
+@@ -100,15 +102,30 @@
+ }
+ 
+ impl NegotiationState {
+-    pub fn new(features: &StreamFeatures, sm_state: Option<SmState>) -> io::Result<Self> {
+-        if let Some(sm_state) = sm_state {
+-            if features.stream_management.is_some() {
++    pub fn into_sm_snapshot(self) -> Option<SmSnapshot> {
++        match self {
++            Self::SendSmRequest { sm_state, .. } | Self::ReceiveSmResponse { sm_state, .. } => {
++                sm_state.map(SmState::into_snapshot)
++            }
++            Self::SendBindRequest { .. } | Self::ReceiveBindResponse { .. } => None,
++        }
++    }
++
++    pub fn new(
++        features: &StreamFeatures,
++        sm_state: Option<SmState>,
++        transmit_queue: &mut TransmitQueue<QueueEntry>,
++    ) -> io::Result<Self> {
++        if let Some(mut sm_state) = sm_state {
++            if features.stream_management.is_some() && sm_state.resume_info().is_some() {
+                 return Ok(Self::SendSmRequest {
+                     sm_state: Some(sm_state),
+                     bound_jid: None,
+                 });
+             } else {
+-                log::warn!("Peer is not offering stream management anymore. Dropping state.");
++                // A fresh stream still needs the original bytes of unacked
++                // traffic. Preserve their order before newer pending work.
++                transmit_queue.requeue_all(sm_state.take_unacked());
+             }
+         }
+ 
+@@ -418,7 +435,18 @@
+                     Ok(XmppStreamElement::SM(sm::Nonza::Resumed(resumed))) => match sm_state.take()
+                     {
+                         Some(mut sm_state) => {
+-                            // Yay!
++                            if sm_state
++                                .resume_info()
++                                .is_none_or(|(id, _)| id != resumed.previd.0)
++                            {
++                                return Poll::Ready(Break(NegotiationResult::StreamError {
++                                    error: StreamError::new(
++                                        DefinedCondition::PolicyViolation,
++                                        "en",
++                                        "SM resumption token mismatch".to_string(),
++                                    ),
++                                }));
++                            }
+                             match sm_state.resume(resumed.h) {
+                                 Ok(to_retransmit) => transmit_queue.requeue_all(to_retransmit),
+                                 Err(e) => {
+@@ -453,12 +481,13 @@
+ 
+                     Ok(XmppStreamElement::SM(sm::Nonza::Failed(failed))) => match sm_state {
+                         Some(sm_state) => {
+-                            log::debug!("Received <sm:failed/> in response to resumption request. Discarding SM data and attempting to renegotiate.");
++                            log::debug!("Received <sm:failed/> in response to resumption request. Preserving unacked traffic and attempting to renegotiate.");
+                             if let Some(h) = failed.h {
+                                 // This is only an optimization anyway, so
+                                 // we can also just ignore this.
+                                 let _: Result<_, _> = sm_state.remote_acked(h);
+                             }
++                            transmit_queue.requeue_all(sm_state.take_unacked());
+                             *self = Self::SendBindRequest { sm_supported: true };
+                             Poll::Ready(Continue(None))
+                         }
+--- a/src/stanzastream/queue.rs
++++ b/src/stanzastream/queue.rs
+@@ -1,3 +1,5 @@
++// Modified for Puhuri 2, 2026-10-24: retain unsent queue on quiet detach.
++// SPDX-License-Identifier: MPL-2.0
+ // Copyright (c) 2019 Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>
+ //
+ // This Source Code Form is subject to the terms of the Mozilla Public
+@@ -341,6 +343,33 @@
+ }
+ 
+ impl TransmitQueue<QueueEntry> {
++    pub fn snapshot_pending(&mut self) -> Vec<Stanza> {
++        // Bound work to the currently visible channel contents. Newly queued
++        // work remains unsent while the durability callback runs.
++        let count = self.inner.len();
++        for _ in 0..count {
++            if let Ok(entry) = self.inner.try_recv() {
++                self.peek.push_back(entry);
++            } else {
++                break;
++            }
++        }
++        self.peek
++            .iter()
++            .map(|entry| super::copy_stanza(&entry.stanza))
++            .collect()
++    }
++
++    pub fn take_pending(&mut self) -> Vec<Stanza> {
++        // Stop accepting new work before draining both queue layers.
++        self.inner.close();
++        let mut pending: Vec<_> = self.peek.drain(..).map(|entry| *entry.stanza).collect();
++        while let Ok(entry) = self.inner.try_recv() {
++            pending.push(*entry.stanza);
++        }
++        pending
++    }
++
+     /// Fail all currently queued items with the given error.
+     ///
+     /// Future items will not be affected.
+--- a/src/stanzastream/stream_management.rs
++++ b/src/stanzastream/stream_management.rs
+@@ -1,3 +1,5 @@
++// Modified for Puhuri 2, 2026-10-24: complete quiet-detach snapshot.
++// SPDX-License-Identifier: MPL-2.0
+ // Copyright (c) 2019 Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>
+ //
+ // This Source Code Form is subject to the terms of the Mozilla Public
+@@ -22,7 +24,38 @@
+         // TODO: pass this to the reconnection logic.
+         #[allow(dead_code)]
+         location: Option<String>,
++        max_resume_secs: Option<u32>,
+     },
++}
++
++/// Owned SM state captured after transport closure at a durable ingress boundary.
++/// Stanzas not yet acknowledged by the server retain their original order.
++/// This is an in-memory value; callers must persist it before handing off.
++#[derive(PartialEq)]
++pub struct SmSnapshot {
++    /// Server resumption token if resumption was allowed; never log it.
++    pub id: Option<String>,
++    /// Server's optional preferred resumption location.
++    pub location: Option<String>,
++    /// Server-advertised resumption time limit.
++    pub max_resume_secs: Option<u32>,
++    /// Inbound handled count, including final library parse-error dispositions.
++    pub inbound_h: u32,
++    /// Last outbound count acknowledged by the server (not total sent).
++    pub outbound_acked: u32,
++    /// Serialized/sent stanzas the server has not acknowledged, in wire order.
++    pub unacked: Vec<crate::Stanza>,
++}
++
++impl fmt::Debug for SmSnapshot {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        // Neither the resumption token nor stanza contents belong in logs.
++        f.debug_struct("SmSnapshot")
++            .field("inbound_h", &self.inbound_h)
++            .field("outbound_acked", &self.outbound_acked)
++            .field("unacked_count", &self.unacked.len())
++            .finish_non_exhaustive()
++    }
+ }
+ 
+ /// State for stream management
+@@ -61,7 +94,7 @@
+         f.debug_struct("SmState")
+             .field("outbound_base", &self.outbound_base)
+             .field("inbound_ctr", &self.inbound_ctr)
+-            .field("resumption", &self.resumption)
++            .field("resumable", &self.resume_info().is_some())
+             .field("len(unacked_stanzas)", &self.unacked_stanzas.len())
+             .finish()
+     }
+@@ -124,6 +157,80 @@
+ }
+ 
+ impl SmState {
++    pub fn from_snapshot(snapshot: SmSnapshot) -> Self {
++        Self {
++            outbound_base: snapshot.outbound_acked,
++            inbound_ctr: snapshot.inbound_h,
++            pending_acks: 0,
++            pending_req: false,
++            resumption: match snapshot.id {
++                Some(id) => SmResumeInfo::Resumable {
++                    id,
++                    location: snapshot.location,
++                    max_resume_secs: snapshot.max_resume_secs,
++                },
++                None => SmResumeInfo::NotResumable,
++            },
++            unacked_stanzas: snapshot
++                .unacked
++                .into_iter()
++                .map(|stanza| QueueEntry::untracked(Box::new(stanza)))
++                .collect(),
++        }
++    }
++
++    pub fn take_unacked(&mut self) -> Vec<QueueEntry> {
++        self.unacked_stanzas.drain(..).collect()
++    }
++
++    pub fn snapshot(&self) -> SmSnapshot {
++        let (id, location, max_resume_secs) = match &self.resumption {
++            SmResumeInfo::Resumable {
++                id,
++                location,
++                max_resume_secs,
++            } => (Some(id.clone()), location.clone(), *max_resume_secs),
++            SmResumeInfo::NotResumable => (None, None, None),
++        };
++        SmSnapshot {
++            id,
++            location,
++            max_resume_secs,
++            inbound_h: self.inbound_ctr,
++            outbound_acked: self.outbound_base,
++            unacked: self
++                .unacked_stanzas
++                .iter()
++                .map(|entry| super::copy_stanza(&entry.stanza))
++                .collect(),
++        }
++    }
++
++    pub fn into_snapshot(self) -> SmSnapshot {
++        let (id, location, max_resume_secs) = match self.resumption {
++            SmResumeInfo::Resumable {
++                id,
++                location,
++                max_resume_secs,
++            } => (Some(id), location, max_resume_secs),
++            SmResumeInfo::NotResumable => (None, None, None),
++        };
++        // Even without a resumption token, unacknowledged outbound data must
++        // remain available for a fresh session's application replay policy.
++        SmSnapshot {
++            id,
++            location,
++            max_resume_secs,
++            inbound_h: self.inbound_ctr,
++            outbound_acked: self.outbound_base,
++            unacked: self
++                .unacked_stanzas
++                .into_iter()
++                .map(|entry| *entry.stanza)
++                .collect(),
++        }
++    }
++
+     /// Mark a stanza as sent and keep it in the stream management queue.
+     pub fn enqueue(&mut self, entry: QueueEntry) {
+         // This may seem like an arbitrary limit, but there's some thought
+@@ -238,6 +345,7 @@
+             match other.id {
+                 Some(id) => SmResumeInfo::Resumable {
+                     location: other.location,
++                    max_resume_secs: other.max,
+                     id: id.0,
+                 },
+                 None => {
+@@ -259,3 +367,48 @@
+         }
+     }
+ }
++
++#[cfg(test)]
++mod handoff_tests {
++    use super::*;
++    use xmpp_parsers::presence::{Presence, Type};
++
++    #[test]
++    fn owned_snapshot_retains_server_max_and_wrapping_counters_without_debug_secrets() {
++        let mut state = SmState::from(sm::Enabled {
++            id: Some(sm::StreamId("private-token".into())),
++            location: Some("private-location".into()),
++            max: Some(600),
++            resume: true,
++        });
++        state.inbound_ctr = u32::MAX;
++        state.received();
++        state.outbound_base = u32::MAX;
++        let mut stanza = Presence::new(Type::Unavailable);
++        stanza.id = Some("private-stanza-id".into());
++        state.enqueue(QueueEntry::untracked(Box::new(stanza.into())));
++        let snapshot = state.into_snapshot();
++        assert_eq!(snapshot.max_resume_secs, Some(600));
++        assert_eq!(snapshot.location.as_deref(), Some("private-location"));
++        assert_eq!(snapshot.inbound_h, 0);
++        assert_eq!(snapshot.outbound_acked, u32::MAX);
++        assert_eq!(snapshot.unacked.len(), 1);
++        let debug = format!("{snapshot:?}");
++        assert!(!debug.contains("private"));
++    }
++    #[test]
++    fn snapshot_keeps_unacked_data_when_resumption_is_not_available() {
++        let mut state = SmState::from(sm::Enabled {
++            id: None,
++            location: None,
++            max: None,
++            resume: false,
++        });
++        state.enqueue(QueueEntry::untracked(Box::new(
++            Presence::new(Type::Unavailable).into(),
++        )));
++        let snapshot = state.into_snapshot();
++        assert!(snapshot.id.is_none());
++        assert_eq!(snapshot.unacked.len(), 1);
++    }
++}
+--- a/src/stanzastream/tests.rs
++++ b/src/stanzastream/tests.rs
+@@ -1,3 +1,5 @@
++// Modified for Puhuri 2, 2026-10-24: durable ingress protocol regression tests.
++// SPDX-License-Identifier: MPL-2.0
+ use std::borrow::Cow;
+ use std::io;
+ 
+@@ -59,7 +61,15 @@
+ 
+ async fn custom_stream_pair(
+     identity: BareJid,
++    features: StreamFeatures,
++) -> io::Result<(StanzaStream, XmppStream)> {
++    custom_stream_pair_with_ingress(identity, features, None).await
++}
++
++async fn custom_stream_pair_with_ingress(
++    identity: BareJid,
+     mut features: StreamFeatures,
++    ingress: Option<InboundCommit>,
+ ) -> io::Result<(StanzaStream, XmppStream)> {
+     // We must always offer the resource binding feature.
+     features
+@@ -106,7 +116,7 @@
+     let mut server = rhs_task.await.unwrap()?.box_stream();
+ 
+     let mut lhs = Some((lhs, identity.clone()));
+-    let client = StanzaStream::new(
++    let client = StanzaStream::new_with_ingress(
+         Box::new(move |_, sink| match lhs.take() {
+             Some(((features, stream), identity)) => match sink.send(Connection {
+                 features,
+@@ -123,6 +133,7 @@
+             ),
+         }),
+         16,
++        ingress,
+     );
+ 
+     match map_io(map_err(server.next().await))? {
+@@ -156,7 +167,7 @@
+     Ok((client, server))
+ }
+ 
+-async fn plain_pair() -> io::Result<(StanzaStream, XmppStream)> {
++pub(crate) async fn plain_pair() -> io::Result<(StanzaStream, XmppStream)> {
+     let (mut client, server) = custom_stream_pair(
+         "client@domain.example".parse().unwrap(),
+         StreamFeatures::default(),
+@@ -172,10 +183,20 @@
+ }
+ 
+ async fn fresh_sm_pair() -> io::Result<(StanzaStream, XmppStream)> {
++    fresh_sm_pair_with_ingress(None).await
++}
++
++async fn fresh_sm_pair_with_ingress(
++    ingress: Option<InboundCommit>,
++) -> io::Result<(StanzaStream, XmppStream)> {
+     let mut features = StreamFeatures::default();
+     features.stream_management = Some(sm::StreamManagement { optional: false });
+-    let (mut client, mut server) =
+-        custom_stream_pair("client@domain.example".parse().unwrap(), features).await?;
++    let (mut client, mut server) = custom_stream_pair_with_ingress(
++        "client@domain.example".parse().unwrap(),
++        features,
++        ingress,
++    )
++    .await?;
+     match map_io(map_err(server.next().await))? {
+         XmppStreamElement::SM(sm) => match sm {
+             sm::Nonza::Enable(sm::Enable { max, resume }) => {
+@@ -296,3 +317,753 @@
+         other => panic!("unexpected recv result on client side: {other:?}"),
+     }
+ }
++
++// Puhuri modifications, 2026-10-24. MPL-2.0, like this source file.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn durable_ingress_precedes_sm_ack_even_without_frontend_polling() {
++    use std::sync::atomic::{AtomicUsize, Ordering};
++    let commits = Arc::new(AtomicUsize::new(0));
++    let committed = commits.clone();
++    let ingress: InboundCommit = Arc::new(move |_| {
++        committed.fetch_add(1, Ordering::SeqCst);
++        Ok(())
++    });
++    let (_client, mut server) = fresh_sm_pair_with_ingress(Some(ingress)).await.unwrap();
++    server
++        .send(&Presence::new(PresenceType::Unavailable))
++        .await
++        .unwrap();
++    server.send(&sm::R).await.unwrap();
++    match tokio::time::timeout(Duration::from_secs(2), server.next())
++        .await
++        .unwrap()
++    {
++        Some(Ok(FallibleStreamElement::Ok(XmppStreamElement::SM(sm::Nonza::Ack(sm::A { h }))))) => {
++            assert_eq!(h, 1);
++            assert_eq!(commits.load(Ordering::SeqCst), 1);
++        }
++        other => panic!("expected an SM ack after durable commit, got {other:?}"),
++    }
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn durable_ingress_holds_ack_while_commit_is_blocked() {
++    let entered = Arc::new(tokio::sync::Notify::new());
++    let notify = entered.clone();
++    let (release, wait) = std::sync::mpsc::channel();
++    let wait = std::sync::Mutex::new(wait);
++    let ingress: InboundCommit = Arc::new(move |_| {
++        notify.notify_one();
++        wait.lock()
++            .unwrap()
++            .recv_timeout(Duration::from_secs(2))
++            .map_err(|_| io::Error::other("test commit timed out"))?;
++        Ok(())
++    });
++    let (_client, mut server) = fresh_sm_pair_with_ingress(Some(ingress)).await.unwrap();
++    server
++        .send(&Presence::new(PresenceType::Unavailable))
++        .await
++        .unwrap();
++    server.send(&sm::R).await.unwrap();
++    tokio::time::timeout(Duration::from_secs(1), entered.notified())
++        .await
++        .unwrap();
++    let premature = tokio::time::timeout(Duration::from_millis(50), server.next()).await;
++    // Always release the worker, including on assertion failure.
++    release.send(()).unwrap();
++    assert!(
++        premature.is_err(),
++        "transport wrote while durable commit was blocked"
++    );
++    match tokio::time::timeout(Duration::from_secs(2), server.next())
++        .await
++        .unwrap()
++    {
++        Some(Ok(FallibleStreamElement::Ok(XmppStreamElement::SM(sm::Nonza::Ack(sm::A { h }))))) => {
++            assert_eq!(h, 1)
++        }
++        other => panic!("expected SM ack after releasing commit, got {other:?}"),
++    }
++}
++
++#[tokio::test]
++async fn durable_ingress_failure_drops_transport_without_ack_footer_or_reconnect() {
++    let ingress: InboundCommit = Arc::new(|_| Err(io::Error::other("simulated full disk")));
++    let (mut client, mut server) = fresh_sm_pair_with_ingress(Some(ingress)).await.unwrap();
++    server
++        .send(&Presence::new(PresenceType::Unavailable))
++        .await
++        .unwrap();
++    server.send(&sm::R).await.unwrap();
++    match tokio::time::timeout(Duration::from_secs(2), server.next())
++        .await
++        .unwrap()
++    {
++        None | Some(Err(ReadError::HardError(_))) => (),
++        other => panic!("failed ingress must drop, without ack or footer: {other:?}"),
++    }
++    assert!(
++        tokio::time::timeout(Duration::from_secs(2), client.next())
++            .await
++            .unwrap()
++            .is_none(),
++        "failed stanza must not reach frontend"
++    );
++}
++
++#[tokio::test]
++async fn durable_ingress_failure_reaches_client_eof_and_cleanup_does_not_panic() {
++    let ingress: InboundCommit = Arc::new(|_| Err(io::Error::other("simulated disk full")));
++    let (stream, mut server) = fresh_sm_pair_with_ingress(Some(ingress)).await.unwrap();
++    let mut client = crate::Client::from_stanza_stream(stream);
++    server
++        .send(&Presence::new(PresenceType::Unavailable))
++        .await
++        .unwrap();
++    server.send(&sm::R).await.unwrap();
++    assert!(tokio::time::timeout(Duration::from_secs(2), client.next())
++        .await
++        .unwrap()
++        .is_none());
++    tokio::time::timeout(Duration::from_secs(2), client.send_end())
++        .await
++        .unwrap()
++        .unwrap();
++}
++
++#[tokio::test]
++async fn quiet_detach_requires_durable_ingress() {
++    let (client, _server) = fresh_sm_pair().await.unwrap();
++    assert_eq!(
++        client.detach_quiet().await.unwrap_err().kind(),
++        io::ErrorKind::InvalidInput
++    );
++}
++
++#[tokio::test]
++async fn quiet_detach_preserves_unsent_queue_without_a_connection() {
++    let slots = Arc::new(std::sync::Mutex::new(Vec::new()));
++    let capture = slots.clone();
++    let stream = StanzaStream::new_with_ingress(
++        Box::new(move |_, slot| {
++            capture.lock().unwrap().push(slot);
++        }),
++        4,
++        Some(Arc::new(|_| Ok(()))),
++    );
++    for id in ["first", "second"] {
++        let mut presence = Presence::new(PresenceType::Unavailable);
++        presence.id = Some(id.into());
++        stream.send(Box::new(presence.into())).await;
++    }
++    let detached = tokio::time::timeout(Duration::from_secs(2), stream.detach_quiet())
++        .await
++        .unwrap()
++        .unwrap()
++        .unwrap();
++    assert!(detached.sm.is_none());
++    let ids: Vec<_> = detached
++        .pending
++        .iter()
++        .map(|stanza| match stanza {
++            Stanza::Presence(p) => p.id.as_deref().unwrap(),
++            _ => panic!("expected presence"),
++        })
++        .collect();
++    assert_eq!(ids, ["first", "second"]);
++}
++
++#[tokio::test]
++async fn quiet_detach_keeps_unacked_wire_order_and_outbound_ack_base() {
++    let (client, mut server) = fresh_sm_pair_with_ingress(Some(Arc::new(|_| Ok(()))))
++        .await
++        .unwrap();
++    for (id, ack) in [
++        ("already-acked", true),
++        ("unacked-second", false),
++        ("unacked-third", false),
++    ] {
++        let mut presence = Presence::new(PresenceType::Unavailable);
++        presence.id = Some(id.into());
++        client.send(Box::new(presence.into())).await;
++        loop {
++            match map_io(map_err(server.next().await)).unwrap() {
++                XmppStreamElement::Stanza(Stanza::Presence(p)) => {
++                    assert_eq!(p.id.as_deref(), Some(id));
++                    break;
++                }
++                XmppStreamElement::SM(sm::Nonza::Req(_)) => (),
++                other => panic!("unexpected outbound {other:?}"),
++            }
++        }
++        if ack {
++            server.send(&sm::A { h: 1 }).await.unwrap();
++            // The response to this R proves the earlier A has been handled.
++            server.send(&sm::R).await.unwrap();
++            loop {
++                match map_io(map_err(server.next().await)).unwrap() {
++                    XmppStreamElement::SM(sm::Nonza::Ack(sm::A { h: 0 })) => break,
++                    XmppStreamElement::SM(sm::Nonza::Req(_)) => (),
++                    other => panic!("unexpected ack barrier {other:?}"),
++                }
++            }
++        }
++    }
++    let detached = client.detach_quiet().await.unwrap().unwrap();
++    let snapshot = detached.sm.unwrap();
++    assert_eq!(snapshot.id.as_deref(), Some(STREAM_MANAGEMENT_ID));
++    assert_eq!(snapshot.outbound_acked, 1);
++    assert_eq!(snapshot.inbound_h, 0);
++    let ids: Vec<_> = snapshot
++        .unacked
++        .iter()
++        .map(|s| match s {
++            Stanza::Presence(p) => p.id.as_deref().unwrap(),
++            _ => panic!("expected presence"),
++        })
++        .collect();
++    assert_eq!(ids, ["unacked-second", "unacked-third"]);
++    assert!(detached.pending.is_empty());
++    // A previously buffered R is harmless. No XML footer may follow it.
++    loop {
++        match tokio::time::timeout(Duration::from_secs(2), server.next())
++            .await
++            .unwrap()
++        {
++            Some(Ok(FallibleStreamElement::Ok(XmppStreamElement::SM(sm::Nonza::Req(_))))) => (),
++            None | Some(Err(ReadError::HardError(_))) => break,
++            other => panic!("quiet detach emitted a footer or other data: {other:?}"),
++        }
++    }
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn quiet_detach_unblocks_full_frontend_and_captures_only_committed_h() {
++    use std::sync::atomic::{AtomicUsize, Ordering};
++    let count = Arc::new(AtomicUsize::new(0));
++    let committed = count.clone();
++    let full = Arc::new(tokio::sync::Notify::new());
++    let notify = full.clone();
++    let ingress: InboundCommit = Arc::new(move |_| {
++        if committed.fetch_add(1, Ordering::SeqCst) + 1 == 17 {
++            notify.notify_one();
++        }
++        Ok(())
++    });
++    let (client, mut server) = fresh_sm_pair_with_ingress(Some(ingress)).await.unwrap();
++    for _ in 0..20 {
++        server
++            .send(&Presence::new(PresenceType::Unavailable))
++            .await
++            .unwrap();
++    }
++    tokio::time::timeout(Duration::from_secs(2), full.notified())
++        .await
++        .unwrap();
++    let detached = tokio::time::timeout(Duration::from_secs(2), client.detach_quiet())
++        .await
++        .unwrap()
++        .unwrap()
++        .unwrap();
++    assert_eq!(count.load(Ordering::SeqCst), 17);
++    assert_eq!(detached.sm.unwrap().inbound_h, 17);
++}
++
++#[tokio::test]
++async fn client_quiet_detach_returns_an_owned_sm_snapshot() {
++    let (stream, _server) = fresh_sm_pair_with_ingress(Some(Arc::new(|_| Ok(()))))
++        .await
++        .unwrap();
++    let client = crate::Client::from_stanza_stream(stream);
++    let detached = tokio::time::timeout(Duration::from_secs(2), client.detach_quiet())
++        .await
++        .unwrap()
++        .unwrap()
++        .unwrap();
++    assert_eq!(
++        detached.sm.unwrap().id.as_deref(),
++        Some(STREAM_MANAGEMENT_ID)
++    );
++}
++
++#[tokio::test]
++async fn quiet_detach_joins_a_pending_library_owned_connect_task() {
++    use std::sync::atomic::{AtomicBool, Ordering};
++    #[derive(Clone, Debug)]
++    struct PendingConnector {
++        started: Arc<tokio::sync::Notify>,
++        dropped: Arc<AtomicBool>,
++    }
++    impl ServerConnector for PendingConnector {
++        type Stream = tokio::io::BufReader<tokio::io::DuplexStream>;
++        async fn connect(
++            &self,
++            _: &crate::jid::Jid,
++            _: &'static str,
++            _: Timeouts,
++        ) -> Result<
++            (
++                crate::xmlstream::PendingFeaturesRecv<Self::Stream>,
++                sasl::common::ChannelBinding,
++            ),
++            crate::Error,
++        > {
++            struct Guard(Arc<AtomicBool>);
++            impl Drop for Guard {
++                fn drop(&mut self) {
++                    self.0.store(true, Ordering::SeqCst);
++                }
++            }
++            let _guard = Guard(self.dropped.clone());
++            self.started.notify_one();
++            std::future::pending().await
++        }
++    }
++    let started = Arc::new(tokio::sync::Notify::new());
++    let dropped = Arc::new(AtomicBool::new(false));
++    let stream = StanzaStream::new_c2s_with_ingress(
++        PendingConnector {
++            started: started.clone(),
++            dropped: dropped.clone(),
++        },
++        "a@example.test/resource".parse().unwrap(),
++        "synthetic".into(),
++        Timeouts::default(),
++        4,
++        Some(Arc::new(|_| Ok(()))),
++    );
++    started.notified().await;
++    let detached = tokio::time::timeout(Duration::from_secs(2), stream.detach_quiet())
++        .await
++        .unwrap()
++        .unwrap()
++        .unwrap();
++    assert!(detached.sm.is_none());
++    assert!(
++        dropped.load(Ordering::SeqCst),
++        "connector future must be dropped before detach returns"
++    );
++}
++
++fn handoff_fixture() -> DetachedState {
++    fn stanza(id: &str) -> Stanza {
++        let mut p = Presence::new(PresenceType::Unavailable);
++        p.id = Some(id.into());
++        p.into()
++    }
++    DetachedState {
++        sm: Some(SmSnapshot {
++            id: Some("handoff-id".into()),
++            location: None,
++            max_resume_secs: Some(600),
++            inbound_h: 9,
++            outbound_acked: 100,
++            unacked: vec![stanza("already-at-server"), stanza("replay-second")],
++        }),
++        pending: vec![stanza("pending-third")],
++    }
++}
++
++async fn handoff_pair(handoff: DetachedState, sm_supported: bool) -> (StanzaStream, XmppStream) {
++    let identity: crate::jid::FullJid = "a@example.test/puhuri2-fixture".parse().unwrap();
++    let mut features = StreamFeatures::default();
++    features.bind = Some(BindFeature { required: false });
++    if sm_supported {
++        features.stream_management = Some(sm::StreamManagement { optional: false });
++    }
++    let (left, right) = tokio::io::duplex(8192);
++    let peer = tokio::spawn(async move {
++        let server = accept_stream(
++            tokio::io::BufReader::new(right),
++            "jabber:client",
++            Timeouts::default(),
++        )
++        .await
++        .unwrap();
++        server
++            .send_header(StreamHeader {
++                from: Some(Cow::Borrowed("example.test")),
++                to: Some(Cow::Borrowed("a@example.test")),
++                id: Some(Cow::Borrowed("handoff-xml")),
++            })
++            .await
++            .unwrap()
++            .send_features(&features)
++            .await
++            .unwrap()
++            .box_stream()
++    });
++    let (features, stream) = initiate_stream(
++        tokio::io::BufReader::new(left),
++        "jabber:client",
++        StreamHeader {
++            from: Some(Cow::Owned(identity.to_string())),
++            to: Some(Cow::Borrowed("example.test")),
++            id: None,
++        },
++        Timeouts::default(),
++    )
++    .await
++    .unwrap()
++    .recv_features()
++    .await
++    .unwrap();
++    let server = peer.await.unwrap();
++    let mut connection = Some(Connection {
++        features,
++        stream: stream.box_stream(),
++        identity: identity.into(),
++    });
++    let mut parked = Vec::new();
++    let client = StanzaStream::new_with_handoff(
++        Box::new(move |_, slot| {
++            if let Some(connection) = connection.take() {
++                assert!(slot.send(connection).is_ok());
++            } else {
++                // A protocol-error case may enter ordinary reconnect. Keep
++                // its slot pending without fabricating another connection.
++                parked.push(slot);
++            }
++        }),
++        16,
++        Arc::new(|_| Ok(())),
++        handoff,
++    )
++    .unwrap();
++    (client, server)
++}
++
++async fn peer_next(server: &mut XmppStream) -> XmppStreamElement {
++    map_io(map_err(
++        tokio::time::timeout(Duration::from_secs(2), server.next())
++            .await
++            .unwrap(),
++    ))
++    .unwrap()
++}
++
++#[tokio::test]
++async fn handoff_resume_populates_new_client_and_replays_only_unacked_before_pending() {
++    let (stream, mut server) = handoff_pair(handoff_fixture(), true).await;
++    let mut client = crate::Client::from_stanza_stream(stream);
++    match peer_next(&mut server).await {
++        XmppStreamElement::SM(sm::Nonza::Resume(resume)) => {
++            assert_eq!(resume.h, 9);
++            assert_eq!(resume.previd.0, "handoff-id");
++        }
++        other => panic!("expected resume, got {other:?}"),
++    }
++    server
++        .send(&sm::Resumed {
++            h: 101,
++            previd: sm::StreamId("handoff-id".into()),
++        })
++        .await
++        .unwrap();
++    match tokio::time::timeout(Duration::from_secs(2), client.next())
++        .await
++        .unwrap()
++    {
++        Some(crate::Event::Online {
++            bound_jid,
++            features,
++            resumed: true,
++        }) => {
++            assert_eq!(bound_jid.to_string(), "a@example.test/puhuri2-fixture");
++            assert!(features.stream_management.is_some());
++            assert_eq!(
++                client.bound_jid().unwrap().to_string(),
++                bound_jid.to_string()
++            );
++        }
++        other => panic!("new Client needs populated resumed Online, got {other:?}"),
++    }
++    for expected in ["replay-second", "pending-third"] {
++        loop {
++            match peer_next(&mut server).await {
++                XmppStreamElement::Stanza(Stanza::Presence(p)) => {
++                    assert_eq!(p.id.as_deref(), Some(expected));
++                    break;
++                }
++                XmppStreamElement::SM(sm::Nonza::Req(_)) => (),
++                other => panic!("unexpected replay {other:?}"),
++            }
++        }
++    }
++    server.send(&sm::R).await.unwrap();
++    loop {
++        match peer_next(&mut server).await {
++            XmppStreamElement::SM(sm::Nonza::Ack(sm::A { h: 9 })) => break,
++            XmppStreamElement::SM(sm::Nonza::Req(_)) => (),
++            other => panic!("wrong restored inbound count: {other:?}"),
++        }
++    }
++    let detached = client.detach_quiet().await.unwrap().unwrap();
++    let state = detached.sm.unwrap();
++    assert_eq!(state.outbound_acked, 101);
++    assert_eq!(state.unacked.len(), 2);
++    assert!(detached.pending.is_empty());
++}
++
++#[tokio::test]
++async fn handoff_resume_rejection_without_h_and_missing_sm_preserve_outbound_data() {
++    for (sm_supported, failed_h, expected) in [
++        (
++            true,
++            None,
++            vec!["already-at-server", "replay-second", "pending-third"],
++        ),
++        (true, Some(101), vec!["replay-second", "pending-third"]),
++        (
++            false,
++            None,
++            vec!["already-at-server", "replay-second", "pending-third"],
++        ),
++    ] {
++        let (mut client, mut server) = handoff_pair(handoff_fixture(), sm_supported).await;
++        if sm_supported {
++            assert!(matches!(
++                peer_next(&mut server).await,
++                XmppStreamElement::SM(sm::Nonza::Resume(_))
++            ));
++            // Exercise the real parser with absent h, not a fabricated enum.
++            let failed: Element = match failed_h {
++                Some(h) => format!("<failed xmlns='urn:xmpp:sm:3' h='{h}'/>"),
++                None => "<failed xmlns='urn:xmpp:sm:3'/>".into(),
++            }
++            .parse()
++            .unwrap();
++            server.send(&failed).await.unwrap();
++        }
++        match peer_next(&mut server).await {
++            XmppStreamElement::Stanza(Stanza::Iq(Iq::Set { id, payload, .. })) => {
++                let query: BindQuery = payload.try_into().unwrap();
++                assert_eq!(query.resource.as_deref(), Some("puhuri2-fixture"));
++                server
++                    .send(&Iq::Result {
++                        from: None,
++                        to: None,
++                        id,
++                        payload: Some(
++                            BindResponse {
++                                jid: "a@example.test/puhuri2-fixture".parse().unwrap(),
++                            }
++                            .into(),
++                        ),
++                    })
++                    .await
++                    .unwrap();
++            }
++            other => panic!("expected fresh bind, got {other:?}"),
++        }
++        if sm_supported {
++            assert!(matches!(
++                peer_next(&mut server).await,
++                XmppStreamElement::SM(sm::Nonza::Enable(_))
++            ));
++            server
++                .send(&sm::Enabled {
++                    id: Some(sm::StreamId("fresh-id".into())),
++                    location: None,
++                    max: Some(600),
++                    resume: true,
++                })
++                .await
++                .unwrap();
++        }
++        assert!(matches!(
++            client.next().await,
++            Some(Event::Stream(StreamEvent::Reset { .. }))
++        ));
++        for expected in expected {
++            loop {
++                match peer_next(&mut server).await {
++                    XmppStreamElement::Stanza(Stanza::Presence(p)) => {
++                        assert_eq!(p.id.as_deref(), Some(expected));
++                        break;
++                    }
++                    XmppStreamElement::SM(sm::Nonza::Req(_)) => (),
++                    other => panic!("unexpected fresh-session replay {other:?}"),
++                }
++            }
++        }
++        let detached = client.detach_quiet().await.unwrap().unwrap();
++        assert_eq!(detached.sm.is_some(), sm_supported);
++    }
++}
++
++#[tokio::test]
++async fn handoff_resume_preserves_inbound_and_outbound_counter_wrap() {
++    let mut fixture = handoff_fixture();
++    fixture.sm.as_mut().unwrap().inbound_h = u32::MAX;
++    fixture.sm.as_mut().unwrap().outbound_acked = u32::MAX - 1;
++    let (mut client, mut server) = handoff_pair(fixture, true).await;
++    assert!(matches!(
++        peer_next(&mut server).await,
++        XmppStreamElement::SM(sm::Nonza::Resume(sm::Resume { h: u32::MAX, .. }))
++    ));
++    server
++        .send(&sm::Resumed {
++            h: u32::MAX,
++            previd: sm::StreamId("handoff-id".into()),
++        })
++        .await
++        .unwrap();
++    assert!(matches!(
++        client.next().await,
++        Some(Event::Stream(StreamEvent::Resumed { .. }))
++    ));
++    for expected in ["replay-second", "pending-third"] {
++        loop {
++            match peer_next(&mut server).await {
++                XmppStreamElement::Stanza(Stanza::Presence(p)) => {
++                    assert_eq!(p.id.as_deref(), Some(expected));
++                    break;
++                }
++                XmppStreamElement::SM(sm::Nonza::Req(_)) => (),
++                other => panic!("unexpected wrapping replay {other:?}"),
++            }
++        }
++    }
++    server
++        .send(&Presence::new(PresenceType::Unavailable))
++        .await
++        .unwrap();
++    server.send(&sm::A { h: 1 }).await.unwrap();
++    server.send(&sm::R).await.unwrap();
++    loop {
++        match peer_next(&mut server).await {
++            XmppStreamElement::SM(sm::Nonza::Ack(sm::A { h: 0 })) => break,
++            XmppStreamElement::SM(sm::Nonza::Req(_)) => (),
++            other => panic!("wrong wrapped counter {other:?}"),
++        }
++    }
++    let state = client.detach_quiet().await.unwrap().unwrap().sm.unwrap();
++    assert_eq!(state.inbound_h, 0);
++    assert_eq!(state.outbound_acked, 1);
++    assert!(state.unacked.is_empty());
++}
++
++#[tokio::test]
++async fn handoff_rejects_wrong_token_or_ack_beyond_the_saved_queue_before_replay() {
++    for (token, h) in [("wrong-token", 101), ("handoff-id", 999)] {
++        let (_client, mut server) = handoff_pair(handoff_fixture(), true).await;
++        assert!(matches!(
++            peer_next(&mut server).await,
++            XmppStreamElement::SM(sm::Nonza::Resume(_))
++        ));
++        server
++            .send(&sm::Resumed {
++                h,
++                previd: sm::StreamId(token.into()),
++            })
++            .await
++            .unwrap();
++        assert!(
++            matches!(
++                peer_next(&mut server).await,
++                XmppStreamElement::StreamError(_)
++            ),
++            "invalid resume must be rejected before replaying any queued stanza"
++        );
++    }
++}
++
++#[tokio::test]
++async fn checkpoint_snapshot_keeps_both_outbound_queue_layers_live_and_ordered() {
++    use super::queue::{QueueEntry, TransmitQueue};
++    fn item(id: &str) -> QueueEntry {
++        let mut p = Presence::new(PresenceType::Unavailable);
++        p.id = Some(id.into());
++        QueueEntry::untracked(Box::new(p.into()))
++    }
++    fn ids(stanzas: &[Stanza]) -> Vec<&str> {
++        stanzas
++            .iter()
++            .map(|stanza| match stanza {
++                Stanza::Presence(p) => p.id.as_deref().unwrap(),
++                _ => panic!("expected presence"),
++            })
++            .collect()
++    }
++    let (tx, mut queue) = TransmitQueue::channel(4);
++    queue.enqueue(item("older-local"));
++    tx.send(item("queued-channel")).await.unwrap();
++    assert_eq!(
++        ids(&queue.snapshot_pending()),
++        ["older-local", "queued-channel"]
++    );
++    // Capturing a checkpoint must neither close senders nor consume entries.
++    tx.send(item("newer-channel")).await.unwrap();
++    assert_eq!(
++        ids(&queue.snapshot_pending()),
++        ["older-local", "queued-channel", "newer-channel"]
++    );
++    assert_eq!(
++        ids(&queue.take_pending()),
++        ["older-local", "queued-channel", "newer-channel"]
++    );
++}
++
++#[derive(Default)]
++struct WakeCounter(std::sync::atomic::AtomicUsize);
++impl futures::task::ArcWake for WakeCounter {
++    fn wake_by_ref(arc_self: &Arc<Self>) {
++        arc_self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
++    }
++}
++
++#[tokio::test]
++async fn split_receiver_is_woken_when_stream_sender_releases_lock() {
++    let (stream, mut server) = plain_pair().await.unwrap();
++    let (sender, mut receiver) = stream.split();
++    let held = sender.0.lock().await;
++    let counter = Arc::new(WakeCounter::default());
++    let waker = futures::task::waker(counter.clone());
++    let mut cx = std::task::Context::from_waker(&waker);
++    assert!(futures::Stream::poll_next(Pin::new(&mut receiver), &mut cx).is_pending());
++    drop(held);
++    assert!(
++        counter.0.load(std::sync::atomic::Ordering::SeqCst) > 0,
++        "receiver returned Pending without registering an unlock wake"
++    );
++    server
++        .send(&Presence::new(PresenceType::Unavailable))
++        .await
++        .unwrap();
++    assert!(matches!(
++        tokio::time::timeout(Duration::from_secs(2), receiver.next())
++            .await
++            .unwrap(),
++        Some(Event::Stanza(crate::Stanza::Presence(_)))
++    ));
++    // A pending poll must not leave a lock reservation preventing reunite.
++    let _stream = StanzaStream::reunite(sender, receiver);
++}
++
++#[tokio::test]
++async fn split_receiver_lock_tracks_latest_waker_without_idle_self_wakes() {
++    let shared = ReceiverMutex::new(());
++    let held = shared.lock().await;
++    let first = Arc::new(WakeCounter::default());
++    let latest = Arc::new(WakeCounter::default());
++    let w1 = futures::task::waker(first.clone());
++    let w2 = futures::task::waker(latest.clone());
++    let mut cx1 = std::task::Context::from_waker(&w1);
++    let mut cx2 = std::task::Context::from_waker(&w2);
++    assert!(shared.poll_lock(&mut cx1).is_pending());
++    assert!(shared.poll_lock(&mut cx2).is_pending());
++    drop(held);
++    assert_eq!(first.0.load(std::sync::atomic::Ordering::SeqCst), 0);
++    assert_eq!(latest.0.load(std::sync::atomic::Ordering::SeqCst), 1);
++    let Poll::Ready(guard) = shared.poll_lock(&mut cx2) else {
++        panic!("released lock unavailable");
++    };
++    drop(guard);
++    assert_eq!(
++        latest.0.load(std::sync::atomic::Ordering::SeqCst),
++        1,
++        "uncontended receiver poll must not busy-wake itself"
++    );
++}
+--- a/src/stanzastream/worker.rs
++++ b/src/stanzastream/worker.rs
+@@ -1,3 +1,5 @@
++// Modified for Puhuri 2, 2026-10-24: commit received stanzas before further I/O.
++// SPDX-License-Identifier: MPL-2.0
+ // Copyright (c) 2019 Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>
+ //
+ // This Source Code Form is subject to the terms of the Mozilla Public
+@@ -73,13 +75,18 @@
+     },
+ 
+     /// The stream has been resumed successfully.
+-    Resumed,
++    Resumed {
++        bound_jid: Jid,
++        features: StreamFeatures,
++    },
+ 
+     /// Data received successfully.
+     Stanza(Stanza),
+ 
+     /// Failed to parse pieces from the stream.
+     ParseError(xso::error::Error),
++    /// Invalid stanza finally discarded by the parser and counted by SM.
++    HandledInvalidStanza,
+ 
+     /// Soft timeout noted by the underlying XmppStream.
+     SoftTimeout,
+@@ -167,8 +174,12 @@
+                                 // that will "only" crash the worker and thus
+                                 // the stream, and that is kind of exactly
+                                 // what we want.
+-                                substate: NegotiationState::new(&features, sm_state.take())
+-                                    .expect("Non-negotiable stream"),
++                                substate: NegotiationState::new(
++                                    &features,
++                                    sm_state.take(),
++                                    transmit_queue,
++                                )
++                                .expect("Non-negotiable stream"),
+                             };
+                             *this = Self::Connected {
+                                 substate,
+@@ -410,6 +421,9 @@
+     frontend_tx: mpsc::Sender<Event>,
+     stream: WorkerStream,
+     transmit_queue: TransmitQueue<QueueEntry>,
++    ingress: Option<super::InboundCommit>,
++    checkpoint: Option<super::CheckpointCommit>,
++    detach: oneshot::Receiver<()>,
+ }
+ 
+ macro_rules! send_or_break {
+@@ -439,28 +453,49 @@
+             dyn FnMut(Option<String>, oneshot::Sender<Connection>) + Send + 'static,
+         >,
+         queue_depth: usize,
+-    ) -> (mpsc::Sender<QueueEntry>, mpsc::Receiver<Event>) {
++        ingress: Option<super::InboundCommit>,
++        handoff: Option<super::DetachedState>,
++        checkpoint: Option<super::CheckpointCommit>,
++    ) -> (
++        mpsc::Sender<QueueEntry>,
++        mpsc::Receiver<Event>,
++        oneshot::Sender<()>,
++        tokio::task::JoinHandle<Option<super::DetachedState>>,
++    ) {
++        let (detach_tx, detach) = oneshot::channel();
+         let (conn_tx, conn_rx) = oneshot::channel();
+         reconnector(None, conn_tx);
+         // c2f = core to frontend
+         let (c2f_tx, c2f_rx) = mpsc::channel(queue_depth);
+         // f2c = frontend to core
+-        let (f2c_tx, transmit_queue) = TransmitQueue::channel(queue_depth);
++        let (f2c_tx, mut transmit_queue) = TransmitQueue::channel(queue_depth);
++        let (initial_sm, pending) = match handoff {
++            Some(handoff) => (handoff.sm.map(SmState::from_snapshot), handoff.pending),
++            None => (None, Vec::new()),
++        };
++        transmit_queue.requeue_all(
++            pending
++                .into_iter()
++                .map(|stanza| QueueEntry::untracked(Box::new(stanza))),
++        );
+         let mut worker = StanzaStreamWorker {
+             reconnector,
+             frontend_tx: c2f_tx,
+             stream: WorkerStream::Connecting {
+                 slot: conn_rx,
+-                sm_state: None,
++                sm_state: initial_sm,
+                 notify: None,
+             },
+             transmit_queue,
++            ingress,
++            checkpoint,
++            detach,
+         };
+-        tokio::spawn(async move { worker.run().await });
+-        (f2c_tx, c2f_rx)
+-    }
+-
+-    pub async fn run(&mut self) {
++        let handle = tokio::spawn(async move { worker.run().await });
++        (f2c_tx, c2f_rx, detach_tx, handle)
++    }
++
++    pub async fn run(&mut self) -> Option<super::DetachedState> {
+         // TODO: consider moving this into SmState somehow, i.e. run a kind
+         // of fake stream management exploiting the sequentiality requirement
+         // from RFC 6120.
+@@ -480,8 +515,15 @@
+         // service stream writes in parallel (putting backpressure on the
+         // sender while not blocking writes on our end).
+         let mut permit = None;
++        let mut detach_requested = false;
++        let mut detach_closed = false;
+         loop {
+             tokio::select! {
++                biased;
++                request = &mut self.detach, if !detach_closed => match request {
++                    Ok(()) => { detach_requested = true; break; }
++                    Err(_) => { detach_closed = true; }
++                },
+                 new_permit = self.frontend_tx.reserve(), if permit.is_none() && !self.frontend_tx.is_closed() => match new_permit {
+                     Ok(new_permit) => permit = Some(new_permit),
+                     // Receiver side dropped… That is stream closure, so we
+@@ -493,6 +535,41 @@
+                         // Stream terminated by local choice. Exit.
+                         break;
+                     };
++                    if let Some(commit) = self.checkpoint.as_ref() {
++                        let incoming = match &ev {
++                            WorkerEvent::Stanza(stanza) => Some(Some(stanza)),
++                            WorkerEvent::HandledInvalidStanza => Some(None),
++                            _ => None,
++                        };
++                        if let Some(incoming) = incoming {
++                            let WorkerStream::Connected { identity, substate, .. } = &self.stream else {
++                                self.stream = WorkerStream::Terminated;
++                                return None;
++                            };
++                            let (ready, sm) = substate.ingress_snapshot();
++                            let context = super::IngressContext { jid:identity.clone(), ready,
++                                state:super::DetachedState { sm, pending:self.transmit_queue.snapshot_pending() } };
++                            if commit(incoming, context).is_err() {
++                                self.stream = WorkerStream::Terminated;
++                                return None;
++                            }
++                        }
++                    }
++                    // No socket I/O between receiving this event and this
++                    // synchronous commit. In-memory h may already include the
++                    // stanza, but no write can advertise it before success.
++                    // Keep future SM snapshot publication AFTER this barrier.
++                    if let WorkerEvent::Stanza(ref stanza) = ev {
++                        if let Some(commit) = self.ingress.as_ref() {
++                            if commit(stanza).is_err() {
++                                // Skip run()'s clean-close path: a footer would
++                                // terminate SM and could discard server data.
++                                // No error payload is logged (it may be private).
++                                self.stream = WorkerStream::Terminated;
++                                return None;
++                            }
++                        }
++                    }
+                     match ev {
+                         WorkerEvent::Reset { bound_jid, features } => send_or_break!(
+                             Event::Stream(StreamEvent::Reset { bound_jid, features }) => permit in self.frontend_tx,
+@@ -514,14 +591,15 @@
+                             }
+                             (self.reconnector)(None, slot);
+                         }
+-                        WorkerEvent::Resumed => send_or_break!(
+-                            Event::Stream(StreamEvent::Resumed) => permit in self.frontend_tx,
++                        WorkerEvent::Resumed { bound_jid, features } => send_or_break!(
++                            Event::Stream(StreamEvent::Resumed { bound_jid, features }) => permit in self.frontend_tx,
+                             self.transmit_queue => self.stream,
+                         ),
+                         WorkerEvent::Stanza(stanza) => send_or_break!(
+                             Event::Stanza(stanza) => permit in self.frontend_tx,
+                             self.transmit_queue => self.stream,
+                         ),
++                        WorkerEvent::HandledInvalidStanza => {},
+                         WorkerEvent::ParseError(e) => {
+                             log::error!("Parse error on stream: {e}");
+                             self.stream.start_send_stream_error(parse_error_to_stream_error(e));
+@@ -552,10 +630,31 @@
+                 },
+             }
+         }
++        if detach_requested {
++            let old = std::mem::replace(&mut self.stream, WorkerStream::Terminated);
++            let sm = match old {
++                WorkerStream::Connected {
++                    substate, stream, ..
++                } => {
++                    // Drop the transport before returning, without poll_close.
++                    drop(stream);
++                    substate.into_sm_snapshot()
++                }
++                WorkerStream::Connecting { sm_state, .. } => {
++                    sm_state.map(|state| state.into_snapshot())
++                }
++                WorkerStream::Terminated => None,
++            };
++            return Some(super::DetachedState {
++                sm,
++                pending: self.transmit_queue.take_pending(),
++            });
++        }
+         match self.stream.close().await {
+             Ok(()) => log::debug!("Stream closed successfully"),
+             Err(e) => log::debug!("Stream closure failed: {e}"),
+         }
++        None
+     }
+ }
+ 

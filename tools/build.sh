@@ -63,7 +63,8 @@ for binary in puhurid puhuri-ctl; do
 done
 chmod -R u=rwX,go=rX "$stage"
 # The push helper is an executable: the push service runs it directly.
-chmod u+x,go+x "$stage/lib/aarch64-linux-gnu/bin/puhuri-push-helper"
+chmod u+x,go+x "$stage/lib/aarch64-linux-gnu/bin/puhuri-push-helper" \
+    "$stage/lib/aarch64-linux-gnu/bin/puhuri-postal-job"
 chmod u+x,go+x "$stage/lib/aarch64-linux-gnu/bin/puhurid" \
     "$stage/lib/aarch64-linux-gnu/bin/puhuri-ctl" \
     "$stage/lib/aarch64-linux-gnu/bin/puhuri-indicator"

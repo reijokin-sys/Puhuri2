@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 import json
+import os
 import pathlib
 import shutil
 import subprocess
@@ -43,7 +44,7 @@ class ConfinedProcessTest(unittest.TestCase):
     def test_push_hook_remains_separately_confined(self):
         profile = json.loads((APP_DIR / "push.apparmor").read_text())
         self.assertEqual(profile.get("template"), "ubuntu-push-helper")
-        self.assertEqual(profile["policy_groups"], ["push-notification-client"])
+        self.assertEqual(set(profile["policy_groups"]), {"push-notification-client", "networking"})
 
     def test_push_helper_uses_the_interpreter_allowed_by_its_profile(self):
         helper = APP_DIR / "lib/aarch64-linux-gnu/bin/puhuri-push-helper"
@@ -51,59 +52,29 @@ class ConfinedProcessTest(unittest.TestCase):
         push_hook = json.loads((APP_DIR / "push.json").read_text())
         self.assertEqual(push_hook["exec"], "lib/aarch64-linux-gnu/bin/puhuri-push-helper")
 
+    def run_logged_out_hook(self, payload):
+        with tempfile.TemporaryDirectory() as directory:
+            root=pathlib.Path(directory)
+            helper=root/"puhuri-push-helper"
+            shutil.copy2(APP_DIR/"lib/aarch64-linux-gnu/bin/puhuri-push-helper",helper)
+            binary=PROJECT/"daemon/target/debug/puhurid"
+            self.assertTrue(binary.exists(), "build the host daemon before this integration check")
+            (root/"puhurid").symlink_to(binary)
+            source=root/"in.json";destination=root/"out.json"
+            source.write_text(json.dumps(payload))
+            result=subprocess.run([sys.executable,str(helper),str(source),str(destination)],
+                env=dict(os.environ,XDG_DATA_HOME=str(root/"data")),check=True,capture_output=True,text=True)
+            return json.loads(destination.read_text()),result.stderr
+
     def test_server_push_cannot_bypass_contact_permissions(self):
-        with tempfile.TemporaryDirectory() as directory:
-            click_root = pathlib.Path(directory) / "0.1.7"
-            bindir = click_root / "lib/aarch64-linux-gnu/bin"
-            bindir.mkdir(parents=True)
-            helper = bindir / "puhuri-push-helper"
-            shutil.copy2(
-                APP_DIR / "lib/aarch64-linux-gnu/bin/puhuri-push-helper",
-                helper,
-            )
-            source = pathlib.Path(directory) / "in.json"
-            destination = pathlib.Path(directory) / "out.json"
-            canary = "PRIVATE-CANARY-MUST-NOT-LEAK"
-            source.write_text(json.dumps({
-                "message": {"type": "puhuri.new-message", "private": canary},
-            }))
-            result = subprocess.run(
-                [sys.executable, str(helper), str(source), str(destination)],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            output = json.loads(destination.read_text())
+        canary="PRIVATE-CANARY-MUST-NOT-LEAK"
+        output,stderr=self.run_logged_out_hook({"message":{"type":"puhuri.new-message","private":canary}})
+        self.assertEqual(output,{})
+        self.assertNotIn(canary,stderr)
 
-        self.assertNotIn("notification", output)
-        self.assertEqual(output["message"], {"type": "puhuri.new-message"})
-        self.assertNotIn("private", json.dumps(output))
-        self.assertIn(
-            '"private": "str", "type": "str:puhuri.new-message"',
-            result.stderr,
-        )
-        self.assertNotIn(canary, result.stderr)
-
-    def test_push_helper_ignores_a_generic_xmpp_wake(self):
-        with tempfile.TemporaryDirectory() as directory:
-            source = pathlib.Path(directory) / "in.json"
-            destination = pathlib.Path(directory) / "out.json"
-            source.write_text(json.dumps({
-                "message": {"type": "xmpp-wake"},
-            }))
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(APP_DIR / "lib/aarch64-linux-gnu/bin/puhuri-push-helper"),
-                    str(source),
-                    str(destination),
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            self.assertIn('"type": "str:xmpp-wake"', result.stderr)
-            self.assertEqual(json.loads(destination.read_text()), {})
+    def test_a_generic_wake_without_an_account_does_not_notify(self):
+        output,stderr=self.run_logged_out_hook({"message":{"type":"xmpp-wake"}})
+        self.assertEqual(output,{})
 
     def test_push_helper_passes_through_puhuri_originated_notifications(self):
         with tempfile.TemporaryDirectory() as directory:

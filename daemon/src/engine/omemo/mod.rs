@@ -759,6 +759,23 @@ impl Omemo {
     where
         F: FnOnce(&Connection, &[u8]) -> Result<T, String>,
     {
+        self.decrypt_and_store_and_finish(sender, element, tallenna, |_| Ok(()))
+    }
+
+    /// The same receive transaction, with a completion step before commit.
+    /// Inbox acknowledgment belongs here, including key-transport messages
+    /// with no plaintext. Completion failure rolls back ratchet and message.
+    pub fn decrypt_and_store_and_finish<T, F, G>(
+        &self,
+        sender: &str,
+        element: &xml::Encrypted,
+        tallenna: F,
+        finish: G,
+    ) -> Result<Option<T>, ReceiveError>
+    where
+        F: FnOnce(&Connection, &[u8]) -> Result<T, String>,
+        G: FnOnce(&Connection) -> Result<(), String>,
+    {
         let our_device = self
             .device_id()
             .map_err(|error| ReceiveError::Decrypt(RatchetError::other(error)))?
@@ -797,6 +814,7 @@ impl Omemo {
         })();
 
         if result.is_ok() {
+            finish(transaction.connection()).map_err(ReceiveError::Store)?;
             transaction.commit().map_err(ReceiveError::Store)?;
         }
         // Err-haarassa suojus hoitaa ROLLBACKin (Drop).

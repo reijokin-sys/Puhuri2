@@ -70,6 +70,8 @@ MainView {
     property bool pushActive: false
     property bool pushAvailable: false
     property string pushService: ""
+    property string pushModule: "puhuri2"
+    property bool pushEnabled: false
     property bool pendingPushRefresh: false
     property string currentThread: ""
     property string currentName: ""
@@ -288,7 +290,7 @@ MainView {
             // its place, a different one replaces the rows.
             var payload = result.result || {}
             Messages.apply(messageModel, payload.messages || [])
-            if (encryptIfNew === true && payload.defaultEncrypted === true)
+            if (payload.defaultEncrypted === true)
                 root.setEncryption(thread, true, false)
             root.conversationPageItem = pageStack.push(conversationPage)
             if (root.conversationPageItem) {
@@ -314,7 +316,7 @@ MainView {
             // OMEMO devices: the first send then fails instead of silently
             // going out in the clear. Tell the user how to make that choice
             // explicitly.
-            if (encryptIfNew === true && payload.defaultEncrypted === true) {
+            if (payload.defaultEncrypted === true) {
                 py.call("puhuri.omemo_devices", [thread], function (deviceResult) {
                     if (!deviceResult || deviceResult.ok !== true)
                         return
@@ -816,6 +818,8 @@ MainView {
             root.pushToken = ""
             root.devicePushToken = ""
             root.pushService = ""
+            root.pushModule = "puhuri2"
+            root.pushEnabled = false
             root.pushActive = false
             root.language = "en"
             root.themeKey = "sininen"
@@ -915,7 +919,9 @@ MainView {
             if (state.token)
                 root.pushToken = state.token
             root.pushService = state.service || ""
-            root.pushActive = state.settings !== null && state.settings !== undefined
+            root.pushModule = state.module || "puhuri2"
+            root.pushEnabled = state.enabled === true
+            root.pushActive = state.active === true
         })
     }
 
@@ -1054,6 +1060,7 @@ MainView {
                         // MAM imports ordinary archived messages as a state
                         // change, not as a live message notification.
                         || event === "state.changed") {
+                    root.refreshPush()
                     root.refreshConversations()
                     // The open conversation has to be read again as well.
                     // (`conversationPage` is the *Component*; the page on
@@ -1065,11 +1072,13 @@ MainView {
                 } else if (event === "connected") {
                     console.log("Puhuri 2: yhteys auki")
                     root.connected = true
+                    root.hasAccount = true
                     if (root.devicePushToken.length > 0)
                         root.registerPushToken(root.devicePushToken)
                     // Replace the whole stack: the login page must not come
                     // back once there is an account to look at.
-                    root.showConversations()
+                    if (!root.conversationsPageItem)
+                        root.showConversations()
                     // The initial status call often runs before XMPP has
                     // connected, so it cannot populate the list. Load it now;
                     // a later state.changed event covers MAM results.
@@ -1139,9 +1148,18 @@ MainView {
                     // console is not visible on the phone.
                     root.appLog("yhteys katkesi")
                     root.connected = false
-                    root.showLogin(tr("error.connectionLost") + svc(reason))
+                    if (!root.hasAccount)
+                        root.showLogin(tr("error.connectionLost") + svc(reason))
                 }
             }
+        }
+    }
+
+    Connections {
+        target: Qt.application
+        onStateChanged: {
+            if (root.pythonReady)
+                py.call("puhuri.lifecycle", [Qt.application.state === Qt.ApplicationActive], function () {})
         }
     }
 
@@ -1329,16 +1347,19 @@ MainView {
             pushActive: root.pushActive
             pushAvailable: root.pushAvailable
             pushService: root.pushService
+            pushModule: root.pushModule
+            pushEnabled: root.pushEnabled
+            onBackgroundSetupRequested: {
+                py.call("puhuri.background_setup", [service, module], function (result) {
+                    if (root.applyError(result)) return
+                    root.refreshPush()
+                })
+            }
             onPushEnabledRequested: {
-                // Turning push on re-sends the token (the service registers
-                // it); turning it off clears the registration.
-                if (enabled)
-                    root.registerPushToken(root.pushToken)
-                else
-                    py.call("puhuri.push_register", [""], function (result) {
-                        if (result && result.ok === true)
-                            root.pushActive = false
-                    })
+                py.call("puhuri.push_set_enabled", [enabled], function (result) {
+                    if (root.applyError(result)) return
+                    root.refreshPush()
+                })
             }
             onNotificationsChanged: py.call("puhuri.settings_set", [enabled], function () {})
             onPollRequested: py.call("puhuri.poll_set", [seconds], function (result) {

@@ -33,8 +33,11 @@ Page {
     property bool pushActive: false
     property bool pushAvailable: false
     property string pushService: ""
+    property string pushModule: "puhuri2"
+    property bool pushEnabled: false
 
     signal notificationsChanged(bool enabled)
+    signal backgroundSetupRequested(string service, string module)
     signal pushEnabledRequested(bool enabled)
     /// The user moved the switch: null means "keep the connection open".
     /// (Not `pollSecondsChanged` - Qt already makes that one for the
@@ -180,9 +183,9 @@ Page {
                         ? (page.pushActive
                            ? tr("settings.pushOn") + (page.pushService
                                            ? " (" + page.pushService + ")" : "")
-                           : (page.pushService
+                           : (page.pushEnabled ? tr("settings.pushPending") : (page.pushService
                               ? tr("settings.pushOff")
-                              : tr("settings.pushOffNoBridge")))
+                              : tr("settings.pushOffNoBridge"))))
                         : tr("settings.pushUnavailable")
                     subtitle.font.pixelSize: Fonts.bigger(FontUtils.sizeToPixels("small"))
                 }
@@ -195,14 +198,47 @@ Page {
                         rightMargin: units.gu(2)
                     }
                     enabled: page.pushAvailable && page.pushService !== ""
-                    checked: page.pushActive
+                    checked: page.pushEnabled
                     onCheckedChanged: {
                         // Guard against the binding writing back.
-                        if (checked === page.pushActive)
+                        if (checked === page.pushEnabled)
                             return
                         page.pushEnabledRequested(checked)
                     }
                 }
+            }
+
+            Label {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                text: tr("settings.backgroundPrivacy")
+            }
+            Label { text: tr("settings.pushService") }
+            TextField {
+                id: pushServiceField
+                objectName: "pushServiceField"
+                width: parent.width
+                text: page.pushService || "ubpush.agnos.is"
+                inputMethodHints: Qt.ImhNoAutoUppercase | Qt.ImhNoPredictiveText
+            }
+            Label { text: tr("settings.pushModule") }
+            TextField {
+                id: pushModuleField
+                objectName: "pushModuleField"
+                width: parent.width
+                text: page.pushModule
+                inputMethodHints: Qt.ImhNoAutoUppercase | Qt.ImhNoPredictiveText
+            }
+            Label {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                text: tr("settings.pushProviderSettings")
+            }
+            Button {
+                text: tr("settings.backgroundSetup")
+                enabled: page.pushAvailable && pushServiceField.text.trim() !== ""
+                         && /^[A-Za-z0-9._-]{1,64}$/.test(pushModuleField.text.trim())
+                onClicked: page.backgroundSetupRequested(pushServiceField.text.trim(), pushModuleField.text.trim())
             }
 
             Label { text: tr("settings.account"); font.pixelSize: Fonts.bigger(FontUtils.sizeToPixels("large")) }

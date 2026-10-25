@@ -15,6 +15,23 @@ use puhurid::store::Store;
 use puhurid::{default_data_dir, default_socket_path};
 
 fn main() {
+    if std::env::args().nth(1).as_deref()==Some("--push-helper") {
+        // Covers startup, database waits and shutdown, not just the fetch loop.
+        // Normal return cancels the watchdog. Forced exit leaves SQLite/WAL and
+        // the pre-written empty result, without a detached network process.
+        let (cancel,receiver)=std::sync::mpsc::channel::<()>();
+        let remaining=(puhurid::push::helper_started()+std::time::Duration::from_millis(4800)).saturating_duration_since(std::time::Instant::now());
+        std::thread::spawn(move || {
+            if matches!(receiver.recv_timeout(remaining),Err(std::sync::mpsc::RecvTimeoutError::Timeout)) {std::process::exit(0);}
+        });
+        let args:Vec<_>=std::env::args_os().collect();
+        if args.len()!=4 { std::process::exit(2); }
+        if puhurid::push::run(std::path::Path::new(&args[2]),std::path::Path::new(&args[3])).is_err() {
+            eprintln!("puhuri-push: vastaanotto epäonnistui");
+        }
+        let _=cancel.send(());
+        return;
+    }
     let mut data_dir = default_data_dir();
     let mut socket_path = default_socket_path();
     let mut engine_name = "xmpp".to_string();

@@ -131,6 +131,31 @@ impl Server {
         self.store.push_service()
     }
 
+    fn disable_push_preserving_route(&self) -> Result<(), String> {
+        self.store.set_setting("push.selected_module", &self.store.push_module())?;
+        self.engine.disable_push()
+    }
+
+    fn selected_push_module(&self, request: &Request) -> Result<String, String> {
+        let module = request.args.get("module").and_then(Value::as_str)
+            .map(str::trim).map(str::to_string).unwrap_or_else(|| self.store.push_module());
+        if module.is_empty() || module.len() > 64
+            || !module.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c)) {
+            return Err("Virheellinen push-moduuli".into());
+        }
+        Ok(module)
+    }
+
+    fn configure_push_route(&self, service: &str, module: &str) -> Result<(), String> {
+        let _: xmpp_parsers::jid::BareJid = service.parse().map_err(|_| "Virheellinen push-palvelu")?;
+        let enabled = self.store.push_enabled();
+        if let Some(old) = self.store.push_settings() {
+            if old.jid != service || old.module != module { self.disable_push_preserving_route()?; }
+        }
+        self.store.set_push_route(service, module)?;
+        self.store.set_setting("push.enabled", if enabled {"true"} else {"false"})
+    }
+
     fn serve_client(self: Arc<Self>, stream: UnixStream) -> std::io::Result<()> {
         let writer = Arc::new(Mutex::new(stream.try_clone()?));
         let (sender, receiver) = channel::<String>();
@@ -234,7 +259,7 @@ impl Server {
                 Ok(json!({"ok": true}))
             }
             "account.logout" => {
-                self.engine.disable_push()?;
+                self.disable_push_preserving_route()?;
                 self.store.set_push_token(None)?;
                 self.engine.disconnect()?;
                 Ok(json!({"ok": true}))
@@ -245,7 +270,7 @@ impl Server {
             // attachment copies. The service stays usable for a fresh login.
             "account.deleteLocalData" => {
                 self.engine.cancel_draft()?;
-                self.engine.disable_push()?;
+                self.disable_push_preserving_route()?;
                 self.engine.disconnect()?;
                 self.store.purge_local_data()?;
                 if let Some(marker) = &self.purge_marker {
@@ -515,64 +540,88 @@ impl Server {
                     .get("node")
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                let module = request
-                    .args
-                    .get("module")
-                    .and_then(Value::as_str)
-                    .unwrap_or("ubports");
-                Ok(json!(self.engine.enable_push(&jid, node, module)?))
+                let module = self.selected_push_module(request)?;
+                let settings = self.engine.enable_push(&jid, node, &module)?;
+                self.store.set_setting("push.selected_module", &module)?;
+                self.store.set_setting("push.enabled", "true")?;
+                Ok(json!({"jid": settings.jid, "module": settings.module, "pending":true}))
             }
             "push.disable" => {
-                self.engine.disable_push()?;
+                self.store.set_setting("push.enabled", "false")?;
+                self.disable_push_preserving_route()?;
                 Ok(json!({"ok": true}))
             }
-            // Which bridge the server should push to. The operator sets it
-            // (there is no public default), and an empty value is "none".
             "push.service.set" => {
-                let service = request
-                    .args
-                    .get("service")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                if !service.is_empty() {
-                    if let Err(error) =
-                        <xmpp_parsers::jid::BareJid as std::str::FromStr>::from_str(&service)
-                    {
-                        return Err(format!("push-palvelun osoite ei kelpaa: {service} ({error})"));
-                    }
-                }
-                self.store.set_push_service(if service.is_empty() {
-                    None
+                let service = request.args.get("service").and_then(Value::as_str).unwrap_or("").trim();
+                let module = self.selected_push_module(request)?;
+                if service.is_empty() {
+                    self.disable_push_preserving_route()?;
+                    self.store.set_push_service(None)?;
                 } else {
-                    Some(&service)
-                })?;
-                // If a token is already known, register it now so the change
-                // does not need a restart of the service or the app.
-                let mut active = false;
-                if let Some(token) = self.store.push_token() {
-                    if service.is_empty() {
-                        self.engine.disable_push()?;
-                    } else {
-                        self.engine.enable_push(&service, &token, "ubports")?;
-                        active = true;
+                    self.configure_push_route(service, &module)?;
+                    if self.store.push_enabled() {
+                        if let Some(token) = self.store.push_token() {
+                            self.engine.enable_push(service, &token, &module)?;
+                        }
                     }
                 }
-                Ok(json!({
-                    "service": if service.is_empty() { Value::Null } else { json!(service) },
-                    "active": active,
-                }))
+                Ok(json!({"service": service, "module": module, "pending": !service.is_empty()}))
             }
             // What the application needs for the push notification chain:
             // the device's token (from Lomiri's push service) and whether a
             // push bridge has been configured. Without a bridge there is
             // nothing the server can be told, so `active` is false and the
             // application can say so.
+            "background.setup" => {
+                let service = arg_str(request,"service")?;
+                let module = self.selected_push_module(request)?;
+                self.configure_push_route(service.trim(), &module)?;
+                self.store.set_setting("push.enabled", "true")?;
+                self.store.set_setting("archive.enabled","true")?;
+                self.store.set_setting("push.confirmed","false")?;
+                if let Some(token)=self.store.push_token() {self.engine.enable_push(service.trim(),&token,&module)?;}
+                let _=self.engine.wake();
+                Ok(json!({"configured":true, "module":module}))
+            }
+            "push.setEnabled" => {
+                let enabled = request.args.get("enabled").and_then(Value::as_bool).ok_or("Push-valinta puuttuu")?;
+                let module = self.store.push_module();
+                let service = self.push_service();
+                if enabled && service.is_empty() { return Err("Push-palvelua ei ole asetettu".into()); }
+                self.store.set_setting("push.enabled", if enabled {"true"} else {"false"})?;
+                if !enabled { self.disable_push_preserving_route()?; }
+                else if let Some(token) = self.store.push_token() { self.engine.enable_push(&service, &token, &module)?; }
+                Ok(json!({"enabled":enabled}))
+            }
+            "lifecycle.active" => {
+                let active=request.args.get("active").and_then(Value::as_bool).unwrap_or(true);
+                if !active && self.store.push_settings().is_some() {
+                    self.engine.pause()?;
+                } else if active && !self.engine.status().connected {
+                    if let Some((jid,password))=self.store.account() {self.engine.connect(&jid,&password)?;}
+                }
+                Ok(json!({"active":active}))
+            }
+            "push.notice.state" => {
+                let account=self.privacy_account()?;
+                let (sequence,emitted)=self.store.push_notice_state(&account)?;
+                Ok(json!({"account":account,"sequence":sequence,"emitted":emitted,"managed":self.engine.name()=="xmpp"}))
+            }
+            "push.notice.ack" => {
+                let account=self.privacy_account()?;
+                if arg_str(request,"account")?!=account {return Err("Ilmoituksen tili vaihtui".into());}
+                let sequence=request.args.get("sequence").and_then(Value::as_i64).ok_or("Ilmoituslaskuri puuttuu")?;
+                self.store.acknowledge_push_notice(&account,sequence)?;
+                Ok(json!({"ok":true}))
+            }
             "push.get" => {
                 let service = self.push_service();
                 Ok(json!({
                     "token": self.store.push_token(),
+                    "active": self.store.push_enabled() && self.store.setting("push.confirmed").as_deref()==Some("true"),
+                    "enabled": self.store.push_enabled(),
+                    "module": self.store.push_module(),
+                    "archive": {"state":self.store.setting("archive.state"),"policy":self.store.setting("archive.default"),"lastPageCount":self.store.setting("archive.last_page_count")},
                     "service": if service.is_empty() { Value::Null } else { json!(service) },
                     "settings": self.engine.push_settings()?,
                 }))
@@ -588,14 +637,10 @@ impl Server {
                     .unwrap_or("")
                     .trim()
                     .to_string();
-                let module = request
-                    .args
-                    .get("module")
-                    .and_then(Value::as_str)
-                    .unwrap_or("ubports");
+                let module = self.selected_push_module(request)?;
                 if token.is_empty() {
                     self.store.set_push_token(None)?;
-                    self.engine.disable_push()?;
+                    self.disable_push_preserving_route()?;
                     return Ok(json!({"ok": true, "active": false, "reason": "no-token"}));
                 }
                 if self.store.account().is_none() {
@@ -612,20 +657,24 @@ impl Server {
                 }
                 self.store.set_push_token(Some(&token))?;
                 let service = self.push_service();
+                if !self.store.push_enabled() {
+                    return Ok(json!({"ok":true,"active":false,"reason":"disabled"}));
+                }
                 if service.is_empty() {
                     return Ok(json!({
                         "ok": true,
                         "active": false,
                         "reason": "no-push-service",
-                        "token": token,
                     }));
                 }
-                let settings = self.engine.enable_push(&service, &token, module)?;
+                self.engine.enable_push(&service, &token, &module)?;
+                self.store.set_setting("push.selected_module", &module)?;
                 Ok(json!({
                     "ok": true,
-                    "active": true,
+                    "active": false,
+                    "pending": true,
                     "service": service,
-                    "settings": settings,
+                    "module": module,
                 }))
             }
             // The push helper woke the daemon: end the session now and open a

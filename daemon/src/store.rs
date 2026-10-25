@@ -6,8 +6,27 @@
 //! service's data directory. Attachments live next to it under
 //! `attachments/`, also private to the user.
 
+#[path = "upload_jobs.rs"]
+mod upload_jobs;
+pub use upload_jobs::UploadJob;
+#[path = "iq_cache.rs"]
+mod iq_cache;
+pub use iq_cache::IqCacheQuery;
+#[path = "push_notice.rs"]
+mod push_notice;
 #[path = "privacy.rs"]
 mod privacy;
+#[path = "handoff.rs"]
+mod handoff;
+#[path = "mam_page.rs"]
+mod mam_page;
+pub use mam_page::MamPageAction;
+#[path = "mam_handoff.rs"]
+mod mam_handoff;
+pub use mam_handoff::{MamProgress, MamQuery};
+#[path = "transport_handoff.rs"]
+mod transport_handoff;
+pub use handoff::{HandoffState, PendingStanza};
 pub use privacy::{Admission, MessageRequest, PrivacyContact};
 
 use crate::db::Db;
@@ -56,7 +75,12 @@ pub struct Store {
 ///   deliberate unlock survives reopening and restarting.
 /// * **7 - contact consent (2026-10-23)**: account-scoped permissions,
 ///   server block cache and bounded, undecrypted message requests.
-pub const SCHEMA_VERSION: i64 = 7;
+/// * **8 - handoff storage (2026-10-24)**: durable inbound queue and atomic
+///   stream checkpoint. Transport integration is not enabled yet.
+/// * **9 - MAM correlation (2026-10-24)**: query registrations and ingress links.
+/// * **10 - ordered MAM completion (2026-10-25)**: bounded result ledger and account cursor.
+/// * **11 - durable MAM final-IQ decisions (2026-10-25)**.
+pub const SCHEMA_VERSION: i64 = 11;
 
 /// Open (or create) `puhuri.db` and bring its schema up to
 /// [`SCHEMA_VERSION`]. `Store` and `OmemoStore` both go through here, so they
@@ -198,6 +222,9 @@ fn upgrade_to_current(connection: &Connection) -> Result<(), String> {
                 .map_err(|error| error.to_string())?;
         }
         privacy::create_schema(connection)?;
+        handoff::create_schema(connection)?;
+        mam_handoff::create_schema(connection)?;
+        mam_page::create_schema(connection)?;
         let after: i64 = connection
             .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
             .map_err(|error| error.to_string())?;
@@ -641,7 +668,21 @@ impl Store {
     /// before this were saved without a stanza id, so re-reading them could
     /// only produce placeholders. Fixed once, when the first L1b build runs.
     pub fn mam_floor(&self) -> Option<i64> {
-        self.setting("mam_floor_ts").and_then(|value| value.parse().ok())
+        self.mam_floor_checked().ok().flatten()
+    }
+
+    pub fn mam_floor_checked(&self) -> Result<Option<i64>, String> {
+        self.setting_checked("mam_floor_ts")?
+            .map(|v| {
+                let value = v
+                    .parse::<i64>()
+                    .map_err(|_| "MAM-alaraja on virheellinen".to_string())?;
+                if value < 0 || chrono::DateTime::from_timestamp(value, 0).is_none() {
+                    return Err("MAM-alaraja on virheellinen".into());
+                }
+                Ok(value)
+            })
+            .transpose()
     }
 
     pub fn set_mam_floor(&self, ts: i64) -> Result<(), String> {
@@ -657,7 +698,11 @@ impl Store {
     /// the id that came with a MAM `<result>` is a real archive id
     /// (`docs/DECISIONS.md`, L1b).
     pub fn mam_last_id(&self) -> Option<String> {
-        self.setting("mam_last_id")
+        self.mam_last_id_checked().ok().flatten()
+    }
+
+    pub fn mam_last_id_checked(&self) -> Result<Option<String>, String> {
+        self.setting_checked("mam_last_id")
     }
 
     pub fn set_mam_last_id(&self, id: &str) -> Result<(), String> {
@@ -702,6 +747,9 @@ impl Store {
         // that already arrived) would be wiped by a row that is recorded
         // again. It is read first and written back, so `mark_delivered` stays
         // the only writer but never loses a race with a re-record.
+        let previously_stored: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE id=?1)",params![message.id],|row|row.get(0)
+        ).map_err(|error|error.to_string())?;
         let receipt: i64 = connection
             .query_row(
                 "SELECT receipt FROM messages WHERE id = ?1",
@@ -760,7 +808,7 @@ impl Store {
                 )
                 .map_err(|error| format!("keskustelun tallennus epäonnistui: {error}"))?;
         }
-        if !message.outgoing && unread {
+        if !message.outgoing && unread && !previously_stored {
             connection
                 .execute(
                     "UPDATE conversations SET unread = unread + 1 WHERE id = ?1",
@@ -802,17 +850,13 @@ impl Store {
             .is_some()
     }
 
-    /// Is there already a message at this exact moment in this conversation?
-    ///
-    /// The archive (MAM, XEP-0313) and the other devices' copies (carbons,
-    /// XEP-0280) describe messages we may already have - this is what keeps
-    /// them from being stored twice, because a message is its conversation
-    /// plus its moment.
-    pub fn has_message_at(&self, thread: &str, ts: i64) -> bool {
+    /// Has this exact local row already been stored in this conversation?
+    /// Timestamps are not identities: several distinct messages can share one.
+    pub fn has_message_row(&self, thread: &str, id: &str) -> bool {
         self.lock()
             .query_row(
-                "SELECT 1 FROM messages WHERE thread = ?1 AND ts = ?2",
-                params![thread, ts],
+                "SELECT 1 FROM messages WHERE thread = ?1 AND id = ?2",
+                params![thread, id],
                 |_| Ok(()),
             )
             .optional()
@@ -865,8 +909,8 @@ impl Store {
                     COALESCE(m.voice, 0), COALESCE(m.image, 0)
                  FROM conversations c
                  LEFT JOIN messages m
-                     ON m.thread = c.id
-                    AND m.ts = (SELECT MAX(ts) FROM messages WHERE thread = c.id)
+                     ON m.id = (SELECT id FROM messages WHERE thread = c.id
+                                ORDER BY ts DESC, id DESC LIMIT 1)
                  ORDER BY COALESCE(m.ts, 0) DESC, c.id",
         ) {
             Ok(statement) => statement,
@@ -1121,6 +1165,12 @@ impl Store {
             "privacy_contacts",
             "privacy_server_blocks",
             "message_requests",
+            "xmpp_mam_ends",
+            "xmpp_mam_inbox",
+            "xmpp_mam_queries",
+            "xmpp_mam_cursors",
+            "xmpp_inbox",
+            "xmpp_handoff",
             "identity",
             "identities",
             "sessions",
@@ -1213,19 +1263,20 @@ impl Store {
             .map_err(|error| error.to_string())
     }
 
-    fn setting(&self, key: &str) -> Option<String> {
-        self.lock()
-            .query_row(
-                "SELECT value FROM settings WHERE key = ?1",
-                params![key],
-                |row| row.get(0),
-            )
-            .optional()
-            .ok()
-            .flatten()
+    pub(crate) fn setting(&self, key: &str) -> Option<String> {
+        self.setting_checked(key).ok().flatten()
     }
 
-    fn set_setting(&self, key: &str, value: &str) -> Result<(), String> {
+    pub(crate) fn setting_checked(&self, key: &str) -> Result<Option<String>, String> {
+        self.lock()
+            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(|_| "Asetuksen luku epäonnistui".into())
+    }
+
+    pub(crate) fn set_setting(&self, key: &str, value: &str) -> Result<(), String> {
         self.lock()
             .execute(
                 "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
@@ -1253,6 +1304,29 @@ impl Store {
                 .map(|_| ())
                 .map_err(|error| error.to_string()),
         }
+    }
+
+    /// The user's route choice survives disabling an active registration.
+    pub fn push_module(&self) -> String {
+        self.setting("push.selected_module")
+            .or_else(|| self.setting("push.module"))
+            .unwrap_or_else(|| "puhuri2".to_string())
+    }
+
+    pub fn push_enabled(&self) -> bool {
+        self.setting("push.enabled")
+            .map(|value| value == "true")
+            .unwrap_or_else(|| self.push_settings().is_some())
+    }
+
+    pub fn set_push_route(&self, service: &str, module: &str) -> Result<(), String> {
+        let connection = self.lock();
+        let transaction = connection.unchecked_transaction().map_err(|e| e.to_string())?;
+        for (key, value) in [("push.service", service), ("push.selected_module", module)] {
+            transaction.execute("INSERT OR REPLACE INTO settings (key,value) VALUES (?1,?2)", params![key,value])
+                .map_err(|e| e.to_string())?;
+        }
+        transaction.commit().map_err(|e| e.to_string())
     }
 
     /// The XEP-0357 push service this account uses, if one was set up.
@@ -1903,6 +1977,20 @@ fn message(id: &str, thread: &str, ts: i64, outgoing: bool, text: &str) -> Messa
         let store = Store::open(&dir).unwrap();
         assert_eq!(store.nickname("maija@example.org"), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_second_messages_share_one_conversation() {
+        let (store, dir) = temporary_store("same-second-selection");
+        for id in ["a", "b"] {
+            store.record(&message(id, "peer@example.org", 42, false, id), "Peer").unwrap();
+        }
+        let conversations = store.conversations();
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].last_message, "b");
+        assert_eq!(store.messages("peer@example.org", 10).len(), 2);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

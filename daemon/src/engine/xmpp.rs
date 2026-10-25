@@ -13,6 +13,16 @@
 //! (`tokio-xmpp` is `Send`, so a plain multi-thread runtime is enough - no
 //! `LocalSet` is needed, unlike with presage.)
 
+#[path = "xmpp_inbox.rs"]
+mod inbox;
+#[path = "xmpp_upload.rs"]
+mod upload_runtime;
+#[cfg(feature="omemo")]
+#[path="xmpp_iq_cache.rs"]
+mod iq_cache;
+#[cfg(feature="omemo")]
+use iq_cache::recover_omemo_cache_iq;
+
 use super::{
     Attachment, AttachmentDraft, Contact, Conversation, Engine, EngineEvent, EngineResult,
     Message, PeerDevice, PushSettings, Status, TrustedDevice,
@@ -29,9 +39,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
-// Only the OMEMO outbox (L2) tracks a stanza's journey to `Acked`; without
-// the feature the import would be a warning.
-#[cfg(feature = "omemo")]
+// Text and attachment outboxes finish only on a transport acknowledgement.
 use tokio_xmpp::stanzastream::StanzaStage;
 use tokio_xmpp::{Client, Event, Stanza};
 use xmpp_parsers::carbons::{Enable, Received as CarbonReceived, Sent as CarbonSent};
@@ -41,7 +49,7 @@ use xmpp_parsers::forwarding::Forwarded;
 use xmpp_parsers::http_upload::{SlotRequest, SlotResult};
 use xmpp_parsers::iq::Iq;
 use xmpp_parsers::jid::BareJid;
-use xmpp_parsers::mam::{Fin as MamFin, Query as MamQuery, Result_ as MamResult};
+use xmpp_parsers::mam::Result_ as MamResult;
 use xmpp_parsers::message::{Lang, Message as ParsedMessage, MessageType};
 use xmpp_parsers::ns;
 use xmpp_parsers::oob::Oob;
@@ -49,7 +57,6 @@ use xmpp_parsers::presence::{Presence, Type as PresenceType};
 use xmpp_parsers::push::{Disable as PushDisable, Enable as PushEnable};
 use xmpp_parsers::receipts::{Received, Request};
 use xmpp_parsers::roster::Roster;
-use xmpp_parsers::rsm::SetQuery;
 #[cfg(feature = "omemo")]
 use xmpp_parsers::legacy_omemo as omemo_xml;
 #[cfg(feature = "omemo")]
@@ -80,9 +87,6 @@ enum Command {
     /// belongs to.
     SendFile {
         to: BareJid,
-        path: PathBuf,
-        body: String,
-        content_type: String,
         id: String,
     },
     Disconnect,
@@ -140,6 +144,8 @@ struct PendingUpload {
 /// item per device).
 #[cfg(feature = "omemo")]
 struct PendingOmemoFetch {
+    store: Arc<Store>,
+    account: String,
     /// The IQ id prefix this fetch owns; unique per fetch.
     id: String,
     jid: BareJid,
@@ -220,6 +226,7 @@ struct OmemoSelfFetch {
 pub(super) struct Shared {
     status: Mutex<Status>,
     events: Mutex<Vec<EngineEvent>>,
+    store_errors: AtomicU64,
     /// bare JID -> the name the roster gives it.
     roster: Mutex<HashMap<String, String>>,
     /// The component that takes files (XEP-0363), once it is known.
@@ -228,6 +235,7 @@ pub(super) struct Shared {
 
 impl Shared {
     pub(super) fn push(&self, event: EngineEvent) {
+        if matches!(&event,EngineEvent::Error {code,..} if code=="store" || code=="privacy") {self.store_errors.fetch_add(1,Ordering::SeqCst);}
         self.events.lock().unwrap().push(event);
     }
 }
@@ -238,6 +246,8 @@ pub struct XmppEngine {
     control: Mutex<Option<Sender<Command>>>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     counter: AtomicU64,
+    short_lived: bool,
+    helper_deadline: Option<std::time::Instant>,
     /// The voice recording, if one is going on (the recorder is a child of
     /// the click UI and uses its declared microphone policy).
     recording: Mutex<Option<Recording>>,
@@ -295,6 +305,25 @@ impl XmppEngine {
         }
     }
 
+    pub fn for_push_until(store:Arc<Store>,deadline:std::time::Instant)->Self {
+        let mut engine=Self::for_push(store);engine.helper_deadline=Some(deadline);engine
+    }
+    /// Bounded cooperative stop for the short-lived helper; no account logout.
+    pub fn stop_before(&self,deadline:std::time::Instant)->bool {
+        let _=self.command(Command::Disconnect);
+        *self.control.lock().unwrap()=None;
+        let mut slot=self.thread.lock().unwrap();
+        if let Some(handle)=slot.take() {
+            while !handle.is_finished() && std::time::Instant::now()<deadline {std::thread::sleep(std::time::Duration::from_millis(10));}
+            if !handle.is_finished() {*slot=Some(handle);return false;}
+            let _=handle.join();
+        }
+        true
+    }
+    pub fn for_push(store: Arc<Store>) -> Self {
+        let mut engine=Self::new(store);engine.short_lived=true;engine
+    }
+
     pub fn new(store: Arc<Store>) -> Self {
         Self {
             store,
@@ -308,12 +337,15 @@ impl XmppEngine {
                     error: None,
                 }),
                 events: Mutex::new(Vec::new()),
+                store_errors: AtomicU64::new(0),
                 roster: Mutex::new(HashMap::new()),
                 upload_service: Mutex::new(None),
             }),
             control: Mutex::new(None),
             thread: Mutex::new(None),
             counter: AtomicU64::new(1),
+            short_lived: false,
+            helper_deadline: None,
             recording: Mutex::new(None),
             draft: Mutex::new(None),
         }
@@ -417,7 +449,7 @@ impl XmppEngine {
             text: body.to_string(),
             ts: now(),
             delivered: false,
-            state: crate::engine::message_state_complete(),
+            state: "pending".into(),
             attachment: Some(Attachment {
                 path: path.to_string_lossy().to_string(),
                 content_type: Some(content_type.to_string()),
@@ -425,14 +457,16 @@ impl XmppEngine {
                 image,
             }),
         };
-        self.store.record(&message, &self.name_for(thread))?;
-        self.command(Command::SendFile {
+        let account=self.status().jid.ok_or("Kirjaudu ensin sisään")?;
+        let encrypted=self.store.encrypted_threads().iter().any(|t|t==thread);
+        self.store.enqueue_upload(&crate::store::UploadJob {
+            account,id:message.id.clone(),peer:thread.into(),path:path.to_path_buf(),body:body.into(),content_type:content_type.into(),
+            encrypted,created:message.ts,iq_id:None,service:None,reply_xml:None,requested:0,attempts:0,failed:false,
+        }, &message, &self.name_for(thread))?;
+        if let Err(error)=self.command(Command::SendFile {
             to,
-            path: path.to_path_buf(),
-            body: body.to_string(),
-            content_type: content_type.to_string(),
             id: message.id.clone(),
-        })?;
+        }) {self.shared.push(EngineEvent::Error{code:"upload".into(),message:format!("Tiedosto jonossa, yhteys ei ole valmis: {error}")});}
         self.shared.push(EngineEvent::MessageSent(message.clone()));
         Ok(message)
     }
@@ -513,9 +547,7 @@ const VOICE_CHANNELS: u16 = 1;
 /// (`puhuri-ctl poll <seconds>`), not this.
 /// The outbox (L2): how many times one pending message may be tried, and how
 /// old it may get, before it is marked `failed` and the user is told.
-#[cfg(feature = "omemo")]
 const OUTBOX_MAX_ATTEMPTS: u32 = 10;
-#[cfg(feature = "omemo")]
 const OUTBOX_MAX_AGE_SECONDS: i64 = 7 * 24 * 3600;
 
 const POLL_CONNECTED_SECONDS: u64 = 10;
@@ -543,7 +575,7 @@ const LOGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// The polite goodbye (`</stream:stream>`) is worth sending to a server that
 /// is there, but it must never hold the worker: a stream that never opened
 /// has nobody to answer it.
-const GOODBYE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const GOODBYE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 /// An attachment may be a picture or a voice message, but it may not be an
 /// unbounded peer-controlled stream: a remote sender could otherwise make the
 /// daemon allocate and write until the phone runs out of resources.
@@ -682,14 +714,78 @@ fn receive_omemo(
     // `<delay>` stamp, a live one the receive time.
     ts: i64,
 ) -> Result<OmemoOutcome, super::omemo::ReceiveError> {
+    receive_omemo_with_inbox(
+        omemo, store, sender, thread, name, server_id, message_id, element, downloads, unread, ts,
+        None,
+    )
+}
+
+#[cfg(feature = "omemo")]
+#[allow(clippy::too_many_arguments)]
+fn receive_omemo_with_inbox(
+    omemo: &Omemo,
+    store: &Store,
+    sender: &BareJid,
+    thread: &str,
+    name: &str,
+    // The id **our own server** stamped on the stanza (XEP-0359): the only
+    // thing a duplicate may be recognised by before the ratchet is touched.
+    server_id: Option<&str>,
+    // The stanza's own `id` attribute. It is the sender's to choose, so it is
+    // **not** used for dedup - but it keeps our message rows apart when two
+    // messages arrive within the same second.
+    message_id: Option<&str>,
+    element: &omemo_xml::Encrypted,
+    downloads: &mut Vec<(BareJid, String, String, Option<String>)>,
+    // A live message is news; a carbon or an archived one is history.
+    unread: bool,
+    // The timestamp rule (L1b): a forwarded message carries the archive's own
+    // `<delay>` stamp, a live one the receive time.
+    ts: i64,
+    inbox: Option<(&str, i64)>,
+) -> Result<OmemoOutcome, super::omemo::ReceiveError> {
+    receive_omemo_inbox_direction(omemo,store,sender,thread,name,server_id,message_id,element,downloads,unread,ts,inbox,false)
+}
+
+#[cfg(feature="omemo")]
+#[allow(clippy::too_many_arguments)]
+fn receive_omemo_inbox_direction(
+    omemo: &Omemo,
+    store: &Store,
+    sender: &BareJid,
+    thread: &str,
+    name: &str,
+    // The id **our own server** stamped on the stanza (XEP-0359): the only
+    // thing a duplicate may be recognised by before the ratchet is touched.
+    server_id: Option<&str>,
+    // The stanza's own `id` attribute. It is the sender's to choose, so it is
+    // **not** used for dedup - but it keeps our message rows apart when two
+    // messages arrive within the same second.
+    message_id: Option<&str>,
+    element: &omemo_xml::Encrypted,
+    downloads: &mut Vec<(BareJid, String, String, Option<String>)>,
+    // A live message is news; a carbon or an archived one is history.
+    unread: bool,
+    // The timestamp rule (L1b): a forwarded message carries the archive's own
+    // `<delay>` stamp, a live one the receive time.
+    ts: i64,
+    inbox: Option<(&str, i64)>,
+    outgoing: bool,
+) -> Result<OmemoOutcome, super::omemo::ReceiveError> {
     if let Some(id) = server_id {
         if store.has_stanza_id(thread, id) {
+            if let Some((account, id)) = inbox {
+                store
+                    .finish_pending_disposition(account, id)
+                    .map_err(super::omemo::ReceiveError::Store)?;
+            }
             return Ok(OmemoOutcome::Duplicate);
         }
     }
     let server_id = server_id.map(str::to_string);
     let row_id = message_id.map(str::to_string);
-    let outcome = match omemo.decrypt_and_store(
+    let mut committed_downloads = Vec::new();
+    let outcome = match omemo.decrypt_and_store_and_finish(
         &sender.to_string(),
         element,
         |connection, plaintext| {
@@ -713,16 +809,17 @@ fn receive_omemo(
                 let placeholder = Message {
                     id: row.clone(),
                     thread: thread.to_string(),
-                    outgoing: false,
-                    sender: name.to_string(),
+                    outgoing,
+                    sender: if outgoing {"minä".into()}else{name.to_string()},
                     text: "⏳ Ladataan liitettä…".to_string(),
                     ts,
                     delivered: false,
                     state: crate::engine::message_state_complete(),
                     attachment: None,
                 };
+                if let Some((account,_))=inbox {Store::record_inbox_notice_in(connection,account,&placeholder,unread)?;}
                 Store::record_downloading_in(connection, &placeholder, name, &url, unread)?;
-                downloads.push((sender.clone(), url, text, Some(row)));
+                committed_downloads.push((sender.clone(), url, text, Some(row)));
                 return Ok(OmemoOutcome::Download);
             }
             // Kaatuminen tässä kohdassa (ennen committia) peruu koko
@@ -731,16 +828,21 @@ fn receive_omemo(
             let message = Message {
                 id: format!("in-{ts}-{}", row_id.clone().unwrap_or_default()),
                 thread: thread.to_string(),
-                outgoing: false,
-                sender: name.to_string(),
+                outgoing,
+                sender: if outgoing {"minä".into()}else{name.to_string()},
                 text,
                 ts,
                 delivered: false,
                 state: crate::engine::message_state_complete(),
                 attachment: None,
             };
+            if let Some((account,_))=inbox {Store::record_inbox_notice_in(connection,account,&message,unread)?;}
             Store::record_in(connection, &message, name, unread, server_id.as_deref())?;
             Ok(OmemoOutcome::Stored(message))
+        },
+        |connection| match inbox {
+            Some((account, id)) => Store::finish_stanza_in(connection, account, id),
+            None => Ok(()),
         },
     ) {
         Ok(outcome) => outcome,
@@ -748,11 +850,20 @@ fn receive_omemo(
         // kaksoiskappaletta ei voitu tunnistaa ennen purkua - mutta kirjasto
         // sanoo itse, että viesti on jo vastaanotettu. Se ei ole virhe eikä
         // paikkamerkin paikka.
-        Err(error) if error.is_already_received() => return Ok(OmemoOutcome::Duplicate),
+        Err(error) if error.is_already_received() => {
+            if let Some((account, id)) = inbox {
+                store
+                    .finish_pending_disposition(account, id)
+                    .map_err(super::omemo::ReceiveError::Store)?;
+            }
+            return Ok(OmemoOutcome::Duplicate);
+        }
         Err(error) => return Err(error),
     };
+    downloads.extend(committed_downloads);
     Ok(outcome.unwrap_or(OmemoOutcome::KeyTransport))
 }
+
 
 impl XmppEngine {
     /// Stop the running session without touching the saved account.
@@ -825,11 +936,18 @@ impl Engine for XmppEngine {
         let shared = Arc::clone(&self.shared);
         let password = password.to_string();
         let domain = bare.domain().to_string();
+        let short_lived=self.short_lived;
+        let helper_deadline=self.helper_deadline;
         let handle = std::thread::Builder::new()
             .name("puhuri-xmpp".to_string())
-            .spawn(move || worker(bare, password, domain, store, shared, receiver))
+            .spawn(move || worker(bare, password, domain, store, shared, receiver, short_lived, helper_deadline))
             .map_err(|error| format!("moottorin säikeen käynnistys epäonnistui: {error}"))?;
         *self.thread.lock().unwrap() = Some(handle);
+        Ok(())
+    }
+
+    fn pause(&self) -> EngineResult<()> {
+        self.stop_session();
         Ok(())
     }
 
@@ -1354,6 +1472,12 @@ impl Engine for XmppEngine {
                 module: module.to_string(),
             },
         };
+        if let Some(previous) = self.store.push_settings() {
+            if previous.jid != settings.jid || previous.node != settings.node || previous.module != settings.module {
+                let _ = self.command(Command::DisablePush { settings: Some(previous) });
+            }
+        }
+        self.store.set_setting("push.confirmed","false")?;
         self.store.set_push_settings(Some(&settings))?;
         // If a session is open, tell it now; otherwise the login does it.
         let _ = self.command(Command::EnablePush {
@@ -1365,6 +1489,7 @@ impl Engine for XmppEngine {
     fn disable_push(&self) -> EngineResult<()> {
         let previous = self.store.push_settings();
         self.store.set_push_settings(None)?;
+        self.store.set_setting("push.confirmed","false")?;
         if previous.is_some() {
             let _ = self.command(Command::DisablePush { settings: previous });
         }
@@ -1410,11 +1535,54 @@ enum SessionEnd {
     Wait(u64),
 }
 
-/// A short name for one of the client's events, for the debug switch
-/// (`PUHURI_LOG_EVENTS`).
 /// Resolve the effective peer before doing anything with a message. Carbon and
 /// archive envelopes are authoritative only from our own account/server.
-fn admit_stanza(raw: &ParsedMessage, own: &BareJid, store: &Store, shared: &Shared) -> bool {
+fn admit_stanza(
+    raw: &ParsedMessage,
+    own: &BareJid,
+    store: &Store,
+    shared: &Shared,
+) -> Result<bool, String> {
+    admit_stanza_with_inbox(raw, own, store, shared, now(), None)
+}
+
+// Every successful non-allow result finishes its inbox row, either through
+// the consent transfer transaction or an explicit policy discard. Errors do
+// neither, so a dispatcher can retry without decrypting or downloading.
+fn admit_stanza_with_inbox(
+    raw: &ParsedMessage,
+    own: &BareJid,
+    store: &Store,
+    shared: &Shared,
+    received_at: i64,
+    inbox_id: Option<i64>,
+) -> Result<bool, String> {
+    match decide_stanza_admission(raw, own, store, shared, received_at, inbox_id)? {
+        StanzaAdmission::Allow => Ok(true),
+        StanzaAdmission::Quarantined => Ok(false),
+        StanzaAdmission::Discard => {
+            if let Some(id) = inbox_id {
+                store.finish_pending_disposition(&own.to_string(), id)?;
+            }
+            Ok(false)
+        }
+    }
+}
+
+enum StanzaAdmission {
+    Allow,
+    Discard,
+    Quarantined,
+}
+
+fn decide_stanza_admission(
+    raw: &ParsedMessage,
+    own: &BareJid,
+    store: &Store,
+    shared: &Shared,
+    received_at: i64,
+    inbox_id: Option<i64>,
+) -> Result<StanzaAdmission, String> {
     use crate::store::Admission;
     let account = own.to_string();
     let mut copy = raw.clone();
@@ -1431,7 +1599,7 @@ fn admit_stanza(raw: &ParsedMessage, own: &BareJid, store: &Store, shared: &Shar
         || ((sent.is_some() || received.is_some()) && !own_origin)
         || (mam.is_some() && raw.from.is_some() && !own_origin)
     {
-        return false;
+        return Ok(StanzaAdmission::Discard);
     }
     let outgoing = sent.is_some()
         || mam.as_ref().is_some_and(|m| {
@@ -1446,15 +1614,25 @@ fn admit_stanza(raw: &ParsedMessage, own: &BareJid, store: &Store, shared: &Shar
         .map(|s| &s.forwarded)
         .or_else(|| received.as_ref().map(|r| &r.forwarded))
         .or_else(|| mam.as_ref().map(|m| &m.forwarded));
-    if let Some(m) = &mam {
-        // Filtering a result still advances the archive, avoiding repeated spam.
-        let _ = store.set_mam_last_id(&m.id);
-        if forwarded.and_then(|f| f.delay.as_ref()).is_some_and(|d| {
-            store
-                .mam_floor()
-                .is_some_and(|floor| d.stamp.0.timestamp() < floor)
-        }) {
-            return false;
+    if let Some(result) = mam.as_ref() {
+        let current_floor = store.mam_floor_checked()?;
+        let floor = if let Some(id) = inbox_id {
+            let Some(query) = store.mam_inbox_query(&account, id)? else {
+                return Ok(StanzaAdmission::Discard);
+            };
+            if result.queryid.as_ref().map(|id| id.0.as_str()) != Some(query.id.as_str()) {
+                return Ok(StanzaAdmission::Discard);
+            }
+            // A newer safety floor (e.g. after a key reset) still applies.
+            current_floor.max(query.floor)
+        } else {
+            current_floor
+        };
+        if forwarded
+            .and_then(|f| f.delay.as_ref())
+            .is_some_and(|d| floor.is_some_and(|floor| d.stamp.0.timestamp() < floor))
+        {
+            return Ok(StanzaAdmission::Discard);
         }
     }
     let message = forwarded.map(|f| &f.message).unwrap_or(raw);
@@ -1464,18 +1642,22 @@ fn admit_stanza(raw: &ParsedMessage, own: &BareJid, store: &Store, shared: &Shar
         message.from.as_ref()
     };
     let Some(peer) = peer else {
-        return false;
+        return Ok(StanzaAdmission::Discard);
     };
     let bare = peer.to_bare().to_string();
     if outgoing {
         // A sent carbon represents the user's deliberate send on another device.
-        if store.privacy_prepare_send(&account, &bare).is_err() {
-            return false;
+        // A block is a policy discard; a failed database read is retryable.
+        if store.privacy_state(&account, &bare)? == "blocked"
+            || store.privacy_server_blocked(&account, &peer.to_string())?
+        {
+            return Ok(StanzaAdmission::Discard);
         }
+        store.privacy_prepare_send(&account, &bare)?;
     }
-    match store.privacy_admission(&account, &peer.to_string()) {
-        Ok(Admission::Allow) => true,
-        Ok(Admission::Request) => {
+    match store.privacy_admission(&account, &peer.to_string())? {
+        Admission::Allow => Ok(StanzaAdmission::Allow),
+        Admission::Request => {
             let content = !message.bodies.is_empty()
                 || message.payloads.iter().any(|p| {
                     p.ns().contains("omemo")
@@ -1483,14 +1665,21 @@ fn admit_stanza(raw: &ParsedMessage, own: &BareJid, store: &Store, shared: &Shar
                         || p.is("x", "jabber:x:oob")
                 });
             if content {
-                if let Ok(true) = store.privacy_queue(&account, &bare, &stanza_xml(raw), now()) {
+                let xml = stanza_xml(raw);
+                let added = match inbox_id {
+                    Some(id) => {
+                        store.privacy_queue_inbox(&account, &bare, &xml, received_at, id)?
+                    }
+                    None => store.privacy_queue(&account, &bare, &xml, received_at)?,
+                };
+                if added {
                     shared.push(EngineEvent::StateChanged);
                 }
+                return Ok(StanzaAdmission::Quarantined);
             }
-            false
+            Ok(StanzaAdmission::Discard)
         }
-        // A storage failure is never interpreted as permission.
-        _ => false,
+        Admission::Drop => Ok(StanzaAdmission::Discard),
     }
 }
 
@@ -1498,7 +1687,24 @@ fn event_kind(event: &Event) -> &'static str {
     match event {
         Event::Online { .. } => "Online",
         Event::Disconnected(_) => "Disconnected",
-        Event::Stanza(Stanza::Iq(_)) => "Iq",
+        Event::Stanza(Stanza::Iq(iq)) => {
+            let id = match iq {
+                Iq::Get { id, .. }
+                | Iq::Set { id, .. }
+                | Iq::Result { id, .. }
+                | Iq::Error { id, .. } => id.as_str(),
+            };
+            // Classify our fixed request names without logging peer-controlled
+            // IDs, XML, account addresses or query metadata.
+            match id {
+                "privacy-disco" => "Iq:privacy-disco",
+                "privacy-list" => "Iq:privacy-list",
+                "mam-disco" => "Iq:mam-disco",
+                "mam-prefs" | "mam-prefs-set" => "Iq:mam-prefs",
+                _ if id.starts_with("mam-history-") => "Iq:mam-history",
+                _ => "Iq",
+            }
+        }
         Event::Stanza(Stanza::Message(_)) => "Message",
         Event::Stanza(Stanza::Presence(_)) => "Presence",
     }
@@ -1512,7 +1718,13 @@ fn worker(
     store: Arc<Store>,
     shared: Arc<Shared>,
     commands: std::sync::mpsc::Receiver<Command>,
+    short_lived: bool,
+    helper_deadline: Option<std::time::Instant>,
 ) {
+    let _owner = match crate::session_lock::SessionLock::acquire(store.data_dir(),helper_deadline.map(|until|until.saturating_duration_since(std::time::Instant::now()).min(std::time::Duration::from_millis(150))).unwrap_or(std::time::Duration::from_secs(5))) {
+        Ok(owner)=>owner,
+        Err(_)=>{ shared.push(EngineEvent::Error{code:"connection".into(),message:"Taustavastaanotto on kesken; avaa sovellus hetken kuluttua uudelleen.".into()}); return; }
+    };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -1552,16 +1764,23 @@ fn worker(
         // SQLite and the archive is read back on every login.
         let mut backoff = 5u64;
         loop {
-            let outcome = std::panic::AssertUnwindSafe(connection(
+            let session = std::panic::AssertUnwindSafe(connection(
                 jid.clone(),
                 password.clone(),
                 domain.clone(),
                 Arc::clone(&store),
                 Arc::clone(&shared),
                 &mut async_rx,
+                short_lived,
+                helper_deadline,
             ))
-            .catch_unwind()
-            .await;
+            .catch_unwind();
+            let outcome=if let Some(until)=helper_deadline {
+                tokio::select! {
+                    result=session=>result,
+                    _=tokio::time::sleep_until(tokio::time::Instant::from_std(until+std::time::Duration::from_millis(400)))=>Ok(SessionEnd::Stop),
+                }
+            }else{session.await};
             match outcome {
                 Ok(SessionEnd::Stop) => break,
                 Ok(SessionEnd::LoginFailed) => {
@@ -1663,25 +1882,46 @@ async fn connection(
     store: Arc<Store>,
     shared: Arc<Shared>,
     async_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Command>,
+    short_lived: bool,
+    helper_deadline: Option<std::time::Instant>,
 ) -> SessionEnd {
-    // `Client::new` does the whole connection: SRV resolution, TCP, STARTTLS,
-    // SASL, XEP-0198 and the reconnect.
-    // The isolated loopback check can use a free port without touching the
-    // machine's existing XMPP service. Release builds have no override.
-    #[cfg(debug_assertions)]
-    let mut client = match std::env::var("PUHURI_TEST_XMPP_PORT").ok().and_then(|s| s.parse::<u16>().ok()) {
-        Some(port) => Client::new_starttls(jid.clone(), password.clone(),
-            tokio_xmpp::connect::DnsConfig::no_srv(jid.domain().as_str(),port), Default::default()),
-        None => Client::new(jid.clone(), password.clone()),
+    // Both owners use the same full JID. Resolve it only while the worker's
+    // cross-process SessionLock is held; storage failure must stop the login.
+    let full_jid = match store.session_resource().and_then(|resource| {
+        jid.with_resource_str(&resource).map_err(|_| "Virheellinen XMPP-resurssi".to_string())
+    }) {
+        Ok(jid) => jid,
+        Err(message) => {
+            shared.push(EngineEvent::Error { code: "store".into(), message });
+            return SessionEnd::Stop;
+        }
     };
-    #[cfg(not(debug_assertions))]
-    let mut client = Client::new(jid.clone(), password.clone());
+    let handoff=match store.load_transport_handoff(jid.as_str(),&full_jid.to_string(),now()) {
+        Ok(state)=>state,
+        Err(message)=>{shared.push(EngineEvent::Error {code:"store".into(),message});return SessionEnd::Stop;}
+    };
+    let ingress_store=store.clone();let ingress_shared=shared.clone();let account=jid.to_string();
+    let commit:tokio_xmpp::stanzastream::CheckpointCommit=Arc::new(move |stanza,context| {
+        ingress_store.commit_transport_ingress(&account,now(),stanza,context).map(|_|()).map_err(|message| {
+            ingress_shared.push(EngineEvent::Error {code:"store".into(),message});
+            std::io::Error::other("XMPP-ingressin tallennus epäonnistui")
+        })
+    });
+    let dns=tokio_xmpp::connect::DnsConfig::srv_default_client(jid.domain().as_ref());
+    #[cfg(debug_assertions)]
+    let dns=std::env::var("PUHURI_TEST_XMPP_PORT").ok().and_then(|s|s.parse::<u16>().ok()).map(|port|tokio_xmpp::connect::DnsConfig::no_srv(jid.domain().as_str(),port)).unwrap_or(dns);
+    let mut client=match Client::new_with_connector_and_checkpoint(full_jid.clone(),password.clone(),tokio_xmpp::connect::StartTlsServerConnector::from(dns),Default::default(),commit,handoff) {
+        Ok(client)=>client,
+        Err(_)=>{shared.push(EngineEvent::Error {code:"connection".into(),message:"XMPP-vastaanottajan alustus epäonnistui".into()});return SessionEnd::Stop;}
+    };
     let mut stop = false;
     // Set when the login really went through (Event::Online). It gates both
     // the login deadline and the polite goodbye at the end: without a session
     // there is nobody to say goodbye to.
     let mut online = false;
     let mut blocking = super::blocking::Blocking::new();
+    let mut archive = super::archive::Archive::default();
+    archive.use_inbox();
     // Polling: when an interval is set, the session is closed a moment after
     // the login work (the archive read) is done, and the worker waits before
     // opening the next one. `SessionEnd::Stop` means "the session ended for
@@ -1712,24 +1952,40 @@ async fn connection(
     // journal into noise - but the limitation is not hidden either.
     #[cfg(feature = "omemo")]
     let mut warned_no_stanza_id = false;
-    let mut replayed_request: Option<i64> = None;
     while !stop {
-        if let Some(id) = replayed_request.take() {
-            let _ = store.privacy_finish_request(id);
+        if online {
+            if !short_lived {
+                if let Err(message)=upload_runtime::resume(&mut client,&jid,&shared,&store,&mut uploads,&mut upload_counter,#[cfg(feature="omemo")] &omemo).await {
+                    shared.push(EngineEvent::Error{code:"store".into(),message});end=SessionEnd::Wait(5);break;
+                }
+            }
+            if let Err(message)=store.privacy_requeue_ready(jid.as_str()) {shared.push(EngineEvent::Error {code:"store".into(),message});end=SessionEnd::Wait(5);break;}
         }
-        let ready = if online { store.privacy_ready(&jid.to_string()).unwrap_or_default().into_iter().next() } else { None };
-        let replay = ready.and_then(|(id,xml)| {
-            let parsed = xml.parse::<xmpp_parsers::minidom::Element>().ok().and_then(|e| ParsedMessage::try_from(e).ok());
-            if parsed.is_none() { let _ = store.privacy_finish_request(id); }
-            parsed.map(|m| { replayed_request = Some(id); Event::Stanza(Stanza::Message(m)) })
-        });
+        let pending=if online {match store.pending_stanzas(jid.as_str(),1) {
+            Ok(mut rows)=>rows.pop(),Err(message)=>{shared.push(EngineEvent::Error {code:"store".into(),message});end=SessionEnd::Wait(5);break;}
+        }}else{None};
+        let replay=match pending {Some(row)=>match inbox::parse(&row) {
+            Ok(stanza)=>Some((Event::Stanza(stanza),Some(row))),
+            Err(message)=>{shared.push(EngineEvent::Error {code:"store".into(),message});end=SessionEnd::Wait(5);break;}
+        },None=>None};
+        let mut active_inbox;
             // Whether the select loop needs the one-second tick (see below); a
             // build without OMEMO never does.
+            let upload_pending=if !short_lived {
+                match store.upload_jobs(jid.as_str()) {
+                    Ok(jobs)=>!jobs.is_empty(),
+                    Err(message)=>{shared.push(EngineEvent::Error{code:"store".into(),message});end=SessionEnd::Wait(5);stop=true;continue;},
+                }
+            }else{false};
             #[cfg(feature = "omemo")]
-            let fetch_pending = !omemo_fetches.is_empty() || blocking.needs_tick();
+            let fetch_pending = !omemo_fetches.is_empty() || blocking.needs_tick() || upload_pending;
             #[cfg(not(feature = "omemo"))]
-            let fetch_pending = blocking.needs_tick();
-            let event = if let Some(event) = replay { event } else { tokio::select! {
+            let fetch_pending = blocking.needs_tick() || upload_pending;
+            let event = tokio::select! {
+                _=tokio::time::sleep_until(tokio::time::Instant::from_std(helper_deadline.unwrap_or_else(||std::time::Instant::now()+std::time::Duration::from_secs(86400)))), if helper_deadline.is_some()=>{
+                    end=SessionEnd::Stop;stop=true;continue;
+                }
+
                 // While an OMEMO fetch waits for answers, tick once a second
                 // so its time budget is checked even if nothing arrives at
                 // all (a stalled fetch would otherwise wait for the caller's
@@ -1748,9 +2004,12 @@ async fn connection(
                     }
                     continue;
                 }
-                next = client.next() => {
+                next = async { match replay {Some(event)=>Some(event),None=>client.next().await.map(|event|(event,None))} } => {
                     match next {
-                        Some(event) => {
+                        Some((event,row)) => {
+                            // Network stanzas are wakeups only: the committed DB row owns delivery.
+                            if matches!(&event,Event::Stanza(_)) && row.is_none() {continue;}
+                            active_inbox=row;
                             // A session that goes silent is hard to tell from a
                             // server that says nothing; this switch makes the
                             // client's own events visible.
@@ -1759,7 +2018,7 @@ async fn connection(
                             }
                             event
                         }
-                        None => { stop = true; continue; }
+                        None => { stop = true; end=SessionEnd::Wait(5);continue; }
                     }
                 }
             command = async_rx.recv() => {
@@ -1796,6 +2055,8 @@ async fn connection(
                                     reply,
                                     omemo_fetch_counter,
                                     &mut omemo_fetches,
+                                    &store,
+                                    &jid,
                                 )
                                 .await;
                                 continue;
@@ -1889,7 +2150,7 @@ async fn connection(
                 stop = true;
                 continue;
             }
-        } };
+        };
             let events = vec![event];
 
         let mut disconnect_reason = None;
@@ -1905,8 +2166,16 @@ async fn connection(
         let mut attachment_ids: HashSet<String> = HashSet::new();
         for event in events {
             match event {
-                Event::Online { .. } => {
+                Event::Online { resumed, .. } => {
                     online = true;
+                    *shared.upload_service.lock().unwrap()=None;
+                    // Decide from the server's actual SM outcome, not the
+                    // presence of a locally saved resumption checkpoint.
+                    if let Err(message) = store.reconcile_mam_session(jid.as_str(), resumed).and_then(|_| store.reconcile_iq_cache_session(jid.as_str(), resumed)).and_then(|_|store.reconcile_upload_session(jid.as_str(),resumed)) {
+                        shared.push(EngineEvent::Error { code:"archive".into(), message });
+                        stop = true;
+                        continue;
+                    }
                     if let Err(error) = store.privacy_init(&jid.to_string()) {
                         shared.push(EngineEvent::Error { code:"privacy".into(), message:error });
                         stop = true;
@@ -1959,6 +2228,7 @@ async fn connection(
                     }) {
                         Ok(fresh) => {
                             step("omemo avattu");
+                            if !short_lived {
                             publish_omemo_bundle(&mut client, &jid, &fresh, &shared, true).await;
                             step("avainnippu julkaistu");
                             let request = Iq::from_get(
@@ -1967,6 +2237,7 @@ async fn connection(
                             )
                             .with_to(xmpp_parsers::jid::Jid::from(jid.clone()));
                             let _ = client.send_stanza(request.into()).await;
+                            }
                             omemo = Some(fresh);
                             step("laitelista pyydetty");
                         }
@@ -1975,6 +2246,7 @@ async fn connection(
                             message: error,
                         }),
                     }
+                    if !short_lived {
                     // Find the component that takes files (XEP-0363).
                     // `upload.<domain>` is the usual name, so it serves
                     // until the server's own answer arrives.
@@ -2001,6 +2273,7 @@ async fn connection(
                         let _ = client.send_stanza(enable.into()).await;
                     }
                     step("carbons");
+                    }
                     // XEP-0313: read the newest part of the archive back,
                     // so a fresh session is not an empty one.
                     // (PUHURI_NO_MAM is a test switch.)
@@ -2010,12 +2283,13 @@ async fn connection(
                         // server without MAM is a known fact (and the journal
                         // says what it means for the XEP-0198 window) instead
                         // of a silent empty read.
-                        if store.mam_floor().is_none() {
-                            let _ = store.set_mam_floor(now());
+                        let floor_ready = store.mam_floor_checked().and_then(|floor| {
+                            if floor.is_none() { store.set_mam_floor(now()) } else { Ok(()) }
+                        });
+                        match floor_ready {
+                            Ok(()) => archive.start(&mut client,&jid,&store,&shared,short_lived).await,
+                            Err(message) => shared.push(EngineEvent::Error { code: "archive".into(), message }),
                         }
-                        let request = Iq::from_get("mam-disco", DiscoInfoQuery { node: None })
-                            .with_to(xmpp_parsers::jid::Jid::from(jid.clone()));
-                        let _ = client.send_stanza(request.into()).await;
                     }
                     step("arkistokysely");
                     // L1b: attachments whose file never arrived (a crash, a
@@ -2024,11 +2298,8 @@ async fn connection(
                     // hole.
                     // L2: lähtölaatikko - lähetä uudelleen se, mitä palvelin
                     // ei ole kuitannut (sama stanza, ei uutta salausta).
-                    // The outbox belongs to the encrypted path (a pending row
-                    // is written by `encrypt_outbox`), so a build without the
-                    // OMEMO feature has nothing to flush - and must still
-                    // compile.
-                    #[cfg(feature = "omemo")]
+                    // Both encrypted text and attachment stanzas use this outbox.
+                    if !short_lived {
                     flush_outbox(&mut client, &store, &shared).await;
                     for (pending_id, thread, pending_url) in store.pending_downloads() {
                         if let Ok(from) = BareJid::from_str(&thread) {
@@ -2062,6 +2333,7 @@ async fn connection(
                         }
                         send_push_enable(&mut client, &jid, &settings).await;
                     }
+                    }
                     // Polling: give the login work a moment (the archive
                     // read, what the server delivers straight away) and
                     // then close the session. This moment is the only time
@@ -2080,7 +2352,41 @@ async fn connection(
                     disconnect_reason = Some(error.to_string());
                 }
                 Event::Stanza(Stanza::Message(mut raw)) => {
-                    if !admit_stanza(&raw, &jid, &store, &shared) { continue; }
+                    if let Some(row)=active_inbox.take() {
+                        let handled:Result<(),String>=async {
+                            if !admit_stanza_with_inbox(&raw,&jid,&store,&shared,row.received_at,Some(row.id))? {return Ok(());}
+                            #[cfg(feature="omemo")]
+                            if let Some(event)=raw.clone().extract_valid_payload::<PubSubEvent>() {
+                                if let PubSubEventPayload::Items {node,published,..}=&event.payload {
+                                    if node.0==super::omemo::pep::DEVICE_LIST_NODE {
+                                        let owner=raw.from.as_ref().map(|j|j.to_bare()).unwrap_or_else(||jid.clone());
+                                        let errors=shared.store_errors.load(Ordering::SeqCst);
+                                        handle_omemo_device_list(&mut client,&jid,&owner,published,&omemo,&shared).await;
+                                        if shared.store_errors.load(Ordering::SeqCst)!=errors {return Err("OMEMO-laitelistan tallennus epäonnistui".into());}
+                                    }
+                                }
+                            }
+                            let reply=inbox::message(raw,&row,&jid,&store,&shared,#[cfg(feature="omemo")] omemo.as_ref(),&mut downloads)?;
+                            if let Some(reply)=reply {receipts_to_send.push(reply);}
+                            Ok(())
+                        }.await;
+                        if let Err(message)=handled {shared.push(EngineEvent::Error {code:"store".into(),message});end=SessionEnd::Wait(5);stop=true;}
+                    } else {
+
+                    if let Some(result)=raw.clone().extract_valid_payload::<MamResult>() {
+                        if !archive.accept(&raw,&jid,&result) { continue; }
+                    }
+                    match admit_stanza(&raw, &jid, &store, &shared) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(message) => {
+                            if raw.clone().extract_valid_payload::<MamResult>().is_some() {
+                                archive.committed("", false, &store);
+                            }
+                            shared.push(EngineEvent::Error { code: "store".into(), message });
+                            continue;
+                        }
+                    }
                     let bare = raw.from.as_ref().map(|jid| jid.to_bare());
                     let id = raw.id.as_ref().map(|id| id.0.clone());
                     let (typing, receipt) = chat_state_and_receipt(&mut raw);
@@ -2353,7 +2659,9 @@ async fn connection(
                                     state: crate::engine::message_state_complete(),
                                     attachment: None,
                                 };
-                                if let Err(error) = store.record(&message, &name) {
+                                let server_id=server_stanza_id(&raw,&jid);
+                                if server_id.as_deref().is_some_and(|sid|store.has_stanza_id(&thread,sid)) {continue;}
+                                if let Err(error) = store.record_with_stanza(&message, &name,true,server_id.as_deref()) {
                                     shared.push(EngineEvent::Error {
                                         code: "store".to_string(),
                                         message: error,
@@ -2422,7 +2730,7 @@ async fn connection(
                             .map(|from| from.to_bare() == jid)
                             .unwrap_or(false);
                         #[cfg(feature = "omemo")]
-                        import_forwarded(
+                        let committed=import_forwarded(
                             &result.forwarded,
                             outgoing,
                             &result.id,
@@ -2433,7 +2741,7 @@ async fn connection(
                             &mut downloads,
                         );
                         #[cfg(not(feature = "omemo"))]
-                        import_forwarded(
+                        let committed=import_forwarded(
                             &result.forwarded,
                             outgoing,
                             &result.id,
@@ -2442,6 +2750,7 @@ async fn connection(
                             &jid,
                             &mut downloads,
                         );
+                        archive.committed(&result.id,committed,&store);
                     }
                     // XEP-0384: a PEP event - somebody published to a node
                     // we follow. Our own device list matters most: another
@@ -2468,36 +2777,42 @@ async fn connection(
                             }
                         }
                     }
+                    }
                 }
                 Event::Stanza(Stanza::Iq(iq)) => {
-                    if blocking.iq(&iq, &mut client, &jid, &store, &shared).await {
-                        blocking.tick(&mut client, &jid, &store, &shared).await;
-                        continue;
-                    }
-                    handle_iq(
-                        &iq,
-                        &mut client,
-                        &mut uploads,
-                        &shared,
-                        &store,
-                        &jid,
-                        #[cfg(feature = "omemo")]
-                        &omemo,
-                    )
-                    .await;
-                    #[cfg(feature = "omemo")]
-                    handle_omemo_iq(
-                        &iq,
-                        &mut client,
-                        &jid,
-                        &omemo,
-                        &mut omemo_fetches,
-                        &mut omemo_self,
-                        &shared,
-                    )
-                    .await;
+                    let row=active_inbox.take().expect("IQ is owned by inbox");
+                    let errors=shared.store_errors.load(Ordering::SeqCst);
+                    let handled:Result<(),String>=async {
+                        if short_lived && upload_runtime::defer_slot_reply(&iq,row.id,jid.as_str(),&store)? {return Ok(());}
+                        #[cfg(feature="omemo")]
+                        if let Some(valid)=recover_omemo_cache_iq(&iq,&jid,&store,omemo.as_ref(),&shared)? {
+                            if valid {
+                                handle_omemo_iq(&iq,&mut client,&jid,&omemo,&mut omemo_fetches,&mut omemo_self,&shared).await;
+                                if shared.store_errors.load(Ordering::SeqCst)!=errors {return Err("Avainvastauksen tallennus epäonnistui".into());}
+                                let id=match &iq {Iq::Result{id,..}|Iq::Error{id,..}=>id,_=>unreachable!()};
+                                store.finish_iq_cache_inbox(jid.as_str(),id,row.id)?;
+                            } else {store.finish_pending_disposition(jid.as_str(),row.id)?;}
+                            return Ok(());
+                        }
+                        let (handled,consumed)=archive.iq_inbox(&iq,row.id,&mut client,&jid,&store,&shared).await?;
+                        if !handled {
+                            if blocking.iq(&iq,&mut client,&jid,&store,&shared).await {
+                                blocking.tick(&mut client,&jid,&store,&shared).await;
+                            } else {
+                                handle_iq(&iq,&mut client,&mut uploads,&shared,&store,&jid,#[cfg(feature="omemo")] &omemo).await;
+                                #[cfg(feature="omemo")]
+                                handle_omemo_iq(&iq,&mut client,&jid,&omemo,&mut omemo_fetches,&mut omemo_self,&shared).await;
+                            }
+                        }
+                        if shared.store_errors.load(Ordering::SeqCst)!=errors {return Err("IQ-käsittelyn tallennus epäonnistui".into());}
+                        if !consumed {store.finish_pending_disposition(jid.as_str(),row.id)?;}
+                        Ok(())
+                    }.await;
+                    if let Err(message)=handled {shared.push(EngineEvent::Error {code:"store".into(),message});end=SessionEnd::Wait(5);stop=true;}
                 }
-                _ => {}
+                Event::Stanza(Stanza::Presence(_))=>{
+                    if let Some(row)=active_inbox.take() {if let Err(message)=store.finish_pending_disposition(jid.as_str(),row.id) {shared.push(EngineEvent::Error {code:"store".into(),message});end=SessionEnd::Wait(5);stop=true;}}
+                }
             }
         }
         for (to, id) in receipts_to_send {
@@ -2522,12 +2837,10 @@ async fn connection(
                 shared.push(EngineEvent::Disconnected { reason });
             }
         }
-    // Say goodbye only to a session that really opened, and never wait for an
-    // answer longer than a moment: `send_end` used to hang here for good when
-    // the stream was still reconnecting, which left the worker alive and made
-    // every following login and logout wait for it (docs/DECISIONS.md).
-    if online {
-        let _ = tokio::time::timeout(GOODBYE_TIMEOUT, client.send_end()).await;
+    match tokio::time::timeout(GOODBYE_TIMEOUT,client.detach_quiet()).await {
+        Ok(Ok(Some(state)))=>if let Err(message)=store.save_transport_handoff(jid.as_str(),&full_jid.to_string(),now(),state) {shared.push(EngineEvent::Error {code:"store".into(),message});},
+        Ok(Ok(None))=>{},
+        _=>{end=SessionEnd::Stop;shared.push(EngineEvent::Error {code:"connection".into(),message:"XMPP-luovutus jäi kesken; aiempi pysyvä inbox säilyy".into()});},
     }
     shared.status.lock().unwrap().connected = false;
     end
@@ -2795,68 +3108,11 @@ async fn handle_command(
         Command::SendReceipt { to, id } => {
             send_chat(client, to.into(), None, "", vec![Received { id }.into()]).await;
         }
-        Command::SendFile {
-            to,
-            path,
-            body,
-            content_type,
-            id,
-        } => {
-            let service = shared.upload_service.lock().unwrap().clone();
-            let Some(service) = service else {
-                shared.push(EngineEvent::Error {
-                    code: "upload".to_string(),
-                    message: "palvelin ei tue tiedostolähetystä (XEP-0363)".to_string(),
-                });
-                return;
-            };
-            let Ok(service_jid) = xmpp_parsers::jid::Jid::from_str(&service) else {
-                shared.push(EngineEvent::Error {
-                    code: "upload".to_string(),
-                    message: format!("tiedostopalvelun osoite ei kelpaa: {service}"),
-                });
-                return;
-            };
-            *upload_counter += 1;
-            let iq_id = format!("upload-slot-{upload_counter}");
-            let filename = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("tiedosto")
-                .to_string();
-            // An encrypted file is uploaded as its ciphertext: the same length
-            // plus the 16-byte GCM tag, which is what the slot has to be
-            // asked for.
-            #[cfg(feature = "omemo")]
-            let aesgcm = store
-                .encrypted_threads()
-                .iter()
-                .any(|thread| thread == &to.to_string());
-            #[cfg(not(feature = "omemo"))]
-            let aesgcm = false;
-            let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0)
-                + if aesgcm { 16 } else { 0 };
-            eprintln!(
-                "puhurid: tiedostolähetys {to}: salattu={aesgcm}, slotin koko={size}"
-            );
-            let request = Iq::from_get(
-                &iq_id,
-                SlotRequest {
-                    filename,
-                    size,
-                    content_type: Some(content_type),
-                },
-            )
-            .with_to(service_jid);
-            let _ = client.send_stanza(request.into()).await;
-            uploads.push(PendingUpload {
-                iq_id,
-                to,
-                path,
-                body,
-                id,
-                aesgcm,
-            });
+        Command::SendFile { id, .. } => {
+            let account=shared.status.lock().unwrap().jid.clone().unwrap_or_default();
+            if let Err(message)=upload_runtime::request(client,&account,&id,shared,store,uploads,upload_counter).await {
+                shared.push(EngineEvent::Error{code:"store".into(),message});
+            }
         }
         Command::PrivacyChanged => {}
         Command::Disconnect => {}
@@ -2876,34 +3132,6 @@ async fn handle_command(
 
 /// The IQ responses that matter to us: the file upload service (XEP-0363) and
 /// the slot it hands out when a file is on its way.
-/// XEP-0313, from where we left off (L1b).
-///
-/// `after` is the archive id of the newest message we have committed
-/// (`Store::last_stanza_id`), so a session that missed something reads exactly
-/// the gap. Paging onward uses the same call with the `<fin>`'s `last`. A
-/// fresh L1b install has no id yet and reads the newest page; the import then
-/// drops anything older than the cut-off (`Store::mam_floor`), because those
-/// rows were stored without a stanza id and re-reading them could only produce
-/// placeholders.
-async fn send_mam_query(client: &mut Client, store: &Arc<Store>, after: Option<String>) {
-    let after = after.or_else(|| store.mam_last_id());
-    let query = MamQuery {
-        queryid: None,
-        node: None,
-        form: None,
-        set: Some(SetQuery {
-            max: Some(50),
-            after,
-            before: None,
-            index: None,
-        }),
-        flip_page: false,
-    };
-    let _ = client
-        .send_stanza(Iq::from_set("mam-history", query).into())
-        .await;
-}
-
 async fn handle_iq(
     iq: &Iq,
     client: &mut Client,
@@ -2913,26 +3141,28 @@ async fn handle_iq(
     own: &BareJid,
     #[cfg(feature = "omemo")] omemo: &Option<Omemo>,
 ) {
+    if let Iq::Result{id,from,..}|Iq::Error{id,from,..}=iq {
+        if id.starts_with("push-") && from.as_ref().is_some_and(|j| j.is_full() || (j.to_bare()!=*own && j.to_string()!=own.domain().to_string())) {return;}
+    }
+    if let Iq::Result{id,from,..}|Iq::Error{id,from,..}=iq {
+        if let Some(service)=id.strip_prefix("upload-info-") {
+            if from.as_ref().map(|j|j.to_string()).as_deref()!=Some(service) {return;}
+        }
+        if id=="upload-disco" && from.as_ref().map(|j|j.to_string()).as_deref()!=Some(own.domain().as_str()) {return;}
+        if id.starts_with("upload-slot-") {
+            let job=match store.upload_jobs(own.as_str()) {Ok(jobs)=>jobs.into_iter().find(|j|j.iq_id.as_deref()==Some(id)),Err(message)=>{shared.push(EngineEvent::Error{code:"store".into(),message});return;}};
+            let Some(job)=job else{return;};
+            if from.as_ref().map(|j|Some(j.to_string())!=job.service).unwrap_or(true) {return;}
+            if !uploads.iter().any(|u|u.iq_id==*id) {
+                match upload_runtime::pending(&job) {Ok(upload)=>uploads.push(upload),Err(message)=>{shared.push(EngineEvent::Error{code:"store".into(),message});return;}}
+            }
+        }
+    }
     let (id, payload) = match iq {
         Iq::Result { id, payload, .. } => (id.clone(), payload.clone()),
         Iq::Error { id, .. } => {
-            if id == "mam-history" {
-                // **Found on the phone 2026-10-11**: the stanza id our own
-                // server stamps on a *delivered* message is not a valid archive
-                // id on `example.org` - a query with it as `<after>` answers
-                // `item-not-found`. Read the newest page instead and let the
-                // stanza-id dedup drop what we already have; the journal says
-                // so, and the archive id from the results takes over as the
-                // anchor for later reads.
-                eprintln!(
-                    "puhurid: MAM-haku ei kelvannut arkistotunnuksella; luetaan uusin sivu \
-                     (docs/DECISIONS.md, L1b)"
-                );
-                let _ = store.clear_mam_last_id();
-                send_mam_query(client, store, None).await;
-                return;
-            }
             if id == "push-enable" || id == "push-disable" {
+                let _=store.set_setting("push.confirmed","false");
                 // The server refused the push setting: the service JID is
                 // unknown, not allowed, or the node is wrong. Say so instead
                 // of leaving the user thinking notifications are on.
@@ -2943,6 +3173,11 @@ async fn handle_iq(
                 return;
             }
             if id.starts_with("upload-slot-") {
+                if let Ok(jobs)=store.upload_jobs(own.as_str()) {
+                    if let Some(job)=jobs.iter().find(|j|j.iq_id.as_deref()==Some(id)) {
+                        if let Err(message)=store.fail_upload(job) {shared.push(EngineEvent::Error{code:"store".into(),message});return;}
+                    }
+                }
                 uploads.retain(|upload| &upload.iq_id != id);
                 shared.push(EngineEvent::Error {
                     code: "upload".to_string(),
@@ -2953,10 +3188,16 @@ async fn handle_iq(
         }
         _ => return,
     };
+    if id == "push-enable" && store.push_settings().is_some() {
+        let _=store.set_setting("push.confirmed","true");
+        shared.push(EngineEvent::StateChanged);
+    }
     let Some(payload) = payload else {
+        if id.starts_with("upload-slot-") {
+            if let Some(upload)=uploads.iter().find(|u|u.iq_id==id) {upload_runtime::retry_slot(own.as_str(),&upload.id,store,shared);}
+        }
         return;
     };
-
     if id == "roster" {
         // The contact list: the names the conversations are shown under.
         if let Ok(roster) = Roster::try_from(payload) {
@@ -2967,31 +3208,6 @@ async fn handle_iq(
             for item in roster.items {
                 let name = nick_or_jid(item.name.as_deref(), &item.jid.to_string());
                 names.insert(item.jid.to_string(), name);
-            }
-        }
-    } else if id == "mam-disco" {
-        // L1b: only a server that archives gets asked for the archive.
-        if let Ok(info) = DiscoInfoResult::try_from(payload) {
-            if info.features.contains(ns::MAM) {
-                send_mam_query(client, store, None).await;
-            } else {
-                eprintln!(
-                    "puhurid: palvelin ei tue MAM:ia (urn:xmpp:mam:2) - arkistoa ei \
-                     lueta, joten kaatumisen jäännösikkuna ei sulkeudu (docs/DECISIONS.md, L1b)"
-                );
-            }
-        }
-    } else if id == "mam-history" {
-        if let Ok(fin) = MamFin::try_from(payload) {
-            eprintln!(
-                "puhurid: arkisto luettu ({} viestiä tässä satsissa)",
-                fin.set.count.unwrap_or(0)
-            );
-            // XEP-0059: keep reading while the server says there is more.
-            if !fin.complete {
-                if let Some(last) = fin.set.last.clone() {
-                    send_mam_query(client, store, Some(last)).await;
-                }
             }
         }
     } else if id == "upload-disco" {
@@ -3020,8 +3236,23 @@ async fn handle_iq(
         };
         let upload = uploads.remove(index);
         if store.privacy_admission(&own.to_string(),&upload.to.to_string()) != Ok(crate::store::Admission::Allow) { return; }
+        #[cfg(not(feature="omemo"))]
+        if upload.aesgcm {
+            match store.upload_jobs(own.as_str()) {
+                Ok(jobs)=>if let Some(job)=jobs.iter().find(|j|j.id==upload.id) {
+                    if let Err(message)=store.fail_upload(job) {shared.push(EngineEvent::Error{code:"store".into(),message});return;}
+                },
+                Err(message)=>{shared.push(EngineEvent::Error{code:"store".into(),message});return;},
+            }
+            shared.push(EngineEvent::Error{code:"upload".into(),message:"Salattua liitettä ei lähetetä ilman OMEMO-tukea.".into()});return;
+        }
         match SlotResult::try_from(payload) {
             Ok(slot) => {
+                match store.begin_upload_attempt(own.as_str(),&upload.id) {
+                    Ok(true)=>{},
+                    Ok(false)=>{shared.push(EngineEvent::Error{code:"upload".into(),message:"Tiedostolähetyksen uusintaraja täyttyi; viesti säilyy epäonnistuneena.".into()});return;},
+                    Err(message)=>{shared.push(EngineEvent::Error{code:"store".into(),message});return;},
+                }
                 // An encrypted conversation sends the file **encrypted**
                 // (XEP-0454) - and this has to happen *before* anything is
                 // uploaded: the server has to get the ciphertext, never the
@@ -3030,13 +3261,10 @@ async fn handle_iq(
                 // chat claims is protected.
                 #[cfg(feature = "omemo")]
                 if upload.aesgcm {
-                    if let Err(error) =
+                    if let Err(_error) =
                         send_encrypted_file(client, own, store, shared, &slot, &upload, omemo).await
                     {
-                        shared.push(EngineEvent::Error {
-                            code: "omemo".to_string(),
-                            message: error,
-                        });
+                        upload_runtime::retry_slot(own.as_str(),&upload.id,store,shared);
                     }
                     return;
                 }
@@ -3060,25 +3288,17 @@ async fn handle_iq(
                         // message like any other and was the one kind that
                         // never asked (docs/TODO.md, plan item 5a). The id is
                         // the row's own, so the answer finds the row.
-                        send_chat(
-                            client,
-                            upload.to.clone().into(),
-                            Some(&upload.id),
-                            &body,
-                            file_message_payloads(&slot.get.url),
-                        )
-                        .await;
+                        if store.privacy_admission(own.as_str(),upload.to.as_str())!=Ok(crate::store::Admission::Allow) {return;}
+                        let xml=stanza_xml(&chat_stanza(upload.to.clone().into(),Some(&upload.id),&body,file_message_payloads(&slot.get.url)));
+                        match store.finish_upload_stanza(own.as_str(),&upload.id,&xml) {
+                            Ok(())=>send_stored_stanza(client,store,shared,&upload.id,&xml).await,
+                            Err(message)=>shared.push(EngineEvent::Error{code:"store".into(),message}),
+                        }
                     }
-                    Err(error) => shared.push(EngineEvent::Error {
-                        code: "upload".to_string(),
-                        message: error,
-                    }),
+                    Err(_) => upload_runtime::retry_slot(own.as_str(),&upload.id,store,shared),
                 }
             }
-            Err(error) => shared.push(EngineEvent::Error {
-                code: "upload".to_string(),
-                message: format!("palvelimen vastausta ei ymmärretty: {error}"),
-            }),
+            Err(_) => upload_runtime::retry_slot(own.as_str(),&upload.id,store,shared),
         }
     }
 }
@@ -3265,13 +3485,23 @@ async fn start_omemo_fetch(
     reply: std::sync::mpsc::Sender<Result<Vec<PeerDevice>, String>>,
     counter: u64,
     fetches: &mut Vec<PendingOmemoFetch>,
+    store: &Arc<Store>,
+    own: &BareJid,
 ) {
-    let id = format!("omemo-fetch-{counter}");
+    let mut nonce=[0u8;16];
+    if getrandom::fill(&mut nonce).is_err() {let _=reply.send(Err("IQ-tunnisteen luonti epäonnistui".into()));return;}
+    let id = format!("omemo-fetch-{}-{counter}",hex(&nonce));
+    if let Err(error)=store.register_iq_cache_query(&crate::store::IqCacheQuery {
+        account:own.to_string(),id:id.clone(),peer:peer.to_string(),node:super::omemo::pep::DEVICE_LIST_NODE.into(),
+    }) {let _=reply.send(Err(error));return;}
+
     // The id ties the request to its answers: without it a stalled chain
     // looks like "the server said nothing", which is what it did - but the
     // question is whether the request ever left.
     eprintln!("puhurid: OMEMO-haku lähtee (id {id})");
     fetches.push(PendingOmemoFetch {
+        store: store.clone(),
+        account: own.to_string(),
         id: id.clone(),
         jid: peer.clone(),
         reply,
@@ -3405,6 +3635,15 @@ async fn pump_omemo_bundles(
         }) else {
             return;
         };
+        if let Err(error)=fetches[index].store.register_iq_cache_query(&crate::store::IqCacheQuery {
+            account:fetches[index].account.clone(),id:request_id.clone(),peer:peer.to_string(),node:super::omemo::pep::bundle_node(device),
+        }) {
+            let fetch=&mut fetches[index];
+            fetch.in_flight.retain(|(id,_)|*id!=device);
+            fetch.queue.push_front(device);
+            let _=fetch.reply.send(Err(error));
+            return;
+        }
         request_omemo_node(
             client,
             &request_id,
@@ -3473,6 +3712,7 @@ fn omemo_peer_device(
     device_id: u32,
     omemo: &Omemo,
     name: &str,
+    shared: &Arc<Shared>,
 ) -> Option<PeerDevice> {
     let element = pubsub_item_payload(items, None)?;
     let element = omemo_xml::Bundle::try_from(element).ok()?;
@@ -3480,7 +3720,8 @@ fn omemo_peer_device(
     // Keep it: a session is built from this bundle, and a send must not have
     // to go back to the server for it.
     if let Err(error) = omemo.remember_bundle(name, &bundle) {
-        eprintln!("puhurid: OMEMO-bundlen tallennus epäonnistui: {error}");
+        shared.push(EngineEvent::Error {code:"store".into(),message:error});
+        return None;
     }
     Some(PeerDevice {
         device_id,
@@ -3569,7 +3810,7 @@ async fn handle_omemo_iq(
                 let Some(mut state) = self_fetch.take() else {
                     return;
                 };
-                if omemo_peer_device(&items, device, omemo, &own.to_string()).is_some() {
+                if omemo_peer_device(&items, device, omemo, &own.to_string(), shared).is_some() {
                     state.with_bundle.push(device);
                 }
                 state.pending = state.pending.saturating_sub(1);
@@ -3590,7 +3831,7 @@ async fn handle_omemo_iq(
                     .position(|fetch| fetch.id == fetch_id)
                     .unwrap();
                 let peer = fetches[index].jid.to_string();
-                if let Some(device) = omemo_peer_device(&items, device, omemo, &peer) {
+                if let Some(device) = omemo_peer_device(&items, device, omemo, &peer, shared) {
                     fetches[index].collected.push(device);
                 }
                 fetches[index].in_flight.retain(|(waiting, _)| *waiting != device);
@@ -3613,7 +3854,7 @@ async fn handle_omemo_iq(
             let peer = fetches[index].jid.clone();
             if let Err(error) = omemo.remember_devices(&peer.to_string(), &devices) {
                 shared.push(EngineEvent::Error {
-                    code: "omemo".to_string(),
+                    code: "store".to_string(),
                     message: error,
                 });
             }
@@ -3739,7 +3980,7 @@ async fn handle_omemo_device_list(
         let devices = super::omemo::pep::devices_from(&list);
         if let Err(error) = omemo.remember_devices(&owner.to_string(), &devices) {
             shared.push(EngineEvent::Error {
-                code: "omemo".to_string(),
+                code: "store".to_string(),
                 message: error,
             });
         }
@@ -3754,8 +3995,7 @@ async fn handle_omemo_device_list(
     }
 }
 
-/// A key as the user could compare it (O6): lowercase hex.
-#[cfg(feature = "omemo")]
+/// Lowercase hex for fingerprints and random IQ identifiers.
 fn hex(bytes: &[u8]) -> String {
     let mut text = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -3891,7 +4131,6 @@ async fn encrypt_and_send<C: ChatSink>(
 /// When the server confirms it (XEP-0198 `Acked`), the row is done; when the
 /// connection dies first, the row stays `pending` and the next session sends
 /// the same bytes again. The stanza is never built or encrypted here.
-#[cfg(feature = "omemo")]
 async fn send_stored_stanza<C: ChatSink>(
     client: &mut C,
     store: &Arc<Store>,
@@ -3946,7 +4185,6 @@ async fn send_stored_stanza<C: ChatSink>(
 /// Try the outbox at the start of a session (L2): everything the server never
 /// acked goes out again, byte for byte. A row that has been tried too often or
 /// is too old is marked `failed` - and the user is told, not left guessing.
-#[cfg(feature = "omemo")]
 async fn flush_outbox<C: ChatSink>(
     client: &mut C,
     store: &Arc<Store>,
@@ -3955,6 +4193,11 @@ async fn flush_outbox<C: ChatSink>(
     for (id, thread, stanza, ts, attempts) in store.outbox_pending() {
         let account = shared.status.lock().unwrap().jid.clone().unwrap_or_default();
         if store.privacy_admission(&account,&thread) != Ok(crate::store::Admission::Allow) { continue; }
+        match store.outbox_owner(&id) {
+            Ok(Some(owner)) if owner!=account=>continue,
+            Err(message)=>{shared.push(EngineEvent::Error{code:"store".into(),message});continue;},
+            _=>{},
+        }
         if attempts >= OUTBOX_MAX_ATTEMPTS || now() - ts > OUTBOX_MAX_AGE_SECONDS {
             let _ = store.mark_outbox_failed(&id);
             shared.push(EngineEvent::Error {
@@ -3993,8 +4236,8 @@ async fn send_encrypted_file(
         .map_err(|error| format!("tiedoston luku epäonnistui: {error}"))?;
     let mut iv = [0u8; super::omemo::crypto::MEDIA_IV_LENGTH];
     let mut key = [0u8; super::omemo::crypto::MEDIA_KEY_LENGTH];
-    let _ = getrandom::fill(&mut iv);
-    let _ = getrandom::fill(&mut key);
+    getrandom::fill(&mut iv).map_err(|_|"Liitteen satunnais-IV:n luonti epäonnistui")?;
+    getrandom::fill(&mut key).map_err(|_|"Liitteen satunnaisavaimen luonti epäonnistui")?;
     let sealed = super::omemo::crypto::aes256_gcm_encrypt(&key, &iv, &plaintext)?;
 
     // The ciphertext is what the server gets. It goes to a 0700 directory next
@@ -4015,9 +4258,8 @@ async fn send_encrypted_file(
     let _ = std::fs::remove_file(&temporary);
     if let Err(error) = uploaded {
         eprintln!(
-            "puhurid: salatun tiedoston lataus epäonnistui ({} tavua, slot {}): {error}",
-            sealed.len(),
-            slot.put.url
+            "puhurid: salatun tiedoston lataus epäonnistui ({} tavua)",
+            sealed.len()
         );
         return Err(error);
     }
@@ -4032,14 +4274,12 @@ async fn send_encrypted_file(
     // out-of-band `<x>`, which §5 explicitly says is not needed here - makes
     // a client show the message as text instead of a file, which is exactly
     // what happened in the first live test with Maija.
-    // **Not the outbox (yet).** The row was written by the engine before the
-    // upload, with the attachment; running the text path's outbox here would
-    // store the row again as a plain message and lose that. It is in
-    // docs/TODO.md: the file path needs its own transaction *after* the upload.
-    encrypt_and_send_direct(client, own, &upload.to, &address, &upload.id, omemo).await
+    // Commit envelope and ratchet without replacing attachment columns.
+    // A retry sends these stored bytes, without another ratchet step.
+    encrypt_and_send_direct(client, own, &upload.to, &address, &upload.id, omemo, store, shared).await
 }
 
-/// Encrypt and send without the outbox - the file path (see above).
+/// Commit uploaded media envelope and ratchet to the attachment outbox.
 ///
 /// `id` is the message row. It goes on the stanza (the same as in the text
 /// path) for two reasons: the XEP-0184 receipt the peer answers with finds
@@ -4053,6 +4293,8 @@ async fn encrypt_and_send_direct<C: ChatSink>(
     text: &str,
     id: &str,
     omemo: &Option<Omemo>,
+    store: &Arc<Store>,
+    shared: &Arc<Shared>,
 ) -> Result<(), String> {
     let omemo = omemo
         .as_ref()
@@ -4085,22 +4327,15 @@ async fn encrypt_and_send_direct<C: ChatSink>(
             "OMEMO: laitteita ei tunneta ({to}), joten viestiä ei voi salata"
         ));
     }
-    let element = omemo.encrypt_message(&recipients, text.as_bytes())?;
-    let payload = super::omemo::pep::encrypted_element(&element);
-    let fallback = "I sent you an OMEMO encrypted message but your client doesn't seem to support that.";
-    send_chat(
-        client,
-        to.clone().into(),
-        Some(id),
-        fallback,
-        vec![payload, Request.into()],
-    )
-    .await;
-    eprintln!(
-        "puhurid: OMEMO-viesti salattu {} laitteelle (sid {})",
-        recipients.len(),
-        element.header.sid
-    );
+    if store.privacy_admission(own.as_str(),to.as_str())?!=crate::store::Admission::Allow {return Err("Tiedostolähetyksen lupa ei ole voimassa".into());}
+    let xml=omemo.encrypt_outbox(&recipients,text.as_bytes(),|connection,element| {
+        let payload=super::omemo::pep::encrypted_element(element);
+        let fallback="I sent you an OMEMO encrypted message but your client doesn't seem to support that.";
+        let xml=stanza_xml(&chat_stanza(to.clone().into(),Some(id),fallback,vec![payload,Request.into()]));
+        Store::finish_upload_stanza_in(connection,own.as_str(),id,&xml)?;
+        Ok(xml)
+    })?;
+    send_stored_stanza(client,store,shared,id,&xml).await;
     Ok(())
 }
 
@@ -4292,7 +4527,7 @@ async fn put_file(
             }
         },
     );
-    let mut request = reqwest::Client::new()
+    let mut request = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().map_err(|_|"Tiedostolatauksen HTTP-asiakasta ei voitu luoda")?
         .put(slot.put.url.as_str())
         .header(reqwest::header::CONTENT_LENGTH, total)
         .body(reqwest::Body::wrap_stream(stream));
@@ -4302,7 +4537,7 @@ async fn put_file(
     let response = request
         .send()
         .await
-        .map_err(|error| format!("tiedoston lataus palvelimelle epäonnistui: {error}"))?;
+        .map_err(|_| "tiedoston lataus palvelimelle epäonnistui".to_string())?;
     if !response.status().is_success() {
         return Err(format!(
             "palvelin vastasi tiedostoon {}",
@@ -4641,9 +4876,8 @@ async fn download_attachment(
 /// Store a message that came out of the archive (XEP-0313) or out of another
 /// device's copy (XEP-0280).
 ///
-/// Such a message is normally one we already know about, so it is only kept
-/// when its conversation and its moment are new, and it never raises a
-/// notification - it is history, not news.
+/// Archive entries can share timestamps. Only stable message identities may
+/// suppress a replay; the timestamp orders messages and is never a dedup key.
 /// What a forwarded stanza (carbon or archive result) tells us before anything
 /// is decrypted or saved: where it belongs, when it happened, and the two
 /// identifiers. `None` means "already handled, nothing to do".
@@ -4657,8 +4891,7 @@ struct ForwardedContext {
 }
 
 /// The checks both builds share (L1b): the timestamp rule, the cut-off for
-/// archived rows, the same-second check and the **server's** stanza id as the
-/// one dedup key.
+/// archived rows and the server's stanza/archive identity for replay checks.
 fn forwarded_context(
     forwarded: &Forwarded,
     outgoing: bool,
@@ -4712,13 +4945,12 @@ fn forwarded_context(
             }
         }
     }
-    // The same second: the message is already stored (our own sent message and
-    // the carbon of it, for instance). A cheap check before decrypting.
-    if store.has_message_at(&thread, ts) {
-        return None;
-    }
-    // The id our own server stamped on the stanza is the only dedup key.
-    let server_id = server_stanza_id(&forwarded.message, own);
+    // Multiple offline messages can have the same timestamp. Do not discard
+    // them before decryption merely because another row shares that second.
+    // The MAM result id is also a trusted archive identity when the inner
+    // stanza does not carry our server's XEP-0359 stamp. Carbons lack that id.
+    let server_id = server_stanza_id(&forwarded.message, own)
+        .or_else(|| (id_hint != "carbon").then(|| id_hint.to_string()));
     if let Some(id) = &server_id {
         if store.has_stanza_id(&thread, id) {
             return None;
@@ -4752,14 +4984,14 @@ fn store_forwarded_plain(
     store: &Arc<Store>,
     shared: &Arc<Shared>,
     downloads: &mut Vec<(BareJid, String, String, Option<String>)>,
-) {
+) -> bool {
     // An attachment (XEP-0363 or the XEP-0454 encrypted address) goes to the
     // same queue as a live one - and its row is already stored, in state
     // `downloading`, from the receive transaction. Our own sent files are not
     // downloaded again.
     if !outgoing {
         if let Some(oob) = inner.extract_valid_payload::<Oob>() {
-            queue_download(
+            return queue_download(
                 &context.sender,
                 oob.url,
                 context,
@@ -4767,15 +4999,13 @@ fn store_forwarded_plain(
                 shared,
                 downloads,
             );
-            return;
         }
         let body = inner
             .get_best_body_cloned(vec![])
             .map(|(_, body)| body)
             .unwrap_or_default();
         if let Some(url) = address_in_body(&body) {
-            queue_download(&context.sender, url, context, store, shared, downloads);
-            return;
+            return queue_download(&context.sender, url, context, store, shared, downloads);
         }
     }
     let text = inner
@@ -4785,7 +5015,7 @@ fn store_forwarded_plain(
     if text.trim().is_empty() {
         // Receipts and chat states are handled as they arrive, not from the
         // archive.
-        return;
+        return true;
     }
     let message = Message {
         id: format!(
@@ -4807,15 +5037,17 @@ fn store_forwarded_plain(
         attachment: None,
     };
     if let Err(error) =
-        store.record_with_stanza(&message, &context.name, false, context.server_id.as_deref())
+        store.record_with_stanza(&message, &context.name, !outgoing, context.server_id.as_deref())
     {
         shared.push(EngineEvent::Error {
             code: "store".to_string(),
             message: error,
         });
-        return;
+        return false;
     }
+    if !outgoing { shared.push(EngineEvent::MessageReceived(message)); }
     shared.push(EngineEvent::StateChanged);
+    true
 }
 
 /// Queue a file that arrived **live** (a plaintext attachment, or a bare
@@ -4885,33 +5117,41 @@ fn queue_download(
     store: &Arc<Store>,
     shared: &Arc<Shared>,
     downloads: &mut Vec<(BareJid, String, String, Option<String>)>,
-) {
+) -> bool {
     let id = format!(
         "arc-{}-{}-att",
         context.ts,
-        context.message_id.clone().unwrap_or_default()
+        context
+            .message_id
+            .clone()
+            .or_else(|| context.server_id.clone())
+            .unwrap_or_default()
     );
-    if !store.has_message_at(&context.thread, context.ts) {
-        let message = Message {
-            id: id.clone(),
-            thread: context.thread.clone(),
-            outgoing: false,
-            sender: context.name.clone(),
-            text: String::new(),
-            ts: context.ts,
-            delivered: false,
-            state: crate::engine::message_state_complete(),
-            attachment: None,
-        };
-        if let Err(error) = store.record_downloading(&message, &context.name, &url, false) {
-            shared.push(EngineEvent::Error {
-                code: "store".to_string(),
-                message: error,
-            });
-            return;
-        }
+    // A text message at this timestamp must not suppress the attachment's
+    // durable placeholder. An existing row for this exact attachment is enough.
+    if store.has_message_row(&context.thread, &id) {
+        return true;
+    }
+    let message = Message {
+        id: id.clone(),
+        thread: context.thread.clone(),
+        outgoing: false,
+        sender: context.name.clone(),
+        text: String::new(),
+        ts: context.ts,
+        delivered: false,
+        state: crate::engine::message_state_complete(),
+        attachment: None,
+    };
+    if let Err(error) = store.record_downloading(&message, &context.name, &url, true) {
+        shared.push(EngineEvent::Error {
+            code: "store".to_string(),
+            message: error,
+        });
+        return false;
     }
     downloads.push((sender.clone(), url, String::new(), Some(id)));
+    true
 }
 
 /// **One decrypt path (L1b).** A carbon and a MAM result go through exactly the
@@ -4932,19 +5172,14 @@ fn import_forwarded(
     omemo: Option<&Omemo>,
     own: &BareJid,
     downloads: &mut Vec<(BareJid, String, String, Option<String>)>,
-) {
+) -> bool {
     let Some(context) = forwarded_context(forwarded, outgoing, id_hint, store, shared, own) else {
-        return;
+        return true;
     };
-    // A MAM result carries the **archive id** we can anchor the next read on
-    // (`<result id=...>`); a carbon has no archive id at all.
-    if id_hint != "carbon" {
-        let _ = store.set_mam_last_id(id_hint);
-    }
     let mut inner = forwarded.message.clone();
     if let Some(element) = inner.extract_valid_payload::<omemo_xml::Encrypted>() {
         let Some(omemo) = omemo else {
-            return;
+            return false;
         };
         match receive_omemo(
             omemo,
@@ -4956,7 +5191,7 @@ fn import_forwarded(
             context.message_id.as_deref(),
             &element,
             downloads,
-            false,
+            !outgoing,
             context.ts,
         ) {
             Ok(OmemoOutcome::Stored(message)) => {
@@ -4975,11 +5210,12 @@ fn import_forwarded(
                     code: "store".to_string(),
                     message: error,
                 });
+                return false;
             }
             Err(error) => {
                 // Unreadable: a visible placeholder in our own words - never
                 // the sender's English fallback line.
-                record_unreadable(
+                return record_unreadable(
                     store,
                     shared,
                     &context.thread,
@@ -4988,7 +5224,7 @@ fn import_forwarded(
                 );
             }
         }
-        return;
+        return true;
     }
     store_forwarded_plain(
         &mut inner,
@@ -4998,7 +5234,7 @@ fn import_forwarded(
         store,
         shared,
         downloads,
-    );
+    )
 }
 
 /// The plain build cannot read an envelope at all, so a forwarded message is
@@ -5013,9 +5249,9 @@ fn import_forwarded(
     shared: &Arc<Shared>,
     own: &BareJid,
     downloads: &mut Vec<(BareJid, String, String, Option<String>)>,
-) {
+) -> bool {
     let Some(context) = forwarded_context(forwarded, outgoing, id_hint, store, shared, own) else {
-        return;
+        return true;
     };
     let mut inner = forwarded.message.clone();
     store_forwarded_plain(
@@ -5026,7 +5262,7 @@ fn import_forwarded(
         store,
         shared,
         downloads,
-    );
+    )
 }
 
 /// The two pieces a raw message stanza carries that the high-level API does
@@ -5114,7 +5350,7 @@ fn record_unreadable(
     thread: &str,
     id: Option<&String>,
     note: String,
-) {
+) -> bool {
     let ts = now();
     let name = shared
         .roster
@@ -5139,8 +5375,10 @@ fn record_unreadable(
             code: "store".to_string(),
             message: error,
         });
+        return false;
     }
     shared.push(EngineEvent::MessageReceived(message));
+    true
 }
 
 #[cfg(test)]

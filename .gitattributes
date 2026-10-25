@@ -1,3 +1,30 @@
 # Preserve original upstream license documents and extracted tool files.
 vendor/runtime-licenses/* -whitespace
 build/release-binutils/** -whitespace
+
+# Unified patches contain mandatory space-prefixed empty context lines.
+# Exact source content is checked by check-tokio-xmpp-vendor.py.
+vendor/tokio-xmpp-6.0.0/patches/*.patch -whitespace
+vendor/xmpp-parsers-0.23.0/patches/*.patch -whitespace
+
+# Preserve the full upstream licence and native test-output formatting.
+vendor/xmpp-parsers-0.23.0/LICENSE -whitespace
+docs/artifacts/sm-resume-20261024/*.log whitespace=-blank-at-eof
+docs/artifacts/atomic-inbox-20261024/*.log whitespace=-blank-at-eof
+docs/artifacts/inbox-consent-20261024/*.log whitespace=-blank-at-eof
+docs/artifacts/mam-correlation-20261024/*.log whitespace=-blank-at-eof
+docs/artifacts/login-stall-20261024/*.log whitespace=-blank-at-eof,-blank-at-eol
+docs/artifacts/mam-cursor-20261025/*.log whitespace=-blank-at-eof
+docs/artifacts/mam-fin-20261025/*.log whitespace=-blank-at-eof
+docs/artifacts/inbox-runtime-20261025/*.log whitespace=-blank-at-eof
+docs/artifacts/push-budget-20261025/*.log whitespace=-blank-at-eof
+docs/artifacts/mam-session-20261025/*.log whitespace=-blank-at-eof
+docs/artifacts/iq-cache-20261025/*.log whitespace=-blank-at-eof
+docs/artifacts/upload-recovery-20261025/*.log whitespace=-blank-at-eof
+docs/artifacts/phone-install-1.1.2-20261025/*.log whitespace=-blank-at-eof,-blank-at-eol
+build/click-host-tool/** -whitespace
+docs/artifacts/closed-notifications-1.1.2-20261025/*.log whitespace=-blank-at-eof,-blank-at-eol
+docs/artifacts/livewire-comparison-20261025/*.log whitespace=-blank-at-eof,-blank-at-eol
+# Keep verified Git blob snapshots and archived, redacted HTML formatting.
+docs/artifacts/livewire-comparison-20261025/upstream/** -whitespace
+docs/artifacts/livewire-comparison-20261025/blocked-downloads/** -whitespace

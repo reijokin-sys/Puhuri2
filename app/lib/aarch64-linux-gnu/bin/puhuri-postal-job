@@ -1,0 +1,23 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""Submit a content-free follow-up through the app's existing Postal channel."""
+import json
+import sys
+import dbus
+
+APP_ID = "fi.reijo.puhuri2"
+
+def post(bus, kind, round_number):
+    if kind not in ("continue", "notify") or not 0 <= round_number <= 3:
+        raise ValueError("invalid internal push job")
+    payload = {"sent-by": APP_ID,
+               "message": {"type": "puhuri." + kind, "round": round_number}}
+    bus.call_blocking("com.lomiri.Postal", "/com/lomiri/Postal/fi_2ereijo_2epuhuri2",
+                      "com.lomiri.Postal", "Post", "ss",
+                      (APP_ID + "_puhuri", json.dumps(payload)), timeout=0.25)
+
+if __name__ == "__main__":
+    try:
+        post(dbus.SessionBus(), sys.argv[1], int(sys.argv[2]))
+    except Exception:
+        sys.exit(1)

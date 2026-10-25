@@ -1,5 +1,52 @@
 # Third-party notices
 
+## Local XMPP transport/parser patches (2026-10-24, unreleased)
+
+`tokio-xmpp` 6.0.0 is now pinned with a Cargo path patch to
+`vendor/tokio-xmpp-6.0.0/`, rather than built from the unmodified registry
+package. Its Cargo.toml declares MPL-2.0; original copyright and MPL notices
+are retained, and local modifications are explicitly dated and remain under
+MPL-2.0. `VENDOR.md`, the original registry archive, its pinned SHA-256 and
+`patches/0001-durable-ingress.patch` record the exact source and changes.
+`tools/check-tokio-xmpp-vendor.py` reproduces and checks the complete tree.
+
+The optional synchronous ingress barrier prevents SM socket writes until a
+successful durable commit. A failed commit drops the transport without a
+footer/reconnect; the client reports EOF and cleanup tolerates that state.
+The contextual callback now exposes actual SM state, pre-negotiation status
+and final parser discards; a non-consuming outbound snapshot preserves send
+queue order. Store integration tests verify incoming data/checkpoint commit
+before acknowledgment. The runtime now supplies the callback and consumes
+only durable inbox rows.
+The same local patch now also provides owned quiet-detach snapshots with
+unacked/unsent outbound work, server metadata and counters. It does not yet
+provide full runtime handoff or persistent outbound write-ahead. From-handoff
+constructors and complete SQLite serialization now pass an actual separate-
+process resume fixture. Library-owned login tasks are aborted and joined on
+quiet detach. The ordinary daemon now restores saved transport state and
+quiet-detaches on exit. Full UI/push/Postal budgets remain separate work.
+The local patch also fixes lost receiver wakes in both split stream and split
+client paths: a writer releasing their shared mutex notifies a registered
+receiver waker. It preserves bounded queues and avoids lock reservations across
+poll cancellation/reunite. Deterministic before/after tests cover this defect.
+No new dependency or license is introduced by this fix.
+No Livewire source or patches were incorporated in this modification.
+
+`xmpp-parsers` 0.23.0 is also pinned to a local verified archive/patch under
+`vendor/xmpp-parsers-0.23.0/`. The sole parser source correction makes SM
+Failed.h's existing Option attribute default to None when omitted. It retains
+MPL-2.0 and all upstream notices. The full licence and provenance are in that
+directory; both source trees are checked by check-tokio-xmpp-vendor.py.
+The production and standalone test manifests both select this parser patch.
+
+The full MPL-2.0 text, sourced from the previously shipped project bundle,
+is retained in the vendor directory and generated THIRD_PARTY_LICENSES.txt.
+Original authors remain in the generated package notice. The modified source
+and its build inputs must accompany the corresponding public application
+source before any future binary release. The app stays AGPL-3.0-or-later.
+There is no new click or publication in this step; the old distributed click
+and older licence evidence below are historical relative to this local work.
+
 ## Compiler runtimes checked for 1.0.0 (2026-10-21)
 
 The Qt plugin statically includes LLVM libc++, libc++abi and libunwind from
@@ -25,7 +72,9 @@ application is distributed under those terms.
 | --- | --- | --- | --- |
 | **libsignal-protocol-c v2.3.3** (the OMEMO ratchet), commit `3a83a4f4…` | `vendor/libsignal-protocol-c/` (source), built by `tools/build-libsignal-c.sh`, linked **statically** into the phone binary | **GPL-3.0** | read from `vendor/libsignal-protocol-c/LICENSE` (2026-10-11) |
 | protobuf-c 1.5.1 (the runtime, one C file) | `vendor/protobuf-c-1.5.1/` (source **and** `LICENSE`) | **BSD-2-Clause** | verified 2026-10-11: the vendored files are byte-identical to the 1.5.1 release tarball (`cmp`), whose sha256 is in `VENDOR.txt`, and its `LICENSE` came from the same tarball |
-| `tokio-xmpp` 6.0 and the other Rust crates (247 packages in the lock file) | `daemon/Cargo.lock`, not vendored | per crate; **read, not assumed** - `cargo deny check licenses` passes under the policy in `daemon/deny.toml` | verified 2026-10-11: `licenses ok`, `advisories ok`, `bans ok`, `sources ok`; `tokio-xmpp` is MPL-2.0, the RustCrypto crates MIT/Apache-2.0, and the one copyleft-adjacent entry is `r-efi` (MIT **OR** Apache-2.0 **OR** LGPL-2.1-or-later - the permissive branch is taken) |
+| Other Rust crates (see actual lock file) | `daemon/Cargo.lock`, registry sources | per crate; **read, not assumed** - `cargo deny check licenses` passes under the policy in `daemon/deny.toml` | verified 2026-10-11: `licenses ok`, `advisories ok`, `bans ok`, `sources ok`; `tokio-xmpp` is MPL-2.0, the RustCrypto crates MIT/Apache-2.0, and the one copyleft-adjacent entry is `r-efi` (MIT **OR** Apache-2.0 **OR** LGPL-2.1-or-later - the permissive branch is taken) |
+| `tokio-xmpp` 6.0.0 with local ingress patch | `vendor/tokio-xmpp-6.0.0/`, pinned by `daemon/Cargo.toml` | **MPL-2.0** | source notices, Cargo metadata, full licence text and reproducible patch checked 2026-10-24; details above |
+| `xmpp-parsers` 0.23.0, optional SM failed h fix | `vendor/xmpp-parsers-0.23.0/` | **MPL-2.0** | original registry checksum, source notices, full text and reproducible patch checked 2026-10-24; real absent-h protocol fixture |
 | **Puhuri's own theme modules** (`PuhuriPunainen`, `PuhuriVihrea`, `PuhuriSininen`, `PuhuriPerus`) | `app/Lomiri/Components/Themes/`, shipped **inside the click**; made by `tools/sync-teemat.sh` from `../ubuntu-touch-teemat` | **LGPL-3.0-only** (Canonical Ltd.'s Lomiri theme files; the colours are the user's own teemat project's modifications) | 2026-10-20: the files keep Canonical's LGPL header, each `.qml` carries an SPDX line and a dated note of the modification (module/type/file names and palette values), and the LGPL-3.0 text travels with them (`app/Lomiri/Components/Themes/LICENSE.LGPL-3.0`). LGPL-3.0-only section 3 allows use under GPL-3.0, and AGPL-3 section 13 allows combining with GPL-3.0 |
 | Lomiri/Ubuntu Touch components | the phone's own system | their own licences | not our distribution |
 

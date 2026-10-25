@@ -9,6 +9,7 @@
 pub mod fake;
 pub mod xmpp;
 mod blocking;
+mod archive;
 
 /// OMEMO (XEP-0384): the Signal ratchet through `libsignal-protocol-c`. Off
 /// until the layer above it is real (`--features omemo`).
@@ -400,6 +401,8 @@ pub trait Engine: Send + Sync {
     fn connect(&self, jid: &str, password: &str) -> EngineResult<()>;
     /// Close the session and stop retrying.
     fn disconnect(&self) -> EngineResult<()>;
+    /// Suspend network ownership without logging the account out.
+    fn pause(&self) -> EngineResult<()> { Ok(()) }
     fn conversations(&self) -> EngineResult<Vec<Conversation>>;
     /// The account's contacts, so a conversation can be started with somebody
     /// the user has never written to. (The roster, not the conversations: a

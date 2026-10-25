@@ -232,8 +232,14 @@ class Backend(object):
             if not line:
                 # The service went away (it restarts itself after linking).
                 # Reconnect and carry on instead of going deaf.
-                self.close()
-                pyotherside.send("disconnected")
+                # Another request may already have opened a fresh socket.
+                # An old reader must never close that replacement connection.
+                with self._lock:
+                    replaced = stream is not self._stream
+                    if not replaced:
+                        self._close_locked()
+                if not replaced:
+                    pyotherside.send("disconnected")
                 continue
             try:
                 message = json.loads(line.decode("utf-8", "replace"))
@@ -401,7 +407,7 @@ def open_conversation(thread, limit=100, has_choice=False):
         "ok": True,
         "result": {
             "messages": rows,
-            "defaultEncrypted": len(rows) == 0 and not bool(has_choice),
+            "defaultEncrypted": not bool(has_choice),
         },
     }
 
@@ -585,9 +591,25 @@ def push_get():
     return _backend.request("push.get")
 
 
-def push_register(token, module="ubports"):
-    """Hand the Lomiri push token to the service so it can register it."""
-    return _backend.request("push.register", {"token": token, "module": module})
+def push_register(token, module=None):
+    """Refresh the token over private RPC, preserving saved route and opt-in."""
+    args = {"token": token}
+    if module is not None:
+        args["module"] = module
+    return _backend.request("push.register", args)
+
+
+def background_setup(service="ubpush.agnos.is", module="puhuri2"):
+    """Explicit opt-in to a user-selected bridge/module and server archive."""
+    return _backend.request("background.setup", {"service": service, "module": module})
+
+
+def push_set_enabled(enabled):
+    return _backend.request("push.setEnabled", {"enabled": bool(enabled)})
+
+
+def lifecycle(active):
+    return _backend.request("lifecycle.active", {"active": bool(active)})
 
 
 def push_wake():

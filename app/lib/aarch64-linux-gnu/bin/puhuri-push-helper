@@ -8,10 +8,13 @@ Lomirin push-palvelu kutsuu tätä, kun palvelimelta tulee push:
 
 Sisään tulee push-palvelun oma kuori, ulos kirjoitetaan UBportsin
 push-helper-muodon mukainen ilmoitus ja sisältöä paljastamaton viestimerkintä.
-Tämä avustaja ei pura viestin sisältöä - ja salattua OMEMO-viestiä se ei
-voisikaan purkaa ilman avainvarastoa. Sovellus hakee viestit, kun käyttäjä
-avaa ilmoituksen.
+Rust-daemon hakee ja tallentaa viestit sovelluksen omalla avainvarastolla.
+Ilmoitus sisältää vain yleisen uuden viestin merkinnän. Lyhyet jatkotyöt
+käyttävät sovelluksen omaa Postal-kanavaa.
 """
+
+import time
+PUSH_STARTED_NS = time.monotonic_ns()
 
 import json
 import os
@@ -55,7 +58,10 @@ def app_action():
 def read_payload(path):
     try:
         with open(path, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
+            text = handle.read(65537)
+            if len(text) > 65536:
+                return {}
+            data = json.loads(text)
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
@@ -125,24 +131,29 @@ def main(argv):
     if len(argv) < 3:
         return 0
     source, destination = argv[1], argv[2]
+    write_payload(destination, {})
     payload = read_payload(source)
     if not payload:
         write_payload(destination, {})
         return 0
     print("puhuri-push-helper: payload " + json.dumps(payload_shape(payload)),
           file=sys.stderr, flush=True)
-    if is_puhuri_originated(payload):
+    message = payload.get("message")
+    internal = (is_puhuri_originated(payload) and isinstance(message, dict)
+                and message.get("type") in ("puhuri.continue", "puhuri.notify"))
+    if is_puhuri_originated(payload) and not internal:
         write_payload(destination, payload)
         return 0
-    if not is_new_message(payload):
+    message = payload.get("message")
+    wake = isinstance(message, dict) and message.get("type") == "xmpp-wake"
+    if not is_new_message(payload) and not wake and not internal:
         write_payload(destination, {})
         return 0
+    write_payload(destination, {})
+    binary = os.path.join(os.path.dirname(os.path.abspath(__file__)), "puhurid")
+    os.environ["PUHURI_PUSH_STARTED_NS"] = str(PUSH_STARTED_NS)
+    os.execv(binary, [binary, "--push-helper", source, destination])
 
-    # A content-free server marker cannot prove that the sender passed the
-    # account's consent / blocking policy. Wake the app, but let only the
-    # daemon's admitted unread counters create a user-visible notification.
-    write_payload(destination, {"message": {"type": NEW_MESSAGE_MARKER}})
-    return 0
 
 
 if __name__ == "__main__":

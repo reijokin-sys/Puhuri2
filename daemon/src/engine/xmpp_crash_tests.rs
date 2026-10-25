@@ -239,6 +239,7 @@ async fn send_like_the_daemon(
     let shared = Arc::new(Shared {
         status: Mutex::new(Status::default()),
         events: Mutex::new(Vec::new()),
+        store_errors: AtomicU64::new(0),
         roster: Mutex::new(std::collections::HashMap::new()),
         upload_service: Mutex::new(None),
     });
@@ -598,6 +599,7 @@ fn an_archived_message_older_than_the_cutoff_is_left_alone() {
     let shared = Arc::new(Shared {
         status: Mutex::new(Status::default()),
         events: Mutex::new(Vec::new()),
+        store_errors: AtomicU64::new(0),
         roster: Mutex::new(std::collections::HashMap::new()),
         upload_service: Mutex::new(None),
     });
@@ -740,6 +742,7 @@ async fn try_send(
     let shared = Arc::new(Shared {
         status: Mutex::new(Status::default()),
         events: Mutex::new(Vec::new()),
+        store_errors: AtomicU64::new(0),
         roster: Mutex::new(std::collections::HashMap::new()),
         upload_service: Mutex::new(None),
     });
@@ -780,6 +783,7 @@ async fn a_pending_message_goes_out_again_from_the_store_untouched() {
     let shared = Arc::new(Shared {
         status: Mutex::new(Status::default()),
         events: Mutex::new(Vec::new()),
+        store_errors: AtomicU64::new(0),
         roster: Mutex::new(std::collections::HashMap::new()),
         upload_service: Mutex::new(None),
     });
@@ -870,6 +874,7 @@ async fn a_failed_encryption_records_nothing_at_all() {
     let shared = Arc::new(Shared {
         status: Mutex::new(Status::default()),
         events: Mutex::new(Vec::new()),
+        store_errors: AtomicU64::new(0),
         roster: Mutex::new(std::collections::HashMap::new()),
         upload_service: Mutex::new(None),
     });
@@ -946,6 +951,7 @@ fn a_forwarded_encrypted_message_is_decrypted_and_keeps_the_stanza_id() {
     let shared = Arc::new(Shared {
         status: Mutex::new(Status::default()),
         events: Mutex::new(Vec::new()),
+        store_errors: AtomicU64::new(0),
         roster: Mutex::new(std::collections::HashMap::new()),
         upload_service: Mutex::new(None),
     });
@@ -1046,6 +1052,7 @@ fn an_outgoing_carbon_with_the_local_message_id_is_not_imported_again() {
     let shared = Arc::new(Shared {
         status: Mutex::new(Status::default()),
         events: Mutex::new(Vec::new()),
+        store_errors: AtomicU64::new(0),
         roster: Mutex::new(std::collections::HashMap::new()),
         upload_service: Mutex::new(None),
     });
@@ -1651,4 +1658,621 @@ async fn b_the_recording_sink_really_carries_the_envelope() {
     assert!(!sink.all().contains(&text));
     let _ = read_encrypted(&encrypted, peer_device as u32).unwrap();
     let _ = own_dir;
+}
+
+/// Two distinct archive entries can have the same whole-second timestamp.
+/// Replaying either entry must still be recognised from its server identity.
+#[test]
+fn archived_same_second_plain_messages_are_distinct_and_replay_safe() {
+    let dir = Dir::new("archive-same-second-plain");
+    let store = Arc::new(Store::open(dir.path()).unwrap());
+    let engine = XmppEngine::new(store.clone());
+    let own = BareJid::from_str("me@test").unwrap();
+    let mut downloads = Vec::new();
+    for round in 0..2 {
+        for index in 0..3 {
+            let xml = format!(
+                "<forwarded xmlns='urn:xmpp:forward:0'>\
+                 <delay xmlns='urn:xmpp:delay' stamp='2026-10-24T10:00:00Z'/>\
+                 <message xmlns='jabber:client' from='sender@test' to='me@test' id='plain-{index}'>\
+                 <body>offline {index}</body>\
+                 <stanza-id xmlns='urn:xmpp:sid:0' by='me@test' id='plain-archive-{index}'/>\
+                 </message></forwarded>"
+            );
+            let forwarded =
+                Forwarded::try_from(xml.parse::<xmpp_parsers::minidom::Element>().unwrap())
+                    .unwrap();
+            import_forwarded(
+                &forwarded,
+                false,
+                &format!("plain-archive-{index}"),
+                &store,
+                &engine.shared,
+                None,
+                &own,
+                &mut downloads,
+            );
+        }
+        assert_eq!(
+            store.messages("sender@test", 10).len(),
+            3,
+            "archive pass {round} lost or duplicated messages"
+        );
+    }
+}
+
+/// The attachment must have its own durable placeholder even if a text
+/// message from the same contact has exactly the same timestamp.
+#[test]
+fn archived_same_second_text_and_attachment_keep_separate_rows() {
+    let dir = Dir::new("archive-same-second-file");
+    let store = Arc::new(Store::open(dir.path()).unwrap());
+    let engine = XmppEngine::new(store.clone());
+    let own = BareJid::from_str("me@test").unwrap();
+    let mut downloads = Vec::new();
+    for (id, content) in [
+        ("text", "<body>offline text</body>"),
+        ("file", "<body>https://example.org/offline.jpg</body><x xmlns='jabber:x:oob'><url>https://example.org/offline.jpg</url></x>"),
+    ] {
+        let xml = format!(
+            "<forwarded xmlns='urn:xmpp:forward:0'>\
+             <delay xmlns='urn:xmpp:delay' stamp='2026-10-24T10:00:00Z'/>\
+             <message xmlns='jabber:client' from='sender@test' to='me@test' id='{id}'>\
+             {content}<stanza-id xmlns='urn:xmpp:sid:0' by='me@test' id='archive-{id}'/>\
+             </message></forwarded>"
+        );
+        let forwarded = Forwarded::try_from(xml.parse::<xmpp_parsers::minidom::Element>().unwrap()).unwrap();
+        import_forwarded(&forwarded, false, &format!("archive-{id}"), &store,
+            &engine.shared, None, &own, &mut downloads);
+    }
+    assert_eq!(store.messages("sender@test", 10).len(), 2);
+    assert_eq!(store.pending_downloads().len(), 1);
+    assert_eq!(downloads.len(), 1);
+}
+
+/// Timestamp collisions must not discard encrypted archive messages before
+/// their ratchets can decrypt them. Replaying must not spend keys twice.
+#[test]
+fn archived_same_second_encrypted_messages_are_distinct_and_replay_safe() {
+    let (dir, receiver, device) = install("archive-same-second-encrypted");
+    let bundle = receiver.bundle().unwrap();
+    let (_sender_dir, sender, _) = install("archive-same-second-sender");
+    sender.remember_bundle("me@test", &bundle).unwrap();
+    drop(receiver);
+    let store = Arc::new(Store::open(dir.path()).unwrap());
+    let receiver = Omemo::open_shared(store.shared_db(), dir.path()).unwrap();
+    let engine = XmppEngine::new(store.clone());
+    let own = BareJid::from_str("me@test").unwrap();
+    let mut downloads = Vec::new();
+    let mut messages = Vec::new();
+    for index in 0..3 {
+        let envelope = sender
+            .encrypt_message(
+                &[RecipientDevice {
+                    jid: "me@test".to_string(),
+                    device_id: device,
+                    bundle: bundle.clone(),
+                }],
+                format!("encrypted offline {index}").as_bytes(),
+            )
+            .unwrap();
+        let payload = xml_of(&encrypted_element(&envelope));
+        let xml = format!(
+            "<forwarded xmlns='urn:xmpp:forward:0'>\
+             <delay xmlns='urn:xmpp:delay' stamp='2026-10-24T10:00:00Z'/>\
+             <message xmlns='jabber:client' from='sender@test' to='me@test' id='encrypted-{index}'>\
+             <body>encrypted fallback</body>\
+             <stanza-id xmlns='urn:xmpp:sid:0' by='me@test' id='encrypted-archive-{index}'/>\
+             {payload}</message></forwarded>"
+        );
+        messages.push(
+            Forwarded::try_from(xml.parse::<xmpp_parsers::minidom::Element>().unwrap()).unwrap(),
+        );
+    }
+    for round in 0..2 {
+        for (index, message) in messages.iter().enumerate() {
+            import_forwarded(
+                message,
+                false,
+                &format!("encrypted-archive-{index}"),
+                &store,
+                &engine.shared,
+                Some(&receiver),
+                &own,
+                &mut downloads,
+            );
+        }
+        let stored = store.messages("sender@test", 10);
+        assert_eq!(
+            stored.len(),
+            3,
+            "archive pass {round} lost or duplicated encrypted messages"
+        );
+        for index in 0..3 {
+            assert!(stored
+                .iter()
+                .any(|m| m.text == format!("encrypted offline {index}")));
+        }
+    }
+}
+
+#[test]
+fn archived_same_second_messages_without_inner_stamps_use_archive_ids() {
+    let dir = Dir::new("archive-same-second-no-stamp");
+    let store = Arc::new(Store::open(dir.path()).unwrap());
+    let engine = XmppEngine::new(store.clone());
+    let own = BareJid::from_str("me@test").unwrap();
+    let mut downloads = Vec::new();
+    for _ in 0..2 {
+        for index in 0..2 {
+            let xml = format!(
+                "<forwarded xmlns='urn:xmpp:forward:0'>\
+                 <delay xmlns='urn:xmpp:delay' stamp='2026-10-24T10:00:00Z'/>\
+                 <message xmlns='jabber:client' from='sender@test' to='me@test'>\
+                 <body>no stamp {index}</body></message></forwarded>"
+            );
+            let forwarded =
+                Forwarded::try_from(xml.parse::<xmpp_parsers::minidom::Element>().unwrap())
+                    .unwrap();
+            import_forwarded(
+                &forwarded,
+                false,
+                &format!("trusted-archive-{index}"),
+                &store,
+                &engine.shared,
+                None,
+                &own,
+                &mut downloads,
+            );
+        }
+        assert_eq!(store.messages("sender@test", 10).len(), 2);
+    }
+}
+
+fn queue_fixture_inbox(store: &Store, element: &omemo_xml::Encrypted) -> i64 {
+    let mut raw = ParsedMessage::chat(None);
+    raw.from = Some("sender@test".parse().unwrap());
+    raw.payloads.push(element.clone().into());
+    store
+        .commit_transport_ingress(
+            "me@test",
+            1000,
+            Some(&Stanza::Message(raw)),
+            tokio_xmpp::stanzastream::IngressContext {
+                jid: own_jid().into(),
+                ready: false,
+                state: tokio_xmpp::stanzastream::DetachedState {
+                    sm: None,
+                    pending: vec![],
+                },
+            },
+        )
+        .unwrap()
+        .unwrap()
+}
+
+#[test]
+fn inbox_completion_failure_rolls_back_ratchet_message_and_unread_then_retries() {
+    let (dir, receiver, device) = install("inbox-atomic");
+    let bundle = receiver.bundle().unwrap();
+    let (_sender_dir, sender, sender_device) = install("inbox-sender");
+    sender.remember_bundle("me@test", &bundle).unwrap();
+    let envelope = sender
+        .encrypt_message(
+            &[RecipientDevice {
+                jid: "me@test".into(),
+                device_id: device,
+                bundle,
+            }],
+            b"inbox-fixture-body",
+        )
+        .unwrap();
+    drop(receiver);
+    let store = Arc::new(Store::open(dir.path()).unwrap());
+    let receiver = Omemo::open_shared(store.shared_db(), dir.path()).unwrap();
+    let id = queue_fixture_inbox(&store, &envelope);
+    let prekeys = OmemoStore::open(dir.path())
+        .unwrap()
+        .pre_key_count()
+        .unwrap();
+    let session = OmemoStore::open(dir.path())
+        .unwrap()
+        .load_session("sender@test", sender_device)
+        .unwrap();
+    store.shared_db().lock().execute_batch("CREATE TRIGGER refuse_inbox_finish BEFORE DELETE ON xmpp_inbox BEGIN SELECT RAISE(FAIL,'fixture'); END;").unwrap();
+    let mut downloads = Vec::new();
+    let result = receive_omemo_with_inbox(
+        &receiver,
+        &store,
+        &"sender@test".parse().unwrap(),
+        "sender@test",
+        "Fixture",
+        Some("inbox-sid"),
+        Some("inbox-mid"),
+        &envelope,
+        &mut downloads,
+        true,
+        1000,
+        Some(("me@test", id)),
+    );
+    assert!(matches!(
+        result,
+        Err(crate::engine::omemo::ReceiveError::Store(_))
+    ));
+    assert!(store.messages("sender@test", 100).is_empty());
+    assert_eq!(store.pending_stanzas("me@test", 100).unwrap().len(), 1);
+    assert_eq!(
+        OmemoStore::open(dir.path())
+            .unwrap()
+            .pre_key_count()
+            .unwrap(),
+        prekeys
+    );
+    assert_eq!(
+        OmemoStore::open(dir.path())
+            .unwrap()
+            .load_session("sender@test", sender_device)
+            .unwrap(),
+        session
+    );
+    store
+        .shared_db()
+        .lock()
+        .execute_batch("DROP TRIGGER refuse_inbox_finish")
+        .unwrap();
+    let result = receive_omemo_with_inbox(
+        &receiver,
+        &store,
+        &"sender@test".parse().unwrap(),
+        "sender@test",
+        "Fixture",
+        Some("inbox-sid"),
+        Some("inbox-mid"),
+        &envelope,
+        &mut downloads,
+        true,
+        1000,
+        Some(("me@test", id)),
+    )
+    .unwrap();
+    assert!(matches!(result, OmemoOutcome::Stored(_)));
+    assert!(store.pending_stanzas("me@test", 100).unwrap().is_empty());
+    assert_eq!(
+        store.messages("sender@test", 100)[0].text,
+        "inbox-fixture-body"
+    );
+    assert_eq!(store.conversations()[0].unread, 1);
+    let session = OmemoStore::open(dir.path())
+        .unwrap()
+        .load_session("sender@test", sender_device)
+        .unwrap();
+    // Both duplicate paths must consume only their queued copy, without a
+    // second ratchet step: trusted stanza-id, then libsignal duplicate fallback.
+    for server_id in [Some("inbox-sid"), None] {
+        let duplicate = queue_fixture_inbox(&store, &envelope);
+        let result = receive_omemo_with_inbox(
+            &receiver,
+            &store,
+            &"sender@test".parse().unwrap(),
+            "sender@test",
+            "Fixture",
+            server_id,
+            Some("inbox-mid"),
+            &envelope,
+            &mut downloads,
+            true,
+            1000,
+            Some(("me@test", duplicate)),
+        )
+        .unwrap();
+        assert!(matches!(result, OmemoOutcome::Duplicate));
+        assert!(store.pending_stanzas("me@test", 100).unwrap().is_empty());
+    }
+    assert_eq!(store.messages("sender@test", 100).len(), 1);
+    assert_eq!(store.conversations()[0].unread, 1);
+    assert_eq!(
+        OmemoStore::open(dir.path())
+            .unwrap()
+            .load_session("sender@test", sender_device)
+            .unwrap(),
+        session
+    );
+}
+
+#[test]
+fn inbox_attachment_does_not_schedule_network_work_before_successful_completion() {
+    let (dir, receiver, device) = install("inbox-attachment");
+    let bundle = receiver.bundle().unwrap();
+    let (_sender_dir, sender, _) = install("inbox-attachment-sender");
+    sender.remember_bundle("me@test", &bundle).unwrap();
+    let address = format!("aesgcm://example.test/fixture#{}", "00".repeat(44));
+    let envelope = sender
+        .encrypt_message(
+            &[RecipientDevice {
+                jid: "me@test".into(),
+                device_id: device,
+                bundle,
+            }],
+            address.as_bytes(),
+        )
+        .unwrap();
+    drop(receiver);
+    let store = Arc::new(Store::open(dir.path()).unwrap());
+    let receiver = Omemo::open_shared(store.shared_db(), dir.path()).unwrap();
+    let id = queue_fixture_inbox(&store, &envelope);
+    let mut downloads = Vec::new();
+    store.shared_db().lock().execute_batch("CREATE TRIGGER refuse_attachment_finish BEFORE DELETE ON xmpp_inbox BEGIN SELECT RAISE(FAIL,'fixture'); END;").unwrap();
+    assert!(receive_omemo_with_inbox(
+        &receiver,
+        &store,
+        &"sender@test".parse().unwrap(),
+        "sender@test",
+        "Fixture",
+        None,
+        Some("inbox-att"),
+        &envelope,
+        &mut downloads,
+        true,
+        1000,
+        Some(("me@test", id))
+    )
+    .is_err());
+    assert!(downloads.is_empty());
+    assert!(store.messages("sender@test", 100).is_empty());
+    assert_eq!(store.pending_stanzas("me@test", 100).unwrap().len(), 1);
+    store
+        .shared_db()
+        .lock()
+        .execute_batch("DROP TRIGGER refuse_attachment_finish")
+        .unwrap();
+    assert!(matches!(
+        receive_omemo_with_inbox(
+            &receiver,
+            &store,
+            &"sender@test".parse().unwrap(),
+            "sender@test",
+            "Fixture",
+            None,
+            Some("inbox-att"),
+            &envelope,
+            &mut downloads,
+            true,
+            1000,
+            Some(("me@test", id))
+        )
+        .unwrap(),
+        OmemoOutcome::Download
+    ));
+    assert_eq!(downloads.len(), 1);
+    assert_eq!(store.messages("sender@test", 100).len(), 1);
+    assert!(store.pending_stanzas("me@test", 100).unwrap().is_empty());
+}
+
+#[test]
+fn inbox_key_transport_completes_without_a_plaintext_message() {
+    let (dir, receiver, device) = install("inbox-key-transport");
+    let bundle = receiver.bundle().unwrap();
+    let (_sender_dir, sender, _) = install("inbox-key-sender");
+    sender.remember_bundle("me@test", &bundle).unwrap();
+    let mut envelope = sender
+        .encrypt_message(
+            &[RecipientDevice {
+                jid: "me@test".into(),
+                device_id: device,
+                bundle,
+            }],
+            b"fixture",
+        )
+        .unwrap();
+    envelope.payload = None;
+    drop(receiver);
+    let store = Arc::new(Store::open(dir.path()).unwrap());
+    let receiver = Omemo::open_shared(store.shared_db(), dir.path()).unwrap();
+    let id = queue_fixture_inbox(&store, &envelope);
+    let mut downloads = Vec::new();
+    assert!(matches!(
+        receive_omemo_with_inbox(
+            &receiver,
+            &store,
+            &"sender@test".parse().unwrap(),
+            "sender@test",
+            "Fixture",
+            None,
+            Some("inbox-key"),
+            &envelope,
+            &mut downloads,
+            true,
+            1000,
+            Some(("me@test", id))
+        )
+        .unwrap(),
+        OmemoOutcome::KeyTransport
+    ));
+    assert!(store.pending_stanzas("me@test", 100).unwrap().is_empty());
+    assert!(store.messages("sender@test", 100).is_empty());
+}
+
+#[test]
+fn mam_cursor_failure_rolls_back_real_ratchet_and_retry_advances_once() {
+    let (dir, receiver, device) = install("mam-cursor-receiver");
+    let bundle = receiver.bundle().unwrap();
+    let (_sender_dir, sender, sender_device) = install("mam-cursor-sender");
+    sender.remember_bundle("me@test", &bundle).unwrap();
+    let envelope = sender
+        .encrypt_message(
+            &[RecipientDevice {
+                jid: "me@test".into(),
+                device_id: device,
+                bundle,
+            }],
+            b"mam-cursor-fixture",
+        )
+        .unwrap();
+    drop(receiver);
+    let store = Arc::new(Store::open(dir.path()).unwrap());
+    let receiver = Omemo::open_shared(store.shared_db(), dir.path()).unwrap();
+    let query = store.register_mam_query("me@test", None, false).unwrap();
+    let element: xmpp_parsers::minidom::Element = envelope.clone().into();
+    let mut bytes = Vec::new();
+    element.write_to(&mut bytes).unwrap();
+    let payload = String::from_utf8(bytes).unwrap();
+    let queue = |archive: &str| {
+        let xml=format!("<message xmlns='jabber:client'><result xmlns='urn:xmpp:mam:2' queryid='{}' id='{archive}'><forwarded xmlns='urn:xmpp:forward:0'><message xmlns='jabber:client' from='sender@test' to='me@test'>{payload}</message></forwarded></result></message>",query.id);
+        let raw = ParsedMessage::try_from(xml.parse::<xmpp_parsers::minidom::Element>().unwrap())
+            .unwrap();
+        store
+            .commit_transport_ingress(
+                "me@test",
+                1000,
+                Some(&Stanza::Message(raw)),
+                tokio_xmpp::stanzastream::IngressContext {
+                    jid: own_jid().into(),
+                    ready: false,
+                    state: tokio_xmpp::stanzastream::DetachedState {
+                        sm: None,
+                        pending: vec![],
+                    },
+                },
+            )
+            .unwrap()
+            .unwrap()
+    };
+    let id = queue("archive-real");
+    let prekeys = OmemoStore::open(dir.path())
+        .unwrap()
+        .pre_key_count()
+        .unwrap();
+    let session = OmemoStore::open(dir.path())
+        .unwrap()
+        .load_session("sender@test", sender_device)
+        .unwrap();
+    store.shared_db().lock().execute_batch("CREATE TRIGGER refuse_mam_cursor BEFORE INSERT ON xmpp_mam_cursors BEGIN SELECT RAISE(FAIL,'fixture'); END;").unwrap();
+    let mut downloads = Vec::new();
+    let receive = |id, downloads: &mut Vec<_>| {
+        receive_omemo_with_inbox(
+            &receiver,
+            &store,
+            &"sender@test".parse().unwrap(),
+            "sender@test",
+            "Fixture",
+            Some("mam-fixture-sid"),
+            Some("mam-fixture-mid"),
+            &envelope,
+            downloads,
+            true,
+            1000,
+            Some(("me@test", id)),
+        )
+    };
+    assert!(matches!(
+        receive(id, &mut downloads),
+        Err(crate::engine::omemo::ReceiveError::Store(_))
+    ));
+    assert!(downloads.is_empty());
+    assert!(store.messages("sender@test", 10).is_empty());
+    assert!(store.mam_cursor("me@test").unwrap().is_none());
+    assert_eq!(
+        store.mam_progress("me@test", &query.id).unwrap().completed,
+        0
+    );
+    assert_eq!(store.pending_stanzas("me@test", 10).unwrap().len(), 1);
+    assert_eq!(
+        OmemoStore::open(dir.path())
+            .unwrap()
+            .pre_key_count()
+            .unwrap(),
+        prekeys
+    );
+    assert_eq!(
+        OmemoStore::open(dir.path())
+            .unwrap()
+            .load_session("sender@test", sender_device)
+            .unwrap(),
+        session
+    );
+    store
+        .shared_db()
+        .lock()
+        .execute_batch("DROP TRIGGER refuse_mam_cursor")
+        .unwrap();
+    assert!(matches!(
+        receive(id, &mut downloads).unwrap(),
+        OmemoOutcome::Stored(_)
+    ));
+    assert_eq!(
+        store.mam_cursor("me@test").unwrap().as_deref(),
+        Some("archive-real")
+    );
+    let committed_session = OmemoStore::open(dir.path())
+        .unwrap()
+        .load_session("sender@test", sender_device)
+        .unwrap();
+    let duplicate = queue("archive-duplicate");
+    assert!(matches!(
+        receive(duplicate, &mut downloads).unwrap(),
+        OmemoOutcome::Duplicate
+    ));
+    assert_eq!(
+        store.mam_cursor("me@test").unwrap().as_deref(),
+        Some("archive-duplicate")
+    );
+    assert_eq!(store.messages("sender@test", 10).len(), 1);
+    assert_eq!(store.conversations()[0].unread, 1);
+    assert_eq!(
+        store.mam_progress("me@test", &query.id).unwrap().completed,
+        2
+    );
+    assert_eq!(
+        OmemoStore::open(dir.path())
+            .unwrap()
+            .load_session("sender@test", sender_device)
+            .unwrap(),
+        committed_session
+    );
+}
+
+#[tokio::test]
+async fn upload_recovery_envelope_and_ratchet_rollback_then_replay_same_bytes() {
+    let (dir,initial,_)=install("upload-outbox");drop(initial);
+    let (_peer_dir,peer,peer_device)=install("upload-outbox-peer");
+    let store=Arc::new(Store::open(dir.path()).unwrap());
+    store.privacy_init("me@test").unwrap();store.privacy_set_contact("me@test","peer@test","approved").unwrap();
+    let own=Omemo::open_shared(store.shared_db(),dir.path()).unwrap();
+    own.remember_bundle("peer@test",&peer.bundle().unwrap()).unwrap();
+    let omemo=Some(own);
+    let shared=Arc::new(Shared{status:Mutex::new(Status::default()),events:Mutex::new(vec![]),store_errors:AtomicU64::new(0),roster:Mutex::new(HashMap::new()),upload_service:Mutex::new(None)});
+    let message=Message{id:"upload-crypto-fixture".into(),thread:"peer@test".into(),outgoing:true,sender:"Fixture".into(),text:"".into(),ts:now(),delivered:false,state:"pending".into(),attachment:Some(Attachment{path:"fixture.png".into(),content_type:Some("image/png".into()),voice:false,image:true})};
+    let job=crate::store::UploadJob{account:"me@test".into(),id:message.id.clone(),peer:message.thread.clone(),path:"fixture.png".into(),body:"".into(),content_type:"image/png".into(),encrypted:true,created:now(),iq_id:Some("upload-slot-helper-fixture".into()),service:Some("upload.test".into()),reply_xml:None,requested:now(),attempts:0,failed:false};
+    store.enqueue_upload(&job,&message,"Fixture").unwrap();
+    let iq=Iq::empty_result("me@test".parse().unwrap(),"upload-slot-helper-fixture").with_from("upload.test".parse().unwrap());
+    let row=store.commit_transport_ingress("me@test",now(),Some(&Stanza::Iq(iq.clone())),tokio_xmpp::stanzastream::IngressContext{jid:own_jid().into(),ready:false,state:tokio_xmpp::stanzastream::DetachedState{sm:None,pending:vec![]}}).unwrap().unwrap();
+    store.shared_db().lock().execute_batch("CREATE TRIGGER refuse_deferred_slot BEFORE DELETE ON xmpp_inbox BEGIN SELECT RAISE(FAIL,'fixture'); END;").unwrap();
+    assert!(upload_runtime::defer_slot_reply(&iq,row,"me@test",&store).is_err());
+    assert!(store.upload_jobs("me@test").unwrap()[0].reply_xml.is_none());
+    assert_eq!(store.pending_stanzas("me@test",1).unwrap().len(),1);
+    store.shared_db().lock().execute_batch("DROP TRIGGER refuse_deferred_slot").unwrap();
+    assert!(upload_runtime::defer_slot_reply(&iq,row,"me@test",&store).unwrap());
+    assert!(store.upload_jobs("me@test").unwrap()[0].reply_xml.is_some());
+    assert!(store.pending_stanzas("me@test",1).unwrap().is_empty());
+    store.reconcile_upload_session("me@test",false).unwrap();
+    assert_eq!(store.upload_jobs("me@test").unwrap()[0].iq_id.as_deref(),Some("upload-slot-helper-fixture"));
+
+    store.shared_db().lock().execute_batch("CREATE TRIGGER refuse_upload_crypto BEFORE DELETE ON settings WHEN OLD.key LIKE 'upload.job:%' BEGIN SELECT RAISE(FAIL,'fixture'); END;").unwrap();
+    let mut sink=RecordingSink::default();let address="aesgcm://fixture.invalid/image#fixture";
+    assert!(encrypt_and_send_direct(&mut sink,&own_jid(),&peer_jid(),address,&message.id,&omemo,&store,&shared).await.is_err());
+    assert!(sink.is_empty());assert!(store.outbox_pending().is_empty());
+    assert!(!omemo.as_ref().unwrap().has_session("peer@test",peer_device).unwrap());
+    assert_eq!(store.upload_jobs("me@test").unwrap().len(),1);
+    store.shared_db().lock().execute_batch("DROP TRIGGER refuse_upload_crypto").unwrap();
+    encrypt_and_send_direct(&mut sink,&own_jid(),&peer_jid(),address,&message.id,&omemo,&store,&shared).await.unwrap();
+    let xml=sink.stanzas[0].clone();assert_eq!(store.outbox_pending()[0].2,xml);
+    assert_eq!(store.messages("peer@test",10)[0].attachment.as_ref().unwrap().path,"fixture.png");
+    let before=OmemoStore::open(dir.path()).unwrap().load_session("peer@test",peer_device).unwrap();
+    drop(omemo);drop(store);
+    let store=Arc::new(Store::open(dir.path()).unwrap());
+    let mut replay=RecordingSink::default();let saved=store.outbox_pending()[0].2.clone();
+    send_stored_stanza(&mut replay,&store,&shared,&message.id,&saved).await;
+    assert_eq!(replay.stanzas,vec![xml]);assert_eq!(decrypt_stanza(&peer,"me@test",&saved),address);
+    let after=OmemoStore::open(dir.path()).unwrap().load_session("peer@test",peer_device).unwrap();
+    assert_eq!(before,after,"stored stanza replay advanced the ratchet");
 }

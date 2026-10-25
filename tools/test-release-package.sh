@@ -46,7 +46,8 @@ for path in \
     ./push.json \
     ./lib/aarch64-linux-gnu/bin/puhurid \
     ./lib/aarch64-linux-gnu/bin/puhuri-indicator \
-    ./lib/aarch64-linux-gnu/bin/puhuri-push-helper
+    ./lib/aarch64-linux-gnu/bin/puhuri-push-helper \
+    ./lib/aarch64-linux-gnu/bin/puhuri-postal-job
 do
     printf '%s\n' "$contents" | grep -qx "$path" || {
         echo "FAIL: clickistä puuttuu $path" >&2

@@ -47,7 +47,9 @@ allow = [
 ignore = []
 
 [sources]
-# Riippuvuudet tulevat vain crates.io:sta. Git-lähteestä tai tuntemattomasta
+# Ladattavat riippuvuudet tulevat vain crates.io:sta. tokio-xmpp ja xmpp-parsers on pinnattu
+# paikalliseen vendor-puuhun (arkiston hash ja patch tarkistetaan työkalulla
+# tools/check-tokio-xmpp-vendor.py). Git-lähteestä tai tuntemattomasta
 # rekisteristä tuleva krate on virhe, ei varoitus.
 unknown-registry = "deny"
 unknown-git = "deny"

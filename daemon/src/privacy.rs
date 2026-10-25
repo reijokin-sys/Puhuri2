@@ -230,18 +230,51 @@ impl Store {
         xml: &str,
         ts: i64,
     ) -> Result<bool, String> {
+        let tx = self.db.begin()?;
+        let added = Self::privacy_queue_in(&tx, account, jid, xml, ts)?;
+        tx.commit()?;
+        Ok(added)
+    }
+
+    /// Transfer an undecrypted inbox stanza into consent storage atomically.
+    /// Capacity rejection is a deliberate policy disposition; SQL failure is
+    /// retryable and leaves the inbox row intact.
+    pub fn privacy_queue_inbox(
+        &self,
+        account: &str,
+        jid: &str,
+        xml: &str,
+        ts: i64,
+        inbox_id: i64,
+    ) -> Result<bool, String> {
+        let tx = self.db.begin()?;
+        let added = Self::privacy_queue_in(&tx, account, jid, xml, ts)?;
+        Self::finish_stanza_in(&tx, account, inbox_id)?;
+        tx.commit()?;
+        Ok(added)
+    }
+
+    fn privacy_queue_in(
+        db: &Connection,
+        account: &str,
+        jid: &str,
+        xml: &str,
+        ts: i64,
+    ) -> Result<bool, String> {
+        if db.is_autocommit() {
+            return Err("yhteydenottopyyntö tarvitsee transaktion".into());
+        }
         if xml.len() > 65536 {
             return Ok(false);
         }
-        let tx = self.db.begin()?;
-        let peers: i64 = tx
+        let peers: i64 = db
             .query_row(
                 "SELECT COUNT(DISTINCT jid) FROM message_requests WHERE account=?1",
                 [account],
                 |r| r.get(0),
             )
             .map_err(|e| e.to_string())?;
-        let count: i64 = tx
+        let count: i64 = db
             .query_row(
                 "SELECT COUNT(*) FROM message_requests WHERE account=?1 AND jid=?2",
                 params![account, jid],
@@ -251,13 +284,12 @@ impl Store {
         if count >= 10 || (count == 0 && peers >= 100) {
             return Ok(false);
         }
-        let added = tx
+        let added = db
             .execute(
                 "INSERT OR IGNORE INTO message_requests(account,jid,xml,ts) VALUES (?1,?2,?3,?4)",
                 params![account, jid, xml, ts],
             )
             .map_err(|e| e.to_string())?;
-        tx.commit()?;
         Ok(added > 0)
     }
 
@@ -274,6 +306,100 @@ impl Store {
             })
             .map_err(|e| e.to_string())?;
         rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
+    }
+
+    /// Move approved requests to the normal durable inbox, never delete before
+    /// ownership transfer. Trusted archived wrappers become direct messages.
+    pub fn privacy_requeue_ready(&self, account: &str) -> Result<usize, String> {
+        use xmpp_parsers::{
+            carbons::Received, jid::BareJid, mam::Result_ as MamResult, message::Message,
+            minidom::Element,
+        };
+        let tx = self.db.begin()?;
+        let pending: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM xmpp_inbox WHERE account=?1)",
+                [account],
+                |r| r.get(0),
+            )
+            .map_err(|_| "Inboxin tilan luku epäonnistui")?;
+        if pending {
+            return Ok(0);
+        }
+        let mut stmt=tx.prepare("SELECT r.id,r.xml,r.ts,r.jid FROM message_requests r JOIN privacy_contacts c ON c.account=r.account AND c.jid=r.jid WHERE r.account=?1 AND c.state='approved' ORDER BY r.id LIMIT 10").map_err(|_|"Hyväksyttyjen pyyntöjen luku epäonnistui")?;
+        let rows = stmt
+            .query_map([account], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|_| "Hyväksyttyjen pyyntöjen luku epäonnistui")?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "Hyväksyttyjen pyyntöjen luku epäonnistui")?;
+        drop(stmt);
+        let own: BareJid = account
+            .parse()
+            .map_err(|_| "Pyynnön tili on virheellinen")?;
+        let count = rows.len();
+        for (id, xml, mut ts, peer) in rows {
+            let mut message = Message::try_from(
+                xml.parse::<Element>()
+                    .map_err(|_| "Pyynnön XML on virheellinen")?,
+            )
+            .map_err(|_| "Pyynnön viesti on virheellinen")?;
+            let mam = message.extract_valid_payload::<MamResult>();
+            let carbon = message.extract_valid_payload::<Received>();
+            if mam.is_some() || carbon.is_some() {
+                if message
+                    .from
+                    .as_ref()
+                    .is_some_and(|from| from.is_full() || from.to_bare() != own)
+                {
+                    return Err("Pyynnön arkistolähde ei täsmää".into());
+                }
+                let (forwarded, archive) = if let Some(m) = mam {
+                    (m.forwarded, Some(m.id))
+                } else {
+                    (carbon.unwrap().forwarded, None)
+                };
+                if let Some(delay) = forwarded.delay {
+                    ts = delay.stamp.0.timestamp();
+                }
+                message = forwarded.message;
+                if let Some(archive) = archive {
+                    message.payloads.push(
+                        Element::builder("stanza-id", "urn:xmpp:sid:0")
+                            .attr("by".try_into().unwrap(), account)
+                            .attr("id".try_into().unwrap(), archive)
+                            .build(),
+                    );
+                }
+            }
+            if message
+                .from
+                .as_ref()
+                .is_none_or(|from| from.to_bare().as_str() != peer)
+            {
+                return Err("Pyynnön lähettäjä ei täsmää".into());
+            }
+            let element: Element = message.into();
+            let mut bytes = Vec::new();
+            element
+                .write_to(&mut bytes)
+                .map_err(|_| "Pyynnön XML-tallennus epäonnistui")?;
+            let xml = String::from_utf8(bytes).map_err(|_| "Pyynnön teksti ei kelpaa")?;
+            super::transport_handoff::append_incoming(&tx, account, ts, &xml)?;
+            tx.execute(
+                "DELETE FROM message_requests WHERE account=?1 AND id=?2",
+                params![account, id],
+            )
+            .map_err(|_| "Pyynnön siirron kuittaus epäonnistui")?;
+        }
+        tx.commit()?;
+        Ok(count)
     }
 
     pub fn privacy_ready(&self, account: &str) -> Result<Vec<(i64, String)>, String> {

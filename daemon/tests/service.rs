@@ -672,9 +672,10 @@ fn the_push_token_is_kept_and_registered() {
     assert_eq!(push["settings"], serde_json::Value::Null);
 }
 
-/// With a bridge configured the device is registered (the node is the token).
+/// Registration stays pending until a real server confirms it; saving the
+/// token in the fake engine is not proof of end-to-end delivery.
 #[test]
-fn a_configured_bridge_registers_the_token() {
+fn a_configured_bridge_keeps_registration_pending_until_confirmation() {
     let service = start_with("push-bridge", |store| {
         store.set_push_service(Some("push.puhuri.test")).unwrap();
     });
@@ -692,7 +693,8 @@ fn a_configured_bridge_registers_the_token() {
         "push.register",
         json!({"token": "TOKEN-B"}),
     ));
-    assert_eq!(push["active"], json!(true));
+    assert_eq!(push["active"], json!(false));
+    assert_eq!(push["pending"], json!(true));
     assert_eq!(push["service"], json!("push.puhuri.test"));
     assert_eq!(push["settings"]["node"], json!("TOKEN-B"));
     assert_eq!(push["settings"]["jid"], json!("push.puhuri.test"));
@@ -701,6 +703,7 @@ fn a_configured_bridge_registers_the_token() {
     let push = result_of(call(&service.socket, 2, "push.get", json!({})));
     assert_eq!(push["service"], json!("push.puhuri.test"));
     assert_eq!(push["token"], json!("TOKEN-B"));
+    assert_eq!(push["active"], json!(false));
 }
 
 /// The bridge can be set over the socket (it is the operator's choice, so

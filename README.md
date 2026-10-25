@@ -4,12 +4,14 @@ Puhuri 2 is an XMPP messenger for Ubuntu Touch. It is a separate application
 with its own click identity (`fi.reijo.puhuri2`), configuration and application
 data. The original Puhuri project is not required.
 
-Version 1.1.0 adds message requests, explicit contact approval,
-reception from approved contacts only, and XEP-0191 blocking with separate
-local/server confirmation. Existing conversations remain approved on upgrade;
-roster membership alone does not approve a new sender. Unknown senders' messages
-stay in requests until accepted, with no attachment downloads or delivery receipts.
-Blocking remains local when the server does not support XEP-0191.
+The main branch contains development version 1.1.3. The last published
+release is 1.1.0. Version 1.1.3 is a local test candidate, not a validated
+store release. Its updated notification settings have been checked on an
+Ubuntu Touch 24.04-2.1 phone; complete closed-app delivery remains unverified.
+
+Recent development adds durable incoming-message processing and offline
+recovery, upload recovery, configurable notification service/module settings,
+and a persistent user opt-out that token updates cannot override.
 
 Puhuri 2 supports one-to-one XMPP chat,
 OMEMO encryption, message archive management (MAM), image attachments, voice
@@ -25,16 +27,25 @@ Recording stops after about two minutes. Existing recordings are preserved.
 
 ## Background messages
 
-The application starts a confined XMPP daemon and a notifications-only helper.
-They continue running after the Puhuri 2 window is closed. Incoming messages
-are stored by the daemon and announced through Lomiri notifications without
-putting message text, sender details or decrypted OMEMO content into a push
-payload. Server push markers only wake the app; they cannot create a
-notification before the daemon checks the sender’s contact permission.
+The UI starts bundled daemon and indicator children intended to inherit its
+AppArmor profile. Background reception uses the confined push hook and
+server-side XEP-0357 notifications; closing the UI is not a guarantee that a
+persistent child will continue running under the platform lifecycle rules.
 
-The persistent services start when Puhuri 2 is first launched. They normally
-remain active for the rest of the user session. Puhuri 2 does not install
-system-wide software or request an unconfined application profile.
+Push requires a bridge module configured for Puhuri's own app ID
+`fi.reijo.puhuri2_puhuri`. A separate Puhuri module on `ubpush.agnos.is` has
+been proposed but has not been provisioned or confirmed by its operator.
+The existing Livewire `ubports` module must not be used as a Puhuri backend.
+The settings expose the service and operator-confirmed module name; saving a
+proposed name does not make that backend available.
+
+Local tests cover UI/RPC configuration, opt-out persistence, isolated
+server-originated push to a controlled HTTPS receiver and offline recovery.
+They do not establish public-bridge or closed-app phone delivery. A
+content-free wake marker cannot bypass the sender's contact permissions.
+Complete stock/OpenStore validation and runtime profile verification remain
+release requirements. No additional systemd service or unconfined setup
+helper is installed by the click.
 
 ## Build
 

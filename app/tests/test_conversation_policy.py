@@ -45,10 +45,10 @@ class ConversationPolicyTest(unittest.TestCase):
         self.assertEqual(result["result"]["messages"], [])
         self.assertTrue(result["result"]["defaultEncrypted"])
 
-    def test_a_conversation_with_history_does_not_change_its_state(self):
+    def test_an_incoming_conversation_without_a_choice_defaults_to_encrypted(self):
         self.answer_with([{"id": "m-1", "text": "hello"}])
         result = self.puhuri.open_conversation("old@example.org", 100, False)
-        self.assertFalse(result["result"]["defaultEncrypted"])
+        self.assertTrue(result["result"]["defaultEncrypted"])
 
     def test_an_explicit_plaintext_choice_wins_over_the_default(self):
         self.answer_with([])

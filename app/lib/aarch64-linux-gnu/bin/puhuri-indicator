@@ -758,6 +758,12 @@ def main():
         try:
             # Only the counters: `conversations.list` carries the message
             # bodies, which this confined helper does not need.
+            try:
+                notice = daemon.request("push.notice.state")
+                if not notice.get("managed", False):
+                    notice = None
+            except Exception:
+                notice = None
             conversations = daemon.request("conversations.indicator")
             unread, newest = unread_state(conversations)
             try:
@@ -765,12 +771,25 @@ def main():
                 enabled = bool(settings.get("notifications", True))
             except Exception:
                 enabled = True
-            for summary, body in tracker.observe(conversations, enabled=enabled):
+            cards = tracker.observe(conversations, enabled=enabled)
+            if notice and notice.get("sequence", 0) <= notice.get("emitted", 0):
+                cards = []
+            if (not cards and enabled and unread > 0 and notice
+                    and notice.get("sequence", 0) > notice.get("emitted", 0)):
+                cards = [("Puhuri 2", "Uusi viesti / New message")]
+            posted = True
+            for summary, body in cards:
                 try:
                     notifications.notify(summary, body)
                 except Exception as error:
+                    posted = False
                     print("puhuri-indicator: ilmoituksen lähetys epäonnistui: %s"
                           % error, file=sys.stderr, flush=True)
+            # Snapshot precedes the conversation read: never acknowledge a
+            # message committed after this poll's notification snapshot.
+            if notice and posted and (cards or not enabled or unread == 0):
+                daemon.request("push.notice.ack", {
+                    "account": notice["account"], "sequence": notice["sequence"]})
             if indicator is not None:
                 indicator.update(unread, newest, conversations)
         except Exception as error:
