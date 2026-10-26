@@ -1,67 +1,99 @@
-# Puhuri 2 v1.2.0
+# Puhuri 2 — Ubuntu Touch XMPP messenger
 
-Puhuri 2 is an XMPP messenger for Ubuntu Touch (arm64). It supports private
-one-to-one chats, OMEMO encryption, offline message recovery through MAM,
-delivery receipts, unread indicators, pictures and voice messages. The
-interface is available in English and Finnish with three colour themes.
-Offline recovery depends on your XMPP server retaining messages.
+Puhuri 2 provides one-to-one chat, OMEMO encryption, offline/MAM recovery,
+delivery receipts, unread markers, pictures and voice messages. It has Finnish
+and English interfaces and three colour themes. Offline recovery depends on
+your XMPP server retaining messages.
 
-Background reception and notifications use two separate user services:
-`puhurid2.service` keeps the XMPP receiver running, and
-`puhuri2-indicator.service` provides notifications and the messaging menu.
-The installer installs the click application and both services, enables their
-automatic startup and checks their status. The services run unconfined with
-the logged-in user's access; the app keeps its click policy. No push bridge
-is required. Without the service add-on, the app receives messages on opening.
+**Install from a COMPUTER with an authorized ADB connection to the PHONE.**
+This release contains installer **1.2.1** for the unchanged Puhuri 2 **1.2.0**
+application and background services. It replaces the withdrawn phone-side
+installation instructions. This is a GitHub distribution, not an OpenStore release.
 
-## Install or remove
+## Requirements
 
-For Ubuntu Touch 24.04 on arm64. Close Puhuri 2 first. Open the phone's Terminal
-and run this command as the ordinary user, **without adding sudo**:
+- Computer: Linux, curl, Python 3.8+ and Android platform-tools (`adb`) in PATH.
+  Linux/Kubuntu is the tested computer platform.
+- Phone: arm64 Ubuntu Touch 24.04-2.x, Python 3.11+, click, sudo, systemd user
+  session and Python dbus/Gio/GLib. OnePlus Nord N100 is the tested device.
+- Enable developer/debugging access, connect by USB, approve the computer on
+  the phone and keep the ordinary phone user session available. `adb devices`
+  on the computer must list the phone as `device`. Close Puhuri 2 before installation.
 
-```sh
-bash -o pipefail -c 'curl -fsSL https://github.com/reijokin-sys/Puhuri2/releases/download/v1.2.0/install-puhuri-1.2.0.py | python3 -'
-```
+No curl, apt installation or root filesystem remount is needed on the phone.
+All installation payloads are downloaded to the computer and transferred by ADB.
 
-After the green heading, choose **1** to install/update, **2** to remove, or
-**0** to exit. The menu returns after each completed action. For installation,
-the installer downloads the matching click and background add-on, verifies
-their SHA-256 checksums, installs them and removes the temporary downloads.
-It may ask for installation confirmation or your phone password through sudo.
-An already matching click is kept, and the services are installed again.
-Existing accounts, messages, attachments and OMEMO keys are retained.
-Terminal access to Bash, curl, Python 3 and the normal user systemd/session bus
-is required. Old manually installed development services need separate migration.
+## Install
 
-## Remove
-
-Close Puhuri 2, run the same command and choose **2**. For an explicit removal
-command, you can also run:
+Run this entire block in the **COMPUTER terminal**, as your normal user:
 
 ```sh
-bash -o pipefail -c 'curl -fsSL https://github.com/reijokin-sys/Puhuri2/releases/download/v1.2.0/install-puhuri-1.2.0.py | python3 - remove'
+curl -fL --retry 3 -o puhuri2-1.2.1-adb-installer.zip https://github.com/reijokin-sys/Puhuri2/releases/download/v1.2.1/puhuri2-1.2.1-adb-installer.zip &&
+python3 -m zipfile -e puhuri2-1.2.1-adb-installer.zip . &&
+python3 puhuri2-1.2.1-adb-installer/install-puhuri-adb.py
 ```
 
-This stops/disables and removes the background services and their code, then
-unregisters the v1.2.0 click for the current user. A shared copy used by other
-users is retained. Account settings, messages, attachments and OMEMO
-keys stay on the phone. This is not a data purge. No backup/version archives
-are left on the phone. The version-pinned installer refuses to remove a newer
-click. If interrupted, rerun the matching command; automatic click rollback
-is not provided. Ubuntu Touch click hooks can print removal warnings even
-when removal succeeds; the installer verifies that the app is no longer
-registered for the current user.
+The first line downloads the complete ZIP with curl; Python extracts it and
+starts the installer on the computer. Use an empty working folder for the download.
+You can also download the ZIP from the [release page](https://github.com/reijokin-sys/Puhuri2/releases/tag/v1.2.1),
+extract it and run `python3 install-puhuri-adb.py` inside the extracted folder.
 
-## Validation and source
+Choose **1** to install/update, **2** to remove, or **0** to exit. The menu
+returns after each successful operation. If sudo asks for the phone password,
+type it directly in the computer terminal. The installer does not save it.
+After installation choose 0, open Puhuri 2 on the phone and sign in to your XMPP account.
 
-Message reception and notifications, including after reboot without opening
-the app, were confirmed on one development phone. A clean Ubuntu Touch test
-was not performed. The complete install/remove/reinstall/exit menu cycle was
-also tested on that development phone. Long sleep and network-loss checks remain open. The
-background services can increase battery use; behaviour during sleep depends
-on the device and network.
+To open the menu again from the same computer folder:
 
-Own source is licensed under AGPL-3.0-or-later. The click and add-on include
-`LICENSE`, `THIRD_PARTY_NOTICES.md` and `THIRD_PARTY_LICENSES.txt`.
-Build with `PUHURI_FEATURES=omemo tools/build-daemon.sh` and `tools/build.sh`;
-Qt 5 recorder build details are in `tools/build-qaudio-plugin.sh`.
+```sh
+python3 puhuri2-1.2.1-adb-installer/install-puhuri-adb.py
+```
+
+Choose 2 to uninstall. Normal removal keeps your account, messages, attachments
+and OMEMO keys. It removes this user's application registration and both services;
+shared copies belonging to other users are not automatically removed.
+
+## What gets installed
+
+The installer verifies pinned SHA-256 hashes, transfers the click and background
+bundle to a private temporary phone directory, verifies the transfer, installs
+Puhuri 2 1.2.0 and enables two automatically started user services:
+
+- `puhurid2.service`: persistent XMPP reception.
+- `puhuri2-indicator.service`: notifications and messaging-menu integration.
+
+Both services run unconfined as the normal phone user. The click UI alone receives
+messages when opened; closed-app reception requires these services. Services may
+increase battery use. Temporary installation files are removed and no backup
+archives are kept on the phone. If ADB disconnects, reconnect; the installer reports
+a temporary path if cleanup fails. Installation rollback is not automatic.
+
+Check dependencies without installing:
+
+```sh
+python3 puhuri2-1.2.1-adb-installer/install-puhuri-adb.py check
+```
+
+For multiple devices add `--serial SERIAL`. SHA256SUMS inside the ZIP covers
+its files; the release also includes the ZIP's checksum.
+
+## Test scope
+
+The user tested the computer/curl/ADB menu sequence **1 → 2 → 0** successfully:
+updating services for an already installed exact click, removing the application
+and services, then exiting. Independent operation-result, final-state and cleanup
+checks passed, including handling ADB terminal status 129. Standard click removal
+hooks can print warnings; failed postcondition checks remain errors.
+
+Fresh click installation through this new ADB launcher remains untested; this
+installer release is a **prerelease** until that path is tested. Earlier phone-helper
+install/remove/reinstall tests and incoming messages/notifications after reboot
+passed on the development phone. No clean Ubuntu Touch installation test was done;
+other devices, long sleep and network-loss recovery remain unverified.
+
+## Licence
+
+AGPL-3.0-or-later. The ZIP, click and service bundle include licence texts and
+third-party notices. See LICENSE, THIRD_PARTY_NOTICES.md and THIRD_PARTY_LICENSES.txt.
+
+[Suomenkielinen ohje](README.fi.md)
