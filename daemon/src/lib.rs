@@ -19,7 +19,6 @@ pub mod protocol;
 pub mod server;
 pub mod store;
 pub mod session_lock;
-pub mod push;
 
 /// The application id, used for the runtime directory and the data directory.
 pub const APP_ID: &str = "fi.reijo.puhuri2";

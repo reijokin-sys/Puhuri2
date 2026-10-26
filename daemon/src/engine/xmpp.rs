@@ -54,7 +54,7 @@ use xmpp_parsers::message::{Lang, Message as ParsedMessage, MessageType};
 use xmpp_parsers::ns;
 use xmpp_parsers::oob::Oob;
 use xmpp_parsers::presence::{Presence, Type as PresenceType};
-use xmpp_parsers::push::{Disable as PushDisable, Enable as PushEnable};
+use xmpp_parsers::push::Disable as PushDisable;
 use xmpp_parsers::receipts::{Received, Request};
 use xmpp_parsers::roster::Roster;
 #[cfg(feature = "omemo")]
@@ -80,7 +80,6 @@ enum Command {
         id: String,
     },
     SendTyping { to: BareJid, typing: bool },
-    SendReceipt { to: BareJid, id: String },
     /// XEP-0363: upload the file and send a message that points at it.
     /// `id` is the message row: it goes on the stanza (so XEP-0184's receipt
     /// finds the row again) and names the bubble the upload's progress
@@ -91,7 +90,6 @@ enum Command {
     },
     Disconnect,
     /// XEP-0357: tell the server about the push service (or take it back).
-    EnablePush { settings: PushSettings },
     DisablePush { settings: Option<PushSettings> },
     /// End this session and open a new one at once - used when a setting that
     /// changes how the session behaves (the polling mode) was switched.
@@ -818,6 +816,7 @@ fn receive_omemo_inbox_direction(
                     attachment: None,
                 };
                 if let Some((account,_))=inbox {Store::record_inbox_notice_in(connection,account,&placeholder,unread)?;}
+                if let Some((account,id))=inbox { Store::queue_inbox_receipt_in(connection,account,id)?; }
                 Store::record_downloading_in(connection, &placeholder, name, &url, unread)?;
                 committed_downloads.push((sender.clone(), url, text, Some(row)));
                 return Ok(OmemoOutcome::Download);
@@ -837,6 +836,7 @@ fn receive_omemo_inbox_direction(
                 attachment: None,
             };
             if let Some((account,_))=inbox {Store::record_inbox_notice_in(connection,account,&message,unread)?;}
+            if let Some((account,id))=inbox { Store::queue_inbox_receipt_in(connection,account,id)?; }
             Store::record_in(connection, &message, name, unread, server_id.as_deref())?;
             Ok(OmemoOutcome::Stored(message))
         },
@@ -915,6 +915,7 @@ impl Engine for XmppEngine {
     fn connect(&self, jid: &str, password: &str) -> EngineResult<()> {
         let bare = BareJid::from_str(jid.trim())
             .map_err(|error| format!("tunnus ei kelpaa (muoto nimi@palvelin): {error}"))?;
+        self.store.ensure_receipt_epoch(bare.as_str(), now())?;
         // A second login replaces the first one - but it must not forget the
         // saved account. Only a logout does that. This used to go through the
         // logout path, so any login attempt (a slipped JID, a wrong password)
@@ -1226,24 +1227,10 @@ impl Engine for XmppEngine {
     fn mark_read(&self, thread: &str) -> EngineResult<()> {
         let account = self.status().jid.unwrap_or_default();
         if self.store.privacy_admission(&account,thread) != Ok(crate::store::Admission::Allow) { return Ok(()); }
-        // Tell the other side that their newest message was read (XEP-0184),
-        // if they asked for a receipt.
-        let newest = self.store.messages(thread, 5);
-        let newest_incoming = newest
-            .iter()
-            .rev()
-            .find(|message| !message.outgoing)
-            .cloned();
-        let newest_ts = newest.last().map(|message| message.ts).unwrap_or(0);
-        let _ = self.store.mark_read(thread, newest_ts);
-        if let Some(message) = newest_incoming {
-            if let Ok(to) = BareJid::from_str(thread) {
-                let _ = self.command(Command::SendReceipt {
-                    to,
-                    id: message.id,
-                });
-            }
-        }
+        // Reading changes only the local unread state. Delivery receipts
+        // belong to first durable reception and use the sender's stanza id.
+        let newest_ts = self.store.messages(thread, 5).last().map(|m|m.ts).unwrap_or(0);
+        self.store.mark_read(thread, newest_ts)?;
         Ok(())
     }
 
@@ -1441,49 +1428,8 @@ impl Engine for XmppEngine {
     /// `module` says which push backend the token belongs to (`ubports` or
     /// `unifiedpush`).
     fn enable_push(&self, jid: &str, node: &str, module: &str) -> EngineResult<PushSettings> {
-        let service = BareJid::from_str(jid.trim())
-            .map_err(|_| format!("push-palvelun osoite ei kelpaa: {jid}"))?;
-        let node = node.trim();
-        let module = if module.trim().is_empty() {
-            "ubports"
-        } else {
-            module.trim()
-        };
-        let settings = match self.store.push_settings() {
-            Some(existing)
-                if existing.jid == service.to_string()
-                    && existing.node == node
-                    && existing.module == module =>
-            {
-                // The same service again: keep the secret it already knows.
-                if existing.secret.is_empty() {
-                    PushSettings {
-                        secret: super::new_push_secret(),
-                        ..existing
-                    }
-                } else {
-                    existing
-                }
-            }
-            _ => PushSettings {
-                jid: service.to_string(),
-                node: node.to_string(),
-                secret: super::new_push_secret(),
-                module: module.to_string(),
-            },
-        };
-        if let Some(previous) = self.store.push_settings() {
-            if previous.jid != settings.jid || previous.node != settings.node || previous.module != settings.module {
-                let _ = self.command(Command::DisablePush { settings: Some(previous) });
-            }
-        }
-        self.store.set_setting("push.confirmed","false")?;
-        self.store.set_push_settings(Some(&settings))?;
-        // If a session is open, tell it now; otherwise the login does it.
-        let _ = self.command(Command::EnablePush {
-            settings: settings.clone(),
-        });
-        Ok(settings)
+        let _ = (jid, node, module);
+        Err("Push-silta on poistettu käytöstä".into())
     }
 
     fn disable_push(&self) -> EngineResult<()> {
@@ -1952,7 +1898,14 @@ async fn connection(
     // journal into noise - but the limitation is not hidden either.
     #[cfg(feature = "omemo")]
     let mut warned_no_stanza_id = false;
+    let mut last_receipt = 0;
     while !stop {
+        let receipt_pending = if online {
+            match flush_delivery_receipts(&mut client,&jid,&store,&mut last_receipt).await {
+                Ok(pending)=>pending,
+                Err(message)=>{shared.push(EngineEvent::Error{code:"store".into(),message});end=SessionEnd::Wait(5);break;}
+            }
+        } else { false };
         if online {
             if !short_lived {
                 if let Err(message)=upload_runtime::resume(&mut client,&jid,&shared,&store,&mut uploads,&mut upload_counter,#[cfg(feature="omemo")] &omemo).await {
@@ -1978,9 +1931,9 @@ async fn connection(
                 }
             }else{false};
             #[cfg(feature = "omemo")]
-            let fetch_pending = !omemo_fetches.is_empty() || blocking.needs_tick() || upload_pending;
+            let fetch_pending = !omemo_fetches.is_empty() || blocking.needs_tick() || upload_pending || receipt_pending;
             #[cfg(not(feature = "omemo"))]
-            let fetch_pending = blocking.needs_tick() || upload_pending;
+            let fetch_pending = blocking.needs_tick() || upload_pending || receipt_pending;
             let event = tokio::select! {
                 _=tokio::time::sleep_until(tokio::time::Instant::from_std(helper_deadline.unwrap_or_else(||std::time::Instant::now()+std::time::Duration::from_secs(86400)))), if helper_deadline.is_some()=>{
                     end=SessionEnd::Stop;stop=true;continue;
@@ -2094,9 +2047,6 @@ async fn connection(
                         match other {
                             Command::PrivacyChanged => {
                                 if online { blocking.tick(&mut client, &jid, &store, &shared).await; }
-                            }
-                            Command::EnablePush { settings } => {
-                                send_push_enable(&mut client, &jid, &settings).await;
                             }
                             Command::DisablePush { settings } => {
                                 send_push_disable(&mut client, &jid, settings.as_ref()).await;
@@ -2322,16 +2272,11 @@ async fn connection(
                     );
                     let _ = client.send_stanza(roster.into()).await;
                     step("yhteystiedot");
-                    // XEP-0357: if this account uses a push service, tell
-                    // the server again at every login - the registration
-                    // lives on the server, and this keeps it in step with
-                    // the settings on the phone. The node is the device's
-                    // push token, so the server pushes to this phone.
-                    if let Some(mut settings) = store.push_settings() {
-                        if let Some(token) = store.push_token() {
-                            settings.node = token;
-                        }
-                        send_push_enable(&mut client, &jid, &settings).await;
+                    // One-way upgrade cleanup. Never enable a saved bridge.
+                    // Keep the old route until the server acknowledges disable,
+                    // so a disconnect retries it at the next foreground login.
+                    if let Some(settings) = store.push_settings() {
+                        send_push_disable(&mut client, &jid, Some(&settings)).await;
                     }
                     }
                     // Polling: give the login work a moment (the archive
@@ -2366,8 +2311,7 @@ async fn connection(
                                     }
                                 }
                             }
-                            let reply=inbox::message(raw,&row,&jid,&store,&shared,#[cfg(feature="omemo")] omemo.as_ref(),&mut downloads)?;
-                            if let Some(reply)=reply {receipts_to_send.push(reply);}
+                            inbox::message(raw,&row,&jid,&store,&shared,#[cfg(feature="omemo")] omemo.as_ref(),&mut downloads)?;
                             Ok(())
                         }.await;
                         if let Err(message)=handled {shared.push(EngineEvent::Error {code:"store".into(),message});end=SessionEnd::Wait(5);stop=true;}
@@ -2891,36 +2835,6 @@ fn install_extra_ca(store: &Store) {
 /// client is not connected. The form carries our secret; the server passes it
 /// to the push service with every notification, which is how the service
 /// tells ours from somebody else's.
-async fn send_push_enable(client: &mut Client, own: &BareJid, settings: &PushSettings) {
-    use xmpp_parsers::data_forms::{DataForm, DataFormType, Field};
-
-    let Ok(service) = BareJid::from_str(&settings.jid) else {
-        return;
-    };
-    let fields = if settings.secret.is_empty() {
-        vec![Field::text_single("pushModule", &settings.module)]
-    } else {
-        vec![
-            Field::text_single("pushModule", &settings.module),
-            Field::text_single("secret", &settings.secret),
-        ]
-    };
-    let form = DataForm::new(
-        DataFormType::Submit,
-        "http://jabber.org/protocol/pubsub#publish-options",
-        fields,
-    );
-    let enable = PushEnable {
-        jid: service,
-        node: (!settings.node.is_empty()).then(|| settings.node.clone()),
-        form: Some(form),
-    };
-    let iq = Iq::from_set("push-enable", enable)
-        .with_to(xmpp_parsers::jid::Jid::from(own.clone()));
-    let _ = client.send_stanza(iq.into()).await;
-}
-
-/// The other direction: stop the server from pushing to that service.
 async fn send_push_disable(
     client: &mut Client,
     own: &BareJid,
@@ -3061,6 +2975,41 @@ fn file_message_payloads(url: &str) -> Vec<xmpp_parsers::minidom::Element> {
     ]
 }
 
+/// Send durable first-reception acknowledgements, independently of opening a
+/// conversation. A disconnect retries unacknowledged jobs on the next session.
+async fn flush_delivery_receipts(
+    client: &mut Client,
+    own: &BareJid,
+    store: &Arc<Store>,
+    last_receipt: &mut i64,
+) -> Result<bool, String> {
+    for receipt in store.pending_delivery_receipts_after(own.as_str(), *last_receipt)? {
+        if store.privacy_admission(own.as_str(), &receipt.peer)? != crate::store::Admission::Allow {
+            store.finish_delivery_receipt(own.as_str(), receipt.id)?;
+            *last_receipt = receipt.id;
+            continue;
+        }
+        let peer = BareJid::from_str(&receipt.peer).map_err(|_| "Kuittauksen vastaanottaja ei kelpaa")?;
+        let message = chat_stanza(peer.into(), Some(&format!("delivery-{}",receipt.id)), "", vec![Received{id:receipt.message_id}.into()]);
+        match client.send_stanza(message.into()).await {
+            Ok(mut token) => {
+                *last_receipt = receipt.id;
+                let store=store.clone();
+                let account=own.to_string();
+                tokio::spawn(async move {
+                    if matches!(token.wait_for(StanzaStage::Acked).await, Some(tokio_xmpp::stanzastream::StanzaState::Acked {..})) {
+                        if let Err(error)=store.finish_delivery_receipt(&account,receipt.id) {
+                            eprintln!("puhurid: vastaanottokuittauksen tallennus epäonnistui: {error}");
+                        }
+                    }
+                });
+            }
+            Err(_) => break,
+        }
+    }
+    Ok(!store.pending_delivery_receipts_after(own.as_str(), *last_receipt)?.is_empty())
+}
+
 /// Send one chat message: an optional body and any number of payloads
 /// (a receipt, a chat state, an out-of-band address).
 async fn send_chat<C: ChatSink>(
@@ -3085,7 +3034,7 @@ async fn handle_command(
     #[cfg(not(feature = "omemo"))]
     let _ = store;
     if let Some(peer) = match &command {
-        Command::SendText { to,.. } | Command::SendTyping { to,.. } | Command::SendReceipt { to,.. } | Command::SendFile { to,.. } => Some(to),
+        Command::SendText { to,.. } | Command::SendTyping { to,.. } | Command::SendFile { to,.. } => Some(to),
         _ => None,
     } {
         let account = shared.status.lock().unwrap().jid.clone().unwrap_or_default();
@@ -3105,9 +3054,7 @@ async fn handle_command(
             };
             send_chat(client, to.into(), None, "", vec![state.into()]).await;
         }
-        Command::SendReceipt { to, id } => {
-            send_chat(client, to.into(), None, "", vec![Received { id }.into()]).await;
-        }
+
         Command::SendFile { id, .. } => {
             let account=shared.status.lock().unwrap().jid.clone().unwrap_or_default();
             if let Err(message)=upload_runtime::request(client,&account,&id,shared,store,uploads,upload_counter).await {
@@ -3122,7 +3069,7 @@ async fn handle_command(
         // Also ended in the session loop (the push wake).
         Command::Wake => {}
         // Answered in the session loop, which has our own JID.
-        Command::EnablePush { .. } | Command::DisablePush { .. } => {}
+        Command::DisablePush { .. } => {}
         // Started (and answered) in the session loop: it needs the session
         // state the fetch lives in.
         #[cfg(feature = "omemo")]
@@ -3161,7 +3108,13 @@ async fn handle_iq(
     let (id, payload) = match iq {
         Iq::Result { id, payload, .. } => (id.clone(), payload.clone()),
         Iq::Error { id, .. } => {
-            if id == "push-enable" || id == "push-disable" {
+            if id == "push-disable" {
+                // Keep the legacy route for a later retry; never re-enable it.
+                // A retired notification service must not block normal chat.
+                let _ = store.set_setting("push.retirement", "pending");
+                return;
+            }
+            if id == "push-enable" {
                 let _=store.set_setting("push.confirmed","false");
                 // The server refused the push setting: the service JID is
                 // unknown, not allowed, or the node is wrong. Say so instead
@@ -3188,9 +3141,10 @@ async fn handle_iq(
         }
         _ => return,
     };
-    if id == "push-enable" && store.push_settings().is_some() {
-        let _=store.set_setting("push.confirmed","true");
-        shared.push(EngineEvent::StateChanged);
+    if id == "push-disable" {
+        let _ = store.set_setting("push.retirement", "confirmed");
+        let _ = store.set_push_settings(None);
+        let _ = store.set_setting("push.confirmed", "false");
     }
     let Some(payload) = payload else {
         if id.starts_with("upload-slot-") {

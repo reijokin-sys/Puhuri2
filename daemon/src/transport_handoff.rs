@@ -564,12 +564,12 @@ mod tests {
             attachment: None,
         };
         assert!(s
-            .record_inbox_message("other@example.test", id, &message, "Fixture", true, None)
+            .record_inbox_message("other@example.test", id, &message, "Fixture", true, None, false)
             .is_err());
         assert!(s.messages("sender@test", 100).is_empty());
         s.shared_db().lock().execute_batch("CREATE TRIGGER refuse_plain_finish BEFORE DELETE ON xmpp_inbox BEGIN SELECT RAISE(FAIL,'fixture'); END;").unwrap();
         assert!(s
-            .record_inbox_message("a@example.test", id, &message, "Fixture", true, None)
+            .record_inbox_message("a@example.test", id, &message, "Fixture", true, None, false)
             .is_err());
         assert!(s.messages("sender@test", 100).is_empty());
         assert_eq!(s.pending_stanzas("a@example.test", 100).unwrap().len(), 1);
@@ -577,7 +577,7 @@ mod tests {
             .lock()
             .execute_batch("DROP TRIGGER refuse_plain_finish")
             .unwrap();
-        s.record_inbox_message("a@example.test", id, &message, "Fixture", true, None)
+        s.record_inbox_message("a@example.test", id, &message, "Fixture", true, None, false)
             .unwrap();
         assert!(s.pending_stanzas("a@example.test", 100).unwrap().is_empty());
         assert_eq!(s.messages("sender@test", 100).len(), 1);

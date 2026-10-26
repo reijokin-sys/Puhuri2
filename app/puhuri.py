@@ -49,7 +49,6 @@ def ensure_confined_helpers():
     """
     for name, arguments in (
         ("puhurid", ["--engine", "xmpp"]),
-        ("puhuri-indicator", ["--notifications-only"]),
     ):
         child = _children.get(name)
         if child is not None and child.poll() is None:
@@ -586,35 +585,9 @@ def poll_set(seconds):
     return _backend.request("poll.set", {"seconds": seconds})
 
 
-def push_get():
-    """The push state: the device token, the bridge JID and the settings."""
-    return _backend.request("push.get")
-
-
-def push_register(token, module=None):
-    """Refresh the token over private RPC, preserving saved route and opt-in."""
-    args = {"token": token}
-    if module is not None:
-        args["module"] = module
-    return _backend.request("push.register", args)
-
-
-def background_setup(service="ubpush.agnos.is", module="puhuri2"):
-    """Explicit opt-in to a user-selected bridge/module and server archive."""
-    return _backend.request("background.setup", {"service": service, "module": module})
-
-
-def push_set_enabled(enabled):
-    return _backend.request("push.setEnabled", {"enabled": bool(enabled)})
-
-
 def lifecycle(active):
     return _backend.request("lifecycle.active", {"active": bool(active)})
 
-
-def push_wake():
-    """Wake the XMPP session after the app consumes a queued push marker."""
-    return _backend.request("push.wake")
 
 
 def privacy_get():

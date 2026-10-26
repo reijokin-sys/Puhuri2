@@ -804,7 +804,7 @@ mod tests {
         ] {
             store.lock().execute_batch(&format!("CREATE TRIGGER {trigger} BEFORE {operation} ON {table} BEGIN SELECT RAISE(FAIL,'fixture'); END;")).unwrap();
             assert!(store
-                .record_inbox_message("me@test", id, &saved_message(), "Fixture", true, None)
+                .record_inbox_message("me@test", id, &saved_message(), "Fixture", true, None, false)
                 .is_err());
             assert!(store.messages("peer@test", 10).is_empty());
             assert!(store.conversations().is_empty());
@@ -817,7 +817,7 @@ mod tests {
                 .unwrap();
         }
         store
-            .record_inbox_message("me@test", id, &saved_message(), "Fixture", true, None)
+            .record_inbox_message("me@test", id, &saved_message(), "Fixture", true, None, false)
             .unwrap();
         assert_eq!(store.messages("peer@test", 10).len(), 1);
         assert_eq!(store.conversations()[0].unread, 1);
@@ -953,7 +953,7 @@ mod tests {
             let store = Store::open(std::path::Path::new(&path)).unwrap();
             let id = store.pending_stanzas("me@test", 1).unwrap()[0].id;
             store
-                .record_inbox_message("me@test", id, &saved_message(), "Fixture", true, None)
+                .record_inbox_message("me@test", id, &saved_message(), "Fixture", true, None, false)
                 .unwrap();
             panic!("MAM completion failpoint did not abort");
         }

@@ -3,8 +3,7 @@
         "networking",
         "audio",
         "microphone",
-        "content_exchange",
-        "push-notification-client"
+        "content_exchange"
     ],
     "policy_version": 2404.2
 }

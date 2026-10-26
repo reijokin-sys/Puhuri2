@@ -131,7 +131,7 @@ mod tests {
         };
         store.lock().execute_batch("CREATE TRIGGER refuse_notice_finish BEFORE DELETE ON xmpp_inbox BEGIN SELECT RAISE(FAIL,'fixture'); END;").unwrap();
         assert!(store
-            .record_inbox_message("me@test", row, &message, "Fixture", true, None)
+            .record_inbox_message("me@test", row, &message, "Fixture", true, None, false)
             .is_err());
         assert_eq!(store.push_notice_state("me@test").unwrap(), (0, 0));
         store
@@ -139,7 +139,7 @@ mod tests {
             .execute_batch("DROP TRIGGER refuse_notice_finish")
             .unwrap();
         store
-            .record_inbox_message("me@test", row, &message, "Fixture", true, None)
+            .record_inbox_message("me@test", row, &message, "Fixture", true, None, false)
             .unwrap();
         drop(store);
         let store = Store::open(&path).unwrap();

@@ -45,6 +45,9 @@ MainView {
 
     property bool pythonReady: false
     property bool busy: false
+    // Ignore late snapshots taken before a newer refresh/read operation.
+    property int conversationRefreshSerial: 0
+    property int messageRefreshSerial: 0
     property bool connected: false
     /// True when the service has a saved account. In the polling mode the
     /// connection is shut most of the time, so `connected` is usually false
@@ -56,23 +59,6 @@ MainView {
     property var privacy: ({ mode: "requests", contacts: [], requests: [] })
     property bool privacyBusy: false
     property bool privacyLoading: false
-    /// Battery-saving polling: null keeps the connection open (default); a
-    /// number means "open it only now and then" and the messages may be late.
-    property var pollSeconds: null
-    /// Push notifications (UBports/Lomiri). `pushAvailable` is false when the
-    /// push module is not there, `pushActive` when the device token is
-    /// registered with the server through the bridge, and `pushService` is
-    /// the bridge's JID (empty when none has been configured).
-    property string pushToken: ""
-    /// Lomiri's current token, kept only in this running process until an
-    /// account exists. It must never be persisted while logged out.
-    property string devicePushToken: ""
-    property bool pushActive: false
-    property bool pushAvailable: false
-    property string pushService: ""
-    property string pushModule: "puhuri2"
-    property bool pushEnabled: false
-    property bool pendingPushRefresh: false
     property string currentThread: ""
     property string currentName: ""
     /// Which conversations send encrypted: thread -> true/false. An explicit
@@ -150,8 +136,6 @@ MainView {
             // The session ended: the first page is where the account is
             // entered, and the reason is worth saying.
             root.showLogin(root.device.error || "")
-        if ((root.connected || root.hasAccount) && root.devicePushToken.length > 0)
-            root.registerPushToken(root.devicePushToken)
     }
 
     function applyError(result) {
@@ -213,8 +197,11 @@ MainView {
         if (!root.pythonReady)
             return
         root.refreshPrivacy()
+        var serial = ++root.conversationRefreshSerial
         root.busy = true
         py.call("puhuri.conversations", [], function (result) {
+            if (serial !== root.conversationRefreshSerial)
+                return
             root.busy = false
             if (root.applyError(result))
                 return
@@ -278,11 +265,14 @@ MainView {
     function openConversation(thread, name, encryptIfNew) {
         if (!root.pythonReady)
             return
+        ++root.messageRefreshSerial
         root.currentThread = thread
         root.currentName = name
         root.busy = true
         var hasChoice = Object.prototype.hasOwnProperty.call(root.encryptedThreads, thread)
         py.call("puhuri.open_conversation", [thread, 100, hasChoice], function (result) {
+            if (thread !== root.currentThread)
+                return
             root.busy = false
             if (root.applyError(result))
                 return
@@ -326,7 +316,7 @@ MainView {
                                        + tr("error.unlockToSend"))
                 })
             }
-            py.call("puhuri.mark_read", [thread, ""], function () {})
+            root.markVisibleConversationRead(thread)
         })
     }
 
@@ -713,15 +703,35 @@ MainView {
         })
     }
 
-    function refreshMessages() {
-        if (!root.currentThread)
+    function markVisibleConversationRead(thread) {
+        if (!root.pythonReady || !root.conversationPageItem
+                || thread !== root.currentThread
+                || pageStack.currentPage !== root.conversationPageItem
+                || Qt.application.state !== Qt.ApplicationActive)
             return
-        py.call("puhuri.messages", [root.currentThread, 100], function (result) {
+        py.call("puhuri.mark_read", [thread, ""], function (result) {
+            if (!result || root.applyError(result))
+                return
+            // Refresh only after the read marker has been persisted. An
+            // earlier conversation snapshot must not restore its old badge.
+            root.refreshConversations()
+        })
+    }
+
+    function refreshMessages() {
+        if (!root.pythonReady || !root.currentThread)
+            return
+        var thread = root.currentThread
+        var serial = ++root.messageRefreshSerial
+        py.call("puhuri.messages", [thread, 100], function (result) {
+            if (thread !== root.currentThread || serial !== root.messageRefreshSerial)
+                return
             if (root.applyError(result))
                 return
             // Only the differences: a message that arrives does not throw the
             // reader's place away (docs/CHANGELOG.md 2026-10-14).
             Messages.apply(messageModel, result.result || [])
+            root.markVisibleConversationRead(thread)
         })
     }
 
@@ -788,10 +798,6 @@ MainView {
         py.call("puhuri.logout", [], function (result) {
             if (result && result.ok === false)
                 root.appLog("logout failed")
-            // The service clears the push registration as part of logout;
-            // keep no stale copy in the running interface either.
-            root.pushToken = ""
-            root.pushActive = false
             root.resetToLogin()
         })
     }
@@ -814,13 +820,6 @@ MainView {
                 return
 
             root.settings = {}
-            root.pollSeconds = null
-            root.pushToken = ""
-            root.devicePushToken = ""
-            root.pushService = ""
-            root.pushModule = "puhuri2"
-            root.pushEnabled = false
-            root.pushActive = false
             root.language = "en"
             root.themeKey = "sininen"
             root.applyTheme("sininen")
@@ -903,71 +902,7 @@ MainView {
             if (result && result.ok === true)
                 root.settings = result.result || ({})
         })
-        py.call("puhuri.poll_get", [], function (result) {
-            if (result && result.ok === true && result.result)
-                root.pollSeconds = result.result.seconds
-        })
-        root.refreshPush()
         root.refreshPrivacy()
-    }
-
-    function refreshPush() {
-        py.call("puhuri.push_get", [], function (result) {
-            if (!result || result.ok !== true || !result.result)
-                return
-            var state = result.result
-            if (state.token)
-                root.pushToken = state.token
-            root.pushService = state.service || ""
-            root.pushModule = state.module || "puhuri2"
-            root.pushEnabled = state.enabled === true
-            root.pushActive = state.active === true
-        })
-    }
-
-    /// The phone gave us a token (at start-up or when it changed): hand it to
-    /// the service, which registers the device with the server through the
-    /// push bridge. When no bridge is configured the service keeps the token
-    /// and says so.
-    function registerPushToken(token) {
-        if (!token || token.length === 0)
-            return
-        root.devicePushToken = token
-        // A delayed token signal after “delete all local data” must not
-        // recreate a device identifier while there is no account.
-        if (!root.connected && !root.hasAccount)
-            return
-        root.pushToken = token
-        py.call("puhuri.push_register", [token], function (result) {
-            if (!result || result.ok !== true || !result.result)
-                return
-            var state = result.result
-            if (state.service)
-                root.pushService = state.service
-            root.pushActive = state.active === true
-            if (state.reason === "no-push-service")
-                console.log("Puhuri 2: push-siltaa ei ole asetettu; pollaus on vara")
-        })
-    }
-
-    /// PushClient queues messages while Puhuri 2 is not running. Once the UI
-    /// and its service connection are ready, use the marker to fetch XMPP
-    /// messages; the push payload itself never contains chat content.
-    function refreshAfterPush(messages) {
-        if (!messages || messages.length === 0)
-            return
-        if (!root.pythonReady) {
-            root.pendingPushRefresh = true
-            return
-        }
-        root.pendingPushRefresh = false
-        py.call("puhuri.push_wake", [], function (result) {
-            if (!result || result.ok !== true)
-                return
-            root.refreshConversations()
-            if (root.currentThread.length > 0)
-                root.refreshMessages()
-        })
     }
 
     /// The theme must be the user's own **before the first page is drawn**,
@@ -1011,8 +946,6 @@ MainView {
             addImportPath(Qt.resolvedUrl("../"))
             importModule("puhuri", function () {
                 root.pythonReady = true
-                if (root.pendingPushRefresh)
-                    root.refreshAfterPush(["puhuri.new-message"])
                 py.call("puhuri.status", [], function (result) {
                     root.applyStatus(result)
                     if (root.connected)
@@ -1060,7 +993,6 @@ MainView {
                         // MAM imports ordinary archived messages as a state
                         // change, not as a live message notification.
                         || event === "state.changed") {
-                    root.refreshPush()
                     root.refreshConversations()
                     // The open conversation has to be read again as well.
                     // (`conversationPage` is the *Component*; the page on
@@ -1073,8 +1005,6 @@ MainView {
                     console.log("Puhuri 2: yhteys auki")
                     root.connected = true
                     root.hasAccount = true
-                    if (root.devicePushToken.length > 0)
-                        root.registerPushToken(root.devicePushToken)
                     // Replace the whole stack: the login page must not come
                     // back once there is an account to look at.
                     if (!root.conversationsPageItem)
@@ -1158,8 +1088,16 @@ MainView {
     Connections {
         target: Qt.application
         onStateChanged: {
-            if (root.pythonReady)
-                py.call("puhuri.lifecycle", [Qt.application.state === Qt.ApplicationActive], function () {})
+            if (root.pythonReady) {
+                var active = Qt.application.state === Qt.ApplicationActive
+                py.call("puhuri.lifecycle", [active], function (result) {
+                    if (!result || root.applyError(result))
+                        return
+                    if (active && Qt.application.state === Qt.ApplicationActive
+                            && pageStack.currentPage === root.conversationPageItem)
+                        root.refreshMessages()
+                })
+            }
         }
     }
 
@@ -1167,41 +1105,6 @@ MainView {
         id: pageStack
         anchors.fill: parent
         Component.onCompleted: push(root.connected ? conversationsPage : loginPage)
-    }
-
-    /// The phone's push service. A Loader, because the module exists only on
-    /// the phone: when it cannot be loaded, push is simply unavailable and the
-    /// polling mode is the answer.
-    Loader {
-        id: pushLoader
-        source: "Push.qml"
-        onLoaded: {
-            if (!item)
-                return
-            root.pushAvailable = true
-            root.registerPushToken(item.token)
-        }
-        onStatusChanged: {
-            if (status === Loader.Error) {
-                console.log("Puhuri 2: push-moduulia ei ole; käytetään pollausta")
-            }
-        }
-
-        Connections {
-            target: pushLoader.item
-            ignoreUnknownSignals: true
-            // The explicit `function` form: the implicit `onFoo:` properties
-            // are deprecated in Connections (the QML check says so).
-            function onPushTokenChanged(token) {
-                root.registerPushToken(token)
-            }
-            function onPushError(message) {
-                root.appLog("push: " + message)
-            }
-            function onPushMessagesAvailable(messages) {
-                root.refreshAfterPush(messages)
-            }
-        }
     }
 
     Component {
@@ -1343,29 +1246,6 @@ MainView {
             onPrivacyRequested: root.showPrivacy()
             language: root.language
             themeKey: root.themeKey
-            pollSeconds: root.pollSeconds
-            pushActive: root.pushActive
-            pushAvailable: root.pushAvailable
-            pushService: root.pushService
-            pushModule: root.pushModule
-            pushEnabled: root.pushEnabled
-            onBackgroundSetupRequested: {
-                py.call("puhuri.background_setup", [service, module], function (result) {
-                    if (root.applyError(result)) return
-                    root.refreshPush()
-                })
-            }
-            onPushEnabledRequested: {
-                py.call("puhuri.push_set_enabled", [enabled], function (result) {
-                    if (root.applyError(result)) return
-                    root.refreshPush()
-                })
-            }
-            onNotificationsChanged: py.call("puhuri.settings_set", [enabled], function () {})
-            onPollRequested: py.call("puhuri.poll_set", [seconds], function (result) {
-                if (result && result.ok === true && result.result)
-                    root.pollSeconds = result.result.seconds
-            })
             onLanguageRequested: root.setLanguage(code)
             onThemeRequested: root.setTheme(key)
             onLogoutRequested: root.logout()

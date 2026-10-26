@@ -154,6 +154,7 @@ VirtualHost "{DOMAIN}"
         for body in sent:
             call(b, "message.send", thread=aj, text=body)
         time.sleep(2)
+        assert not any(m.get("delivered") for m in call(b,"messages.list",thread=aj) if m["text"] in sent), "offline receiver acknowledged prematurely"
         def restart_alpha():
             log = (work / "alpha-restart.log").open("a")
             logs.append(log)
@@ -174,6 +175,8 @@ VirtualHost "{DOMAIN}"
         assert len(call(a, "conversations.indicator")) == 1, "same-second messages duplicated the conversation"
         assert results["indicator_after_recovery"]["unread"] == 3,"archive replay counted an old message as new: "+str(results)
         assert len(messages)==4,"archive replay duplicated the online baseline"
+        wait_for(lambda: sum(m["text"] in sent and m.get("delivered",False) for m in call(b,"messages.list",thread=aj)) == len(sent), "sender did not receive plaintext offline receipts before markRead")
+        results["plaintext_offline_receipts"]={"acknowledged":len(sent),"before_mark_read":True}
         # Reopening once more must recover anything skipped before advancing
         # the MAM cursor. This detects a persistent gap rather than UI delay.
         restarted.terminate()
@@ -217,37 +220,33 @@ VirtualHost "{DOMAIN}"
         wait_for(lambda: sum(m["text"] in encrypted_sent for m in call(a,"messages.list",thread=bj)) == len(encrypted_sent), "encrypted offline recovery incomplete")
         encrypted_recovered = [m["text"] for m in call(a,"messages.list",thread=bj) if m["text"] in encrypted_sent]
         results["encrypted_offline_recovery"] = {"sent":len(encrypted_sent), "received":len(encrypted_recovered), "missing_fixture_names":sorted(set(encrypted_sent)-set(encrypted_recovered))}
-        # The real push hook uses the same engine and private database, under
-        # a hard time budget. No UI/daemon process is present during the fetch.
-        call(a, "thread.markRead", thread=bj)
-        call(a, "push.enable", jid="push."+DOMAIN, node="public-test-token", module="ubports")
-        # Stop the last receiver process (restart_alpha appended it).
-        processes[-1].terminate()
-        processes[-1].wait(timeout=5)
-        time.sleep(1)
-        push_sent=["push-encrypted-one","push-encrypted-two","push-encrypted-three"]
-        for body in push_sent:
-            call(b,"message.sendEncrypted",thread=aj,text=body)
-        time.sleep(2) # a real push is emitted after server acceptance
-        source=work/"push-in.json";output=work/"push-out.json"
-        source.write_text(json.dumps({"message":{"type":"xmpp-wake"}}))
-        helper_env=dict(env,XDG_DATA_HOME=str(work/"alpha"))
-        # XDG_DATA_HOME follows the app-id rule in default_data_dir(). Keep the
-        # fixture in the exact directory the real hook would resolve.
-        hook_data=work/"hook"/"fi.reijo.puhuri2"
-        hook_data.parent.mkdir()
-        hook_data.symlink_to(work/"alpha",target_is_directory=True)
-        helper_env["XDG_DATA_HOME"]=str(hook_data.parent)
-        result=subprocess.run([str(DAEMON),"--push-helper",str(source),str(output)],env=helper_env,capture_output=True,text=True,timeout=5)
-        assert result.returncode==0,result.stderr
-        notification=json.loads(output.read_text())
-        assert "notification" in notification, "push hook did not notify actual messages: "+result.stderr
-        assert all(body not in output.read_text() for body in push_sent),"push leaked message content"
+        wait_for(lambda: sum(m["text"] in encrypted_sent and m.get("delivered",False) for m in call(b,"messages.list",thread=aj)) == len(encrypted_sent), "sender did not receive OMEMO offline receipts before markRead")
+        results["encrypted_offline_receipts"]={"acknowledged":len(encrypted_sent),"before_mark_read":True}
+        def receipt_rows():
+            with sqlite3.connect(work/"alpha"/"puhuri.db") as db:
+                return db.execute("SELECT peer,message_id FROM delivery_receipts WHERE account=? ORDER BY id",(aj,)).fetchall()
+        known_receipts=receipt_rows()
+        call(a,"thread.markRead",thread=bj)
+        call(a,"thread.markRead",thread=bj)
+        assert receipt_rows()==known_receipts, "reading a conversation created delivery receipts"
+        processes[-1].terminate();processes[-1].wait(timeout=5)
         restart_alpha()
-        wait_for(lambda: sum(m["text"] in push_sent for m in call(a,"messages.list",thread=bj)) == len(push_sent), "push-hook offline recovery incomplete")
-        push_recovered=[m["text"] for m in call(a,"messages.list",thread=bj) if m["text"] in push_sent]
-        assert len(push_recovered)==3,"push-hook OMEMO messages lost"
-        results["push_hook"]={"sent":3,"received":len(push_recovered),"notification":True,"content_free":True}
+        assert receipt_rows()==known_receipts, "archive replay created duplicate delivery receipts"
+        results["receipt_replay"]={"unchanged_after_read_and_reopen":True}
+        # The selected mobile lifecycle: retain account state while paused,
+        # then synchronize on foreground return without any push registration.
+        call(a, "lifecycle.active", active=False)
+        time.sleep(1)
+        call(b, "message.send", thread=aj, text="foreground-plain")
+        call(b, "message.sendEncrypted", thread=aj, text="foreground-encrypted")
+        time.sleep(1)
+        call(a, "lifecycle.active", active=True)
+        foreground = ["foreground-plain", "foreground-encrypted"]
+        wait_for(lambda: sum(m["text"] in foreground for m in call(a,"messages.list",thread=bj)) == 2, "foreground recovery incomplete")
+        call(a, "lifecycle.active", active=True)
+        time.sleep(1)
+        assert sum(m["text"] in foreground for m in call(a,"messages.list",thread=bj)) == 2, "foreground recovery duplicated messages"
+        results["foreground_recovery"] = {"plaintext":1,"encrypted":1,"duplicates":0,"push_bridge":False}
         print(json.dumps(results,indent=2))
         assert len(encrypted_recovered) == len(encrypted_sent), "encrypted offline messages lost"
         assert len(recovered) == len(sent), "offline messages lost on archive recovery"

@@ -34,7 +34,6 @@ stage="$work/package"
 mkdir -p "$stage"
 cp app/manifest.json app/fi.reijo.puhuri2.apparmor \
    app/puhuri-daemon.apparmor app/puhuri-daemon.desktop \
-   app/push.apparmor app/push.json \
    app/puhuri.desktop app/puhuri.py "$stage/"
 cp LICENSE THIRD_PARTY_NOTICES.md THIRD_PARTY_LICENSES.txt "$stage/"
 # `app/Lomiri` carries Puhuri 2's own theme modules. They belong in the click's
@@ -52,8 +51,8 @@ cp -r app/qml app/assets app/lib app/Lomiri app/Puhuri "$stage/"
 # they can make removed helper names appear to remain in the package.
 find "$stage" -type d -name __pycache__ -prune -exec rm -rf {} +
 find "$stage" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
-# The confined UI starts the daemon and indicator as children. AppArmor
-# inheritance and both child labels must be checked on the target device.
+# The confined UI starts the daemon as a child. AppArmor
+# inheritance and its runtime label must be checked on the target device.
 for binary in puhurid puhuri-ctl; do
     [ -x "$PROJECT/build/$binary" ] || {
         echo "Puuttuu $PROJECT/build/$binary. Aja ensin tools/build-daemon.sh" >&2
@@ -62,12 +61,8 @@ for binary in puhurid puhuri-ctl; do
     cp "$PROJECT/build/$binary" "$stage/lib/aarch64-linux-gnu/bin/$binary"
 done
 chmod -R u=rwX,go=rX "$stage"
-# The push helper is an executable: the push service runs it directly.
-chmod u+x,go+x "$stage/lib/aarch64-linux-gnu/bin/puhuri-push-helper" \
-    "$stage/lib/aarch64-linux-gnu/bin/puhuri-postal-job"
 chmod u+x,go+x "$stage/lib/aarch64-linux-gnu/bin/puhurid" \
-    "$stage/lib/aarch64-linux-gnu/bin/puhuri-ctl" \
-    "$stage/lib/aarch64-linux-gnu/bin/puhuri-indicator"
+    "$stage/lib/aarch64-linux-gnu/bin/puhuri-ctl"
 
 cd "$work"
 "$CLICK" build --no-validate "$stage"

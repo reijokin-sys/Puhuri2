@@ -268,10 +268,12 @@ impl Store {
         name: &str,
         unread: bool,
         server_id: Option<&str>,
+        receipt_eligible: bool,
     ) -> Result<(), String> {
         let tx = self.db.begin()?;
         Self::record_inbox_notice_in(&tx,account,message,unread)?;
         Self::record_in(&tx, message, name, unread, server_id)?;
+        if receipt_eligible { Self::queue_inbox_receipt_in(&tx, account, id)?; }
         Self::finish_stanza_in(&tx, account, id)?;
         tx.commit()?;
         crate::failpoint!("mam_completion_after_commit");
@@ -295,6 +297,7 @@ impl Store {
         url: &str,
         unread: bool,
         server_id: Option<&str>,
+        receipt_eligible: bool,
     ) -> Result<(), String> {
         let tx = self.db.begin()?;
         Self::record_inbox_notice_in(&tx,account,message,unread)?;
@@ -304,6 +307,7 @@ impl Store {
             params![message.id, server_id],
         )
         .map_err(|_| "Liitteen tunnisteen tallennus epäonnistui")?;
+        if receipt_eligible { Self::queue_inbox_receipt_in(&tx, account, id)?; }
         Self::finish_stanza_in(&tx, account, id)?;
         tx.commit()
     }

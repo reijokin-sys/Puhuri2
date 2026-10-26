@@ -612,170 +612,31 @@ fn the_polling_mode_is_kept_and_validated() {
     assert_eq!(poll["seconds"], json!(null));
 }
 
-/// The push side of the socket: the token from the phone can be kept before a
-/// bridge exists, the state is readable, and with a bridge configured the
-/// device is registered (the fake engine, so no server is talked to).
+/// Upgrading a formerly configured installation must not re-enable push or
+/// accept a delayed device token, while account/message state stays intact.
 #[test]
-fn the_push_token_is_kept_and_registered() {
-    let service = start("push-token");
-
-    result_of(call(
-        &service.socket,
-        99,
-        "account.login",
-        json!({"jid": "maija@example.org", "password": "salasana"}),
-    ));
-
-    // Nothing is set at first.
-    let push = result_of(call(&service.socket, 1, "push.get", json!({})));
-    assert_eq!(push["token"], json!(null));
-    assert_eq!(push["settings"], json!(null));
-
-    // No bridge: the token is remembered but nothing is registered.
-    let push = result_of(call(
-        &service.socket,
-        2,
-        "push.register",
-        json!({"token": "TOKEN-A"}),
-    ));
-    assert_eq!(push["active"], json!(false));
-    assert_eq!(push["reason"], json!("no-push-service"));
-    let push = result_of(call(&service.socket, 3, "push.get", json!({})));
-    assert_eq!(push["token"], json!("TOKEN-A"));
-    assert_eq!(push["settings"], json!(null));
-
-    // An empty token clears the registration again.
-    let push = result_of(call(
-        &service.socket,
-        4,
-        "push.register",
-        json!({"token": ""}),
-    ));
-    assert_eq!(push["active"], json!(false));
-    let push = result_of(call(&service.socket, 5, "push.get", json!({})));
-    assert_eq!(push["token"], json!(null));
-    assert_eq!(push["settings"], json!(null));
-
-    // The wake command answers even with no session (the fake engine).
-    let wake = result_of(call(&service.socket, 6, "push.wake", json!({})));
-    assert_eq!(wake["session"], json!(false));
-
-    result_of(call(
-        &service.socket,
-        7,
-        "push.register",
-        json!({"token": "TOKEN-D"}),
-    ));
-    result_of(call(&service.socket, 8, "account.logout", json!({})));
-    let push = result_of(call(&service.socket, 9, "push.get", json!({})));
-    assert_eq!(push["token"], serde_json::Value::Null);
-    assert_eq!(push["settings"], serde_json::Value::Null);
-}
-
-/// Registration stays pending until a real server confirms it; saving the
-/// token in the fake engine is not proof of end-to-end delivery.
-#[test]
-fn a_configured_bridge_keeps_registration_pending_until_confirmation() {
-    let service = start_with("push-bridge", |store| {
-        store.set_push_service(Some("push.puhuri.test")).unwrap();
+fn retired_push_cannot_be_reenabled() {
+    let service = start_with("retired-push", |store| {
+        store.set_push_token(Some("OLD-TOKEN")).unwrap();
+        store.set_push_service(Some("push.example.org")).unwrap();
+        store.set_push_settings(Some(&puhurid::engine::PushSettings {
+            jid:"push.example.org".into(),node:"OLD-TOKEN".into(),
+            secret:"OLD-SECRET".into(),module:"ubports".into(),
+        })).unwrap();
+        store.retire_push_bridge().unwrap();
+        assert!(!store.push_enabled());
+        assert!(store.push_token().is_none());
+        assert!(store.push_service().is_empty());
+        assert!(store.push_settings().is_some(), "retain route for server-side disable");
     });
-
-    result_of(call(
-        &service.socket,
-        90,
-        "account.login",
-        json!({"jid": "maija@example.org", "password": "salasana"}),
-    ));
-
-    let push = result_of(call(
-        &service.socket,
-        1,
-        "push.register",
-        json!({"token": "TOKEN-B"}),
-    ));
-    assert_eq!(push["active"], json!(false));
-    assert_eq!(push["pending"], json!(true));
-    assert_eq!(push["service"], json!("push.puhuri.test"));
-    assert_eq!(push["settings"]["node"], json!("TOKEN-B"));
-    assert_eq!(push["settings"]["jid"], json!("push.puhuri.test"));
-    assert_eq!(push["settings"]["module"], json!("ubports"));
-
-    let push = result_of(call(&service.socket, 2, "push.get", json!({})));
-    assert_eq!(push["service"], json!("push.puhuri.test"));
-    assert_eq!(push["token"], json!("TOKEN-B"));
-    assert_eq!(push["active"], json!(false));
-}
-
-/// The bridge can be set over the socket (it is the operator's choice, so
-/// there is no public default), and a rubbish JID is refused.
-#[test]
-fn the_bridge_can_be_set_and_is_validated() {
-    let service = start("push-service");
-
-    let response = call(
-        &service.socket,
-        1,
-        "push.service.set",
-        json!({"service": "molemmat@ osat"}),
-    );
-    assert!(!response.ok);
-
-    // With a token known, setting the bridge registers it at once.
-    result_of(call(
-        &service.socket,
-        91,
-        "account.login",
-        json!({"jid": "maija@example.org", "password": "salasana"}),
-    ));
-    let _ = result_of(call(
-        &service.socket,
-        2,
-        "push.register",
-        json!({"token": "TOKEN-C"}),
-    ));
-    let changed = result_of(call(
-        &service.socket,
-        3,
-        "push.service.set",
-        json!({"service": "push.example.org"}),
-    ));
-    assert_eq!(changed["service"], json!("push.example.org"));
-    assert_eq!(changed["active"], json!(true));
-
-    let push = result_of(call(&service.socket, 4, "push.get", json!({})));
-    assert_eq!(push["service"], json!("push.example.org"));
-    assert_eq!(push["settings"]["node"], json!("TOKEN-C"));
-
-    // "off" clears the bridge and takes the registration back.
-    let changed = result_of(call(
-        &service.socket,
-        5,
-        "push.service.set",
-        json!({"service": ""}),
-    ));
-    assert_eq!(changed["service"], json!(null));
-    let push = result_of(call(&service.socket, 6, "push.get", json!({})));
-    assert_eq!(push["service"], json!(null));
-    assert_eq!(push["settings"], json!(null));
-}
-
-/// A delayed PushClient signal after “delete all local data” must not put the
-/// device token back into an account-less database.
-#[test]
-fn a_push_token_is_not_stored_without_an_account() {
-    let service = start("push-no-account");
-    let push = result_of(call(
-        &service.socket,
-        1,
-        "push.register",
-        json!({"token": "TOKEN-LATE"}),
-    ));
-    assert_eq!(push["active"], json!(false));
-    assert_eq!(push["reason"], json!("no-account"));
-
-    let push = result_of(call(&service.socket, 2, "push.get", json!({})));
-    assert_eq!(push["token"], serde_json::Value::Null);
-    assert_eq!(push["settings"], serde_json::Value::Null);
+    for cmd in ["push.enable", "push.register", "background.setup", "push.service.set", "push.setEnabled"] {
+        assert!(!call(&service.socket, 1, cmd, json!({"jid":"push.example.org","token":"LATE-TOKEN","enabled":true})).ok);
+    }
+    let state = result_of(call(&service.socket,2,"push.get",json!({})));
+    assert_eq!(state["enabled"],json!(false));
+    let store=Store::open(&service.dir).unwrap();
+    assert!(store.push_token().is_none());
+    assert!(!store.push_enabled());
 }
 
 /// A picture (and a voice message) is **staged** first: the user sees what is

@@ -24,13 +24,13 @@ case "$maintainer" in
 esac
 contents=$(ar p "$PACKAGE" data.tar.gz | tar -tz)
 
-for hook in '"puhuri"' '"puhuri-daemon"' '"push"'; do
+for hook in '"puhuri"' '"puhuri-daemon"'; do
     printf '%s\n' "$manifest" | grep -q "$hook" || {
         echo "FAIL: manifestista puuttuu hook $hook" >&2
         exit 1
     }
 done
-if printf '%s\n' "$manifest" | grep -q 'unconfined\|puhuri-setup\|puhuri-indicator'; then
+if printf '%s\n' "$manifest" | grep -q '"push"\|unconfined\|puhuri-setup\|puhuri-indicator'; then
     echo "FAIL: manifestissa on poistettu tai unconfined hook" >&2
     exit 1
 fi
@@ -42,12 +42,7 @@ for path in \
     ./fi.reijo.puhuri2.apparmor \
     ./puhuri-daemon.apparmor \
     ./puhuri-daemon.desktop \
-    ./push.apparmor \
-    ./push.json \
-    ./lib/aarch64-linux-gnu/bin/puhurid \
-    ./lib/aarch64-linux-gnu/bin/puhuri-indicator \
-    ./lib/aarch64-linux-gnu/bin/puhuri-push-helper \
-    ./lib/aarch64-linux-gnu/bin/puhuri-postal-job
+    ./lib/aarch64-linux-gnu/bin/puhurid
 do
     printf '%s\n' "$contents" | grep -qx "$path" || {
         echo "FAIL: clickistä puuttuu $path" >&2
@@ -55,14 +50,7 @@ do
     }
 done
 
-push_helper_shebang=$(ar p "$PACKAGE" data.tar.gz | tar -xzO \
-    ./lib/aarch64-linux-gnu/bin/puhuri-push-helper | head -n 1)
-[ "$push_helper_shebang" = '#!/usr/bin/python3' ] || {
-    echo "FAIL: push-helperin shebang ei sovi ubuntu-push-helper-profiiliin" >&2
-    exit 1
-}
-
-for forbidden in puhuri-setup.apparmor puhuri-service-setup puhurid2.service; do
+for forbidden in push.json push.apparmor Push.qml puhuri-push-helper puhuri-postal-job puhuri-indicator push-notification-client puhuri-setup.apparmor puhuri-service-setup puhurid2.service; do
     if printf '%s\n' "$contents" | grep -q "$forbidden"; then
         echo "FAIL: click sisältää poistettavan helperin tai yksikön: $forbidden" >&2
         exit 1
@@ -97,9 +85,8 @@ if printf '%s\n' "$daemon_profile" | grep -q '"template": "unconfined"'; then
     echo "FAIL: daemon-profiili ei saa olla unconfined" >&2
     exit 1
 fi
-push_profile=$(ar p "$PACKAGE" data.tar.gz | tar -xzO ./push.apparmor)
-printf '%s\n' "$push_profile" | grep -q '"template": "ubuntu-push-helper"' || {
-    echo "FAIL: push-hookin confined template puuttuu" >&2
+if grep -R -I -q 'Ubuntu.PushNotifications\|push-notification-client' "$work"; then
+    echo "FAIL: paketti sisältää push-rekisteröinnin tai oikeuden" >&2
     exit 1
-}
+fi
 echo "PASS: clickin hookit, helperit ja lisenssitarkistus täsmäävät"

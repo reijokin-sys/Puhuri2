@@ -254,7 +254,7 @@ impl Archive {
             if let Some(prefs) = payload.filter(|p| p.is("prefs", ns::MAM)) {
                 let policy = prefs.attr("default").unwrap_or("unknown");
                 let _ = store.set_setting("archive.default", policy);
-                // Explicit background setup enables future server retention;
+                // Offline-on-open setup enables future server retention;
                 // preserve all per-contact exceptions from the user's server.
                 if id == "mam-prefs"
                     && store.setting("archive.enabled").as_deref() == Some("true")

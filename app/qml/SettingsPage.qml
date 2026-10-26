@@ -23,26 +23,6 @@ Page {
 
     property var settings
     property var device
-    /// null keeps the connection open; a number is the polling interval in
-    /// seconds (the battery-saving mode). The standard interval is 150 s,
-    /// the same that Livewire uses.
-    property var pollSeconds
-    /// Push notifications: `pushAvailable` when the phone's push module is
-    /// there, `pushActive` when the token has been registered with the server,
-    /// `pushService` the bridge's JID (empty when none is configured).
-    property bool pushActive: false
-    property bool pushAvailable: false
-    property string pushService: ""
-    property string pushModule: "puhuri2"
-    property bool pushEnabled: false
-
-    signal notificationsChanged(bool enabled)
-    signal backgroundSetupRequested(string service, string module)
-    signal pushEnabledRequested(bool enabled)
-    /// The user moved the switch: null means "keep the connection open".
-    /// (Not `pollSecondsChanged` - Qt already makes that one for the
-    /// property, and re-declaring it is an error.)
-    signal pollRequested(var seconds)
     signal privacyRequested()
     signal logoutRequested()
     /// The irreversible removal of every piece of local Puhuri 2 data.
@@ -117,128 +97,10 @@ Page {
                 onClicked: page.privacyRequested()
             }
 
-            ListItem {
-                height: switchLayout.height + divider.height
-
-                ListItemLayout {
-                    id: switchLayout
-                    title.text: tr("settings.notifications")
-                    title.font.pixelSize: Fonts.bigger(FontUtils.sizeToPixels("medium"))
-                }
-
-                Switch {
-                    id: notificationsSwitch
-                    anchors {
-                        right: parent.right
-                        verticalCenter: parent.verticalCenter
-                        rightMargin: units.gu(2)
-                    }
-                    // `page.settings` is a plain var: guard it, or the check
-                    // reports "Unable to assign [undefined] to bool" when the
-                    // page is shown on its own (tools/check.sh --qml).
-                    checked: page.settings ? page.settings.notifications === true : false
-                    onCheckedChanged: page.notificationsChanged(checked)
-                }
-            }
-
-            ListItem {
-                height: pollLayout.height + divider.height
-
-                ListItemLayout {
-                    id: pollLayout
-                    title.text: tr("settings.keepOpenTitle")
-                    title.font.pixelSize: Fonts.bigger(FontUtils.sizeToPixels("medium"))
-                }
-
-                Switch {
-                    id: pollSwitch
-                    anchors {
-                        right: parent.right
-                        verticalCenter: parent.verticalCenter
-                        rightMargin: units.gu(2)
-                    }
-                    checked: page.pollSeconds === null
-                           || page.pollSeconds === undefined
-                    onCheckedChanged: {
-                        // Guard against the initial binding writing back.
-                        if (checked && (page.pollSeconds === null
-                                        || page.pollSeconds === undefined))
-                            return
-                        if (!checked && page.pollSeconds !== null
-                                      && page.pollSeconds !== undefined)
-                            return
-                        page.pollRequested(checked ? null : 150)
-                    }
-                }
-            }
-
-            ListItem {
-                height: pushLayout.height + divider.height
-
-                ListItemLayout {
-                    id: pushLayout
-                    title.text: tr("settings.push")
-                    title.font.pixelSize: Fonts.bigger(FontUtils.sizeToPixels("medium"))
-                    subtitle.text: page.pushAvailable
-                        ? (page.pushActive
-                           ? tr("settings.pushOn") + (page.pushService
-                                           ? " (" + page.pushService + ")" : "")
-                           : (page.pushEnabled ? tr("settings.pushPending") : (page.pushService
-                              ? tr("settings.pushOff")
-                              : tr("settings.pushOffNoBridge"))))
-                        : tr("settings.pushUnavailable")
-                    subtitle.font.pixelSize: Fonts.bigger(FontUtils.sizeToPixels("small"))
-                }
-
-                Switch {
-                    id: pushSwitch
-                    anchors {
-                        right: parent.right
-                        verticalCenter: parent.verticalCenter
-                        rightMargin: units.gu(2)
-                    }
-                    enabled: page.pushAvailable && page.pushService !== ""
-                    checked: page.pushEnabled
-                    onCheckedChanged: {
-                        // Guard against the binding writing back.
-                        if (checked === page.pushEnabled)
-                            return
-                        page.pushEnabledRequested(checked)
-                    }
-                }
-            }
-
             Label {
                 width: parent.width
                 wrapMode: Text.WordWrap
-                text: tr("settings.backgroundPrivacy")
-            }
-            Label { text: tr("settings.pushService") }
-            TextField {
-                id: pushServiceField
-                objectName: "pushServiceField"
-                width: parent.width
-                text: page.pushService || "ubpush.agnos.is"
-                inputMethodHints: Qt.ImhNoAutoUppercase | Qt.ImhNoPredictiveText
-            }
-            Label { text: tr("settings.pushModule") }
-            TextField {
-                id: pushModuleField
-                objectName: "pushModuleField"
-                width: parent.width
-                text: page.pushModule
-                inputMethodHints: Qt.ImhNoAutoUppercase | Qt.ImhNoPredictiveText
-            }
-            Label {
-                width: parent.width
-                wrapMode: Text.WordWrap
-                text: tr("settings.pushProviderSettings")
-            }
-            Button {
-                text: tr("settings.backgroundSetup")
-                enabled: page.pushAvailable && pushServiceField.text.trim() !== ""
-                         && /^[A-Za-z0-9._-]{1,64}$/.test(pushModuleField.text.trim())
-                onClicked: page.backgroundSetupRequested(pushServiceField.text.trim(), pushModuleField.text.trim())
+                text: tr("settings.openToReceive")
             }
 
             Label { text: tr("settings.account"); font.pixelSize: Fonts.bigger(FontUtils.sizeToPixels("large")) }
@@ -248,11 +110,7 @@ Page {
                 wrapMode: Text.WordWrap
                 font.pixelSize: Fonts.bigger(FontUtils.sizeToPixels("medium"))
                 text: page.device && page.device.connected === true
-                      ? tr("settings.connected")
-                      : (page.pollSeconds > 0
-                         ? tr("settings.polling")
-                           + page.pollSeconds + tr("settings.pollingSuffix")
-                         : tr("settings.disconnected"))
+                      ? tr("settings.connected") : tr("settings.disconnected")
             }
 
             Label {

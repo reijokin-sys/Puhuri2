@@ -26,7 +26,7 @@ pub(super) fn message(
     shared: &Arc<Shared>,
     #[cfg(feature = "omemo")] omemo: Option<&Omemo>,
     downloads: &mut Vec<Download>,
-) -> Result<Option<(BareJid, String)>, String> {
+) -> Result<(), String> {
     let account = own.to_string();
     let mam = raw.extract_valid_payload::<MamResult>();
     let sent = raw.extract_valid_payload::<CarbonSent>();
@@ -58,7 +58,7 @@ pub(super) fn message(
     };
     let Some(peer) = peer.map(|j| j.to_bare()) else {
         store.finish_pending_disposition(&account, row.id)?;
-        return Ok(None);
+        return Ok(());
     };
     let thread = peer.to_string();
     let client_id = inner.id.as_ref().map(|id| id.0.clone());
@@ -69,7 +69,7 @@ pub(super) fn message(
         if outgoing { client_id.as_deref() } else { None },
     )? {
         store.finish_pending_disposition(&account, row.id)?;
-        return Ok(None);
+        return Ok(());
     }
     let name = shared
         .roster
@@ -86,11 +86,6 @@ pub(super) fn message(
             id: receipt,
         });
     }
-    let reply = if live && inner.extract_valid_payload::<Request>().is_some() {
-        client_id.clone().map(|id| (peer.clone(), id))
-    } else {
-        None
-    };
     if let Some(typing) = typing.filter(|_| live) {
         shared.push(EngineEvent::Typing {
             thread: thread.clone(),
@@ -98,6 +93,7 @@ pub(super) fn message(
         });
     }
     let mut text = None;
+    let mut receipt_eligible = true;
     let unsupported = unsupported_encryption(&inner);
     #[cfg(feature = "omemo")]
     if let Some(envelope) = inner.extract_valid_payload::<omemo_xml::Encrypted>() {
@@ -132,19 +128,21 @@ pub(super) fn message(
                 } else {
                     shared.push(EngineEvent::MessageReceived(message));
                 }
-                return Ok(reply);
+                return Ok(());
             }
             Ok(_) => {
                 shared.push(EngineEvent::StateChanged);
-                return Ok(reply);
+                return Ok(());
             }
             Err(super::super::omemo::ReceiveError::Store(error)) => return Err(error),
             Err(super::super::omemo::ReceiveError::Decrypt(_)) => {
+                receipt_eligible = false;
                 text = Some("🔒 Saapui salattu viesti, jota tämä laite ei voi purkaa.".to_string())
             }
         }
     }
     if unsupported.is_some() {
+        receipt_eligible = false;
         text = Some("🔒 Saapui salattu viesti, jota tämä versio ei osaa purkaa.".into());
     }
     #[cfg(not(feature = "omemo"))]
@@ -153,6 +151,7 @@ pub(super) fn message(
         .iter()
         .any(|p| p.ns().contains("omemo") || p.ns() == xmpp_parsers::ns::LEGACY_OMEMO)
     {
+        receipt_eligible = false;
         text = Some("🔒 Saapui salattu viesti; tämä rakennus ei tue OMEMOa.".into());
     }
     let url = if text.is_none() && !outgoing {
@@ -175,7 +174,7 @@ pub(super) fn message(
     });
     if text.trim().is_empty() && url.is_none() {
         store.finish_pending_disposition(&account, row.id)?;
-        return Ok(reply);
+        return Ok(());
     }
     let message = Message {
         id: format!("inbox-{}", row.id),
@@ -201,6 +200,7 @@ pub(super) fn message(
             &url,
             !outgoing,
             server_id.as_deref(),
+            receipt_eligible,
         )?;
         downloads.push((peer, url, text, Some(message.id)));
         shared.push(EngineEvent::StateChanged);
@@ -212,6 +212,7 @@ pub(super) fn message(
             &name,
             !outgoing,
             server_id.as_deref(),
+            receipt_eligible,
         )?;
         if outgoing {
             shared.push(EngineEvent::StateChanged);
@@ -219,5 +220,5 @@ pub(super) fn message(
             shared.push(EngineEvent::MessageReceived(message));
         }
     }
-    Ok(reply)
+    Ok(())
 }

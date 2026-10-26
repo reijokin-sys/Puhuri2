@@ -2,8 +2,8 @@
 Version=1.0
 Type=Application
 Terminal=false
-Name=Puhuri 2 background service
-Comment=Keeps the XMPP service running without the user interface
+Name=Puhuri 2 message engine
+Comment=Message engine launched by Puhuri 2
 Exec=lib/aarch64-linux-gnu/bin/puhurid --engine xmpp
 Icon=assets/puhuri.png
 NoDisplay=true

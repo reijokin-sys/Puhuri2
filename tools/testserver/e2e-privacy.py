@@ -11,6 +11,7 @@ import os
 import pwd
 from pathlib import Path
 import socket
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -116,7 +117,9 @@ VirtualHost "{DOMAIN}"
         wait_for(lambda: call(a, "privacy.get")["requests"], "first message was not quarantined")
         assert call(a, "messages.list", thread=bj) == []
         assert not call(a, "conversations.indicator")
-        checks.append("unknown sender quarantined without conversation or notification counters")
+        with sqlite3.connect(work/"alpha"/"puhuri.db") as db:
+            assert db.execute("SELECT COUNT(*) FROM delivery_receipts").fetchone()[0] == 0, "unknown sender got a receipt"
+        checks.append("unknown sender quarantined without conversation, notification counters or delivery receipt")
         call(a, "privacy.contact", jid=bj, action="approve")
         wait_for(lambda: any(m["text"] == "first request" for m in call(a, "messages.list", thread=bj)), "accepted request not imported")
         wait_for(lambda: not call(a, "privacy.get")["requests"], "accepted request not consumed")
@@ -124,12 +127,16 @@ VirtualHost "{DOMAIN}"
         call(a, "privacy.contact", jid=bj, action="block")
         wait_for(lambda: any(c["jid"] == bj and c["server_sync"] == "synced" for c in call(a, "privacy.get")["contacts"]), "server did not confirm block")
         count = len(call(a, "messages.list", thread=bj))
+        with sqlite3.connect(work/"alpha"/"puhuri.db") as db:
+            receipt_count = db.execute("SELECT COUNT(*) FROM delivery_receipts").fetchone()[0]
         call(b, "message.send", thread=aj, text="blocked message")
         time.sleep(1)
         assert len(call(a, "messages.list", thread=bj)) == count
         assert call(a, "privacy.get")["requests"] == []
         assert call(a, "conversations.indicator") == []
-        checks.append("server-confirmed block suppresses messages, requests and counters")
+        with sqlite3.connect(work/"alpha"/"puhuri.db") as db:
+            assert db.execute("SELECT COUNT(*) FROM delivery_receipts").fetchone()[0] == receipt_count, "blocked sender got a receipt"
+        checks.append("server-confirmed block suppresses messages, requests, counters and receipts")
         call(a, "privacy.contact", jid=bj, action="unblock")
         wait_for(lambda: any(c["jid"] == bj and not c["blocked"] and c["server_sync"] == "synced" for c in call(a, "privacy.get")["contacts"]), "server did not confirm unblock")
         call(b, "message.sendEncrypted", thread=aj, text="encrypted request")

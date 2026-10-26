@@ -26,6 +26,9 @@ mod mam_handoff;
 pub use mam_handoff::{MamProgress, MamQuery};
 #[path = "transport_handoff.rs"]
 mod transport_handoff;
+#[path = "delivery_receipts.rs"]
+mod delivery_receipts;
+pub use delivery_receipts::DeliveryReceipt;
 pub use handoff::{HandoffState, PendingStanza};
 pub use privacy::{Admission, MessageRequest, PrivacyContact};
 
@@ -80,7 +83,8 @@ pub struct Store {
 /// * **9 - MAM correlation (2026-10-24)**: query registrations and ingress links.
 /// * **10 - ordered MAM completion (2026-10-25)**: bounded result ledger and account cursor.
 /// * **11 - durable MAM final-IQ decisions (2026-10-25)**.
-pub const SCHEMA_VERSION: i64 = 11;
+/// * **12 - durable first-reception XEP-0184 reply ledger (2026-10-26)**.
+pub const SCHEMA_VERSION: i64 = 12;
 
 /// Open (or create) `puhuri.db` and bring its schema up to
 /// [`SCHEMA_VERSION`]. `Store` and `OmemoStore` both go through here, so they
@@ -225,6 +229,7 @@ fn upgrade_to_current(connection: &Connection) -> Result<(), String> {
         handoff::create_schema(connection)?;
         mam_handoff::create_schema(connection)?;
         mam_page::create_schema(connection)?;
+        delivery_receipts::create_schema(connection)?;
         let after: i64 = connection
             .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
             .map_err(|error| error.to_string())?;
@@ -1169,6 +1174,7 @@ impl Store {
             "xmpp_mam_inbox",
             "xmpp_mam_queries",
             "xmpp_mam_cursors",
+            "delivery_receipts",
             "xmpp_inbox",
             "xmpp_handoff",
             "identity",
@@ -1284,6 +1290,26 @@ impl Store {
             )
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+
+    /// Request server-side retention for offline synchronization. Existing
+    /// per-contact archive exceptions are preserved by the MAM preference path.
+    pub fn set_setting_for_archive(&self) -> Result<(), String> {
+        self.set_setting("archive.enabled", "true")
+    }
+
+    /// Retire push without touching messages, credentials or OMEMO state.
+    /// Retain only the old active route until XEP-0357 disable is confirmed.
+    pub fn retire_push_bridge(&self) -> Result<(), String> {
+        let connection = self.lock();
+        let transaction = connection.unchecked_transaction().map_err(|e| e.to_string())?;
+        transaction.execute("DELETE FROM settings WHERE key IN ('push.token','push.service','push.selected_module')", [])
+            .map_err(|e| e.to_string())?;
+        for key in ["push.enabled", "push.confirmed"] {
+            transaction.execute("INSERT OR REPLACE INTO settings (key,value) VALUES (?1,'false')", [key])
+                .map_err(|e| e.to_string())?;
+        }
+        transaction.commit().map_err(|e| e.to_string())
     }
 
     /// The push bridge: a public XMPP component that forwards XEP-0357

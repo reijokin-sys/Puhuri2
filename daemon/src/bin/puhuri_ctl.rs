@@ -17,14 +17,6 @@
 //!     puhuri-ctl omemo-forget <keskustelu> <laite>   (unohda laite: avainnippu,
 //!                                                    istunto ja avain pois)
 //!     puhuri-ctl omemo-encrypt <keskustelu> [--off]  (salausvalinta)
-//!     puhuri-ctl push                         (push-asetus, XEP-0357)
-//!     puhuri-ctl push-enable <push-palvelu> <token> [--module ubports|unifiedpush]
-//!     puhuri-ctl push-enable <push-palvelu> --token-stdin [--module nimi]
-//!     puhuri-ctl push-disable
-//!     puhuri-ctl push-token <token|off>       (Lomirin push-token, sama kuin sovellus)
-//!     puhuri-ctl push-token --stdin            (token vakiosyötteestä)
-//!     puhuri-ctl push-service <jid|off>        (push-silta; ei julkista oletusta)
-//!     puhuri-ctl push-wake                     (pakota välitön haku)
 //!     puhuri-ctl poll [sekuntia|off]        (akkua säästävä pollaus; off = yhteys auki)
 //!     puhuri-ctl voicestart <keskustelu>     (aloita äänitys)
 //!     puhuri-ctl voicestop                    (lähetä äänitetty)
@@ -37,7 +29,7 @@
 //!     puhuri-ctl listen
 
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
@@ -56,15 +48,6 @@ fn print_line(text: &str) {
     let _ = lock.flush();
 }
 
-fn stdin_token() -> String {
-    let mut value = String::new();
-    if std::io::stdin().take(4097).read_to_string(&mut value).is_err() || value.len() > 4096 {
-        die("Tokenin lukeminen epäonnistui");
-    }
-    let value = value.trim();
-    if value.is_empty() || value.chars().any(char::is_whitespace) { die("Virheellinen token"); }
-    value.to_string()
-}
 
 fn main() {
     let mut socket_path = default_socket_path();
@@ -203,38 +186,6 @@ fn main() {
             )
         }
         "omemo-encrypted" => ("omemo.encrypted", json!({})),
-        "push" => ("push.get", json!({})),
-        "push-enable" => {
-            let jid = args.first().cloned().unwrap_or_default();
-            if jid.is_empty() {
-                die("käyttö: puhuri-ctl push-enable <push-palvelu> <token> [--module ubports|unifiedpush]");
-            }
-            let token = if args.iter().any(|a| a == "--token-stdin") { stdin_token() }
-                else { args.get(1).cloned().unwrap_or_default() };
-            let module = args
-                .iter()
-                .position(|value| value == "--module")
-                .and_then(|index| args.get(index + 1).cloned());
-            (
-                "push.enable",
-                json!({"jid": jid, "node": token, "module": module}),
-            )
-        }
-        "push-disable" => ("push.disable", json!({})),
-        "push-token" => {
-            let token = args.first().cloned().unwrap_or_default();
-            if token.is_empty() {
-                die("käyttö: puhuri-ctl push-token <token|off>");
-            }
-            let token = if token == "--stdin" { stdin_token() } else if token == "off" { String::new() } else { token };
-            ("push.register", json!({"token": token}))
-        }
-        "push-wake" => ("push.wake", json!({})),
-        "push-service" => {
-            let service = args.first().cloned().unwrap_or_default();
-            let service = if service == "off" { String::new() } else { service };
-            ("push.service.set", json!({"service": service}))
-        }
         "poll" => {
             let value = args.first().cloned().unwrap_or_default();
             if value.is_empty() {
