@@ -147,6 +147,33 @@ class InstallerTests(unittest.TestCase):
                 self.assertEqual('existing-session', path.read_text())
             self.assertEqual('existing-session', path.read_text())
 
+    def test_menu_session_runs_install_remove_then_exits_without_extra_action(self):
+        installer = module('session_menu_under_test', 'install-release.py')
+        with patch.object(installer.sys, 'argv', ['installer']), \
+             patch.object(installer, 'choose_action', side_effect=['install', 'remove', 'exit']), \
+             patch.object(installer, 'run_action') as action:
+            installer.main()
+            self.assertEqual([('install', None), ('remove', None)], [c.args for c in action.call_args_list])
+
+    def test_inherited_shared_registration_is_hidden_only_for_current_user(self):
+        installer = module('inherited_under_test', 'install-release.py')
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            installer.CLICK_ROOT = home / 'click'
+            manifest = installer.CLICK_ROOT / '.click/info/fi.reijo.puhuri2.manifest'
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text(json.dumps({'name': 'fi.reijo.puhuri2', 'version': '1.2.0'}))
+            with patch.object(Path, 'home', return_value=home), \
+                 patch.object(installer.shutil, 'which', return_value='/usr/bin/tool'), \
+                 patch.object(installer, 'click_session', side_effect=lambda: nullcontext()), \
+                 patch.object(installer, 'registered_version', side_effect=['1.2.0', '1.2.0', None]), \
+                 patch('builtins.open', create=True), \
+                 patch.object(installer.subprocess, 'run') as run:
+                installer.remove_installation()
+                self.assertEqual(2, run.call_count)
+                self.assertTrue(all('--user' in c.args[0] for c in run.call_args_list))
+                self.assertTrue(all('--all-users' not in c.args[0] for c in run.call_args_list))
+
 
 if __name__ == '__main__':
     unittest.main()

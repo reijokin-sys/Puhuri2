@@ -44,3 +44,26 @@ installer created it, and existing session files are untouched. Root click gets
 the real user's HOME/cache and bus environment. No persistent phone fix or
 backup is added. Tests cover missing registration, menu choices and session
 file creation/cleanup in addition to install/remove/rollback.
+
+## Menu session and inherited registration
+
+Interactive mode returns to the menu after each successful action until 0 is
+chosen. The staged wrapper therefore keeps its temporary packages for the
+session and deletes them on exit. A fresh manual test can choose 1, 2, 1, 0.
+
+If removing a local registration reveals the same version from @all, ordinary
+removal hides the inherited copy for this user with a second per-user unregister.
+It never unregisters an application for other users automatically. Files shared
+by another registration may remain, but the app must disappear from this user's
+click list. Fresh installation still requires a valid user-visible registration.
+
+## Final real-device lifecycle result
+
+The agent ran menu choices 1, 2, 1, 0 under explicit user authorization.
+Fresh click installation, full user/application removal, reinstallation and exit
+all passed. Independent read-only checks established package/registration/service
+absence after removal and enabled/active services after installation. Exit
+preserved the installed manifest hash and PIDs and removed staging/session-env
+files. The existing development OS was used. Some standard click removal hooks
+printed warnings despite successful verified removal. Network download was not
+part of this staged run. No account was logged in after the user's app reset.

@@ -190,11 +190,22 @@ def remove_installation():
     if click_present:
         print('Removing click application', flush=True)
         with click_session(), open('/dev/tty') as terminal:
-            subprocess.run(root_click_command('unregister', '--user',
-                            pwd.getpwuid(os.getuid()).pw_name, 'fi.reijo.puhuri2', VERSION),
-                           stdin=terminal, check=True)
-        if registered_version() is not None:
-            raise RuntimeError('Click still registered; removal did not finish')
+            # First removal can reveal an @all installation. A second normal
+            # per-user unregister hides that inherited version for this user;
+            # never remove other users' shared application automatically.
+            for attempt in range(2):
+                subprocess.run(root_click_command('unregister', '--user',
+                                pwd.getpwuid(os.getuid()).pw_name, 'fi.reijo.puhuri2', VERSION),
+                               stdin=terminal, check=True)
+                remaining = registered_version()
+                if remaining is None:
+                    break
+                if remaining != VERSION:
+                    raise RuntimeError('Another click version became visible; refusing further removal')
+                if attempt == 0:
+                    print('Removing inherited registration for this user', flush=True)
+            else:
+                raise RuntimeError('Click still registered; removal did not finish')
     # The manager has exited, so its now-unused lock and empty directories can
     # be removed. Never recursively delete a home/config/data directory.
     (base / 'manager.lock').unlink(missing_ok=True)
@@ -231,9 +242,18 @@ def main():
                           'phone_archives': False}, indent=2))
         return
     print('\033[1;32m=== Puhuri 2 - v' + VERSION + ' ===\033[0m', flush=True)
-    action = args.action or choose_action()
-    if action == 'exit':
+    if args.action:
+        run_action(args.action, args.local_assets)
         return
+    while True:
+        action = choose_action()
+        if action == 'exit':
+            print('Exit / Lopetettu.', flush=True)
+            return
+        run_action(action, args.local_assets)
+
+
+def run_action(action, local_assets=None):
     os.umask(0o077)
     managed = preflight()
     if action == 'remove':
@@ -243,8 +263,8 @@ def main():
     # TemporaryDirectory removes downloads/extracted staging on success/error.
     with tempfile.TemporaryDirectory(prefix='puhuri-install-') as temporary:
         directory = Path(temporary)
-        click = download('fi.reijo.puhuri2_' + VERSION + '_arm64.click', directory, args.local_assets)
-        bundle = unpack(download('background-' + VERSION + '.tar.gz', directory, args.local_assets), directory)
+        click = download('fi.reijo.puhuri2_' + VERSION + '_arm64.click', directory, local_assets)
+        bundle = unpack(download('background-' + VERSION + '.tar.gz', directory, local_assets), directory)
         subprocess.run(['/usr/bin/python3', str(bundle / 'manage.py'), 'plan'],
                        check=True, stdout=subprocess.DEVNULL)
         matches = click_already_matches(bundle)

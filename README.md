@@ -24,7 +24,8 @@ bash -o pipefail -c 'curl -fsSL https://github.com/reijokin-sys/Puhuri2/releases
 ```
 
 After the green heading, choose **1** to install/update, **2** to remove, or
-**0** to exit. For installation, the installer downloads the matching click and background add-on, verifies
+**0** to exit. The menu returns after each completed action. For installation,
+the installer downloads the matching click and background add-on, verifies
 their SHA-256 checksums, installs them and removes the temporary downloads.
 It may ask for installation confirmation or your phone password through sudo.
 An already matching click is kept, and the services are installed again.
@@ -42,17 +43,21 @@ bash -o pipefail -c 'curl -fsSL https://github.com/reijokin-sys/Puhuri2/releases
 ```
 
 This stops/disables and removes the background services and their code, then
-uninstalls the v1.2.0 click. Account settings, messages, attachments and OMEMO
+unregisters the v1.2.0 click for the current user. A shared copy used by other
+users is retained. Account settings, messages, attachments and OMEMO
 keys stay on the phone. This is not a data purge. No backup/version archives
 are left on the phone. The version-pinned installer refuses to remove a newer
 click. If interrupted, rerun the matching command; automatic click rollback
-is not provided.
+is not provided. Ubuntu Touch click hooks can print removal warnings even
+when removal succeeds; the installer verifies that the app is no longer
+registered for the current user.
 
 ## Validation and source
 
 Message reception and notifications, including after reboot without opening
 the app, were confirmed on one development phone. A clean Ubuntu Touch test
-was not performed. Long sleep and network-loss checks remain open. The
+was not performed. The complete install/remove/reinstall/exit menu cycle was
+also tested on that development phone. Long sleep and network-loss checks remain open. The
 background services can increase battery use; behaviour during sleep depends
 on the device and network.
 
