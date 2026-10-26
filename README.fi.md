@@ -6,7 +6,7 @@ ja ääniviestit. Käyttöliittymän kielet ovat suomi ja englanti, ja väriteem
 on kolme. Offline-viestien haku riippuu XMPP-palvelimen viestihistoriatuesta.
 
 **Asennus tehdään TIETOKONEELLA, josta on hyväksytty ADB-yhteys PUHELIMEEN.**
-Julkaisu sisältää asentimen **1.2.3**, joka asentaa muuttumattoman Puhuri 2
+Julkaisu sisältää asentimen **1.2.4**, joka asentaa muuttumattoman Puhuri 2
 **1.2.0** -sovelluksen ja taustapalvelut. Tämä korvaa poistetun julkaisun
 puhelimessa ajettavan asennusohjeen. Jakelu tapahtuu GitHubista.
 
@@ -24,34 +24,35 @@ puhelimessa ajettavan asennusohjeen. Jakelu tapahtuu GitHubista.
 Puhelimeen ei tarvitse asentaa curlia tai apt-paketteja eikä juuriosiota avata
 kirjoitettavaksi. Kaikki asennustiedostot haetaan tietokoneelle ja siirretään ADB:llä.
 
-## Asennus
+## Asennus tai poisto yhdellä komennolla
 
-Avaa TIETOKONEEN terminaali tyhjään työkansioon ja aja koko lohko tavallisena
-käyttäjänä, ilman sudo-etuliitettä:
+Aja TIETOKONEEN terminaalissa tavallisena käyttäjänä:
 
 ```sh
-curl -fsSL --retry 3 -o puhuri2-1.2.3-adb-installer.zip https://github.com/reijokin-sys/Puhuri2/releases/download/v1.2.3/puhuri2-1.2.3-adb-installer.zip &&
-python3 -m zipfile -e puhuri2-1.2.3-adb-installer.zip . &&
-python3 puhuri2-1.2.3-adb-installer/install-puhuri-adb.py
+curl -fsSL https://github.com/reijokin-sys/Puhuri2/releases/download/v1.2.4/install.sh | sh
 ```
 
-Curl lataa koko paketin tietokoneelle. Python purkaa sen ja käynnistää asentimen.
-Voit myös ladata ZIPin [julkaisusivulta](https://github.com/reijokin-sys/Puhuri2/releases/tag/v1.2.3),
-purkaa sen ja ajaa puretussa kansiossa `python3 install-puhuri-adb.py`.
+Käynnistin näyttää ”Ladataan asenninta…”, lataa ja tarkistaa koko paketin,
+purkaa sen tietokoneen väliaikaishakemistoon ja avaa nykyisen valikon.
+Python toimii taustalla; Python-komentoa ei tarvitse kopioida terminaaliin.
+Tietokoneessa tarvitaan edelleen curl, Python 3.8+ ja adb.
 
 Valitse **1 Asenna/päivitä**, **2 Poista** tai **0 Lopeta**. Ohjelma päättyy
-valitun toiminnon jälkeen. Uusi toiminto vaatii uuden käynnistyksen. Jos sudo kysyy puhelimen salasanaa, kirjoita se
-suoraan tietokoneen terminaaliin. Asennin ei tallenna salasanaa.
-Asennuksen valmistuttua avaa Puhuri 2 puhelimessa ja kirjaudu XMPP-tilillesi.
+valitun toiminnon jälkeen ja poistaa tietokoneen väliaikaistiedostot.
+Jos sudo kysyy puhelimen salasanaa, kirjoita se tietokoneen terminaaliin.
+Käynnistin ei lue tai tallenna salasanaa. Asennuksen jälkeen avaa Puhuri 2
+puhelimessa ja kirjaudu XMPP-tilillesi.
 
-Saat saman valikon myöhemmin auki tietokoneen alkuperäisestä työkansiosta:
+Myöhempää asennusta tai poistoa varten suorita sama curl-komento uudelleen.
+Se lataa paketin uudelleen. Poisto säilyttää tilin, viestit, liitteet ja
+OMEMO-avaimet. Muiden käyttäjien yhteisiä kopioita ei poisteta.
+
+Vaihtoehtoisesti voit säilyttää ladatun ZIP-paketin, purkaa sen ja ajaa
+purettuun kansioon avatusta tietokoneen terminaalista:
 
 ```sh
-python3 puhuri2-1.2.3-adb-installer/install-puhuri-adb.py
+python3 install-puhuri-adb.py
 ```
-
-Valinta 2 poistaa sovelluksen käyttäjältä ja molemmat palvelut. Tili, viestit,
-liitteet ja OMEMO-avaimet säilyvät. Muiden käyttäjien yhteisiä kopioita ei poisteta.
 
 ## Mitä asennetaan
 
@@ -72,13 +73,19 @@ jos siivous ei onnistu. Automaattista asennuksen palautusta ei ole.
 Pelkkä vaatimusten tarkistus:
 
 ```sh
-python3 puhuri2-1.2.3-adb-installer/install-puhuri-adb.py check
+python3 puhuri2-1.2.4-adb-installer/install-puhuri-adb.py check
 ```
 
 Jos laitteita on useita, lisää `--serial SERIAL`. ZIPin SHA256SUMS sisältää sen
 tiedostojen tarkistussummat; julkaisussa on myös ZIPin tarkistussumma.
 
 ## Testauksen rajaus
+
+Käyttäjä vahvisti tämän käynnistimen toimivaksi paikallisella paketilla.
+Neljä curl-putkituksen ja terminaalin testiä läpäistiin: valinta toimii,
+lataus- ja tarkistussummavirhe estävät käynnistyksen, argumentit välittyvät ja
+tietokoneen väliaikaistiedostot siivotaan. Käynnistin ei asenna Pythonia tai ADB:tä.
+
 
 Tietokone/curl/ADB-polun palvelupäivitys, poisto ja lopetus testattiin ensin.
 Sen jälkeen GitHubista ladatulla paketilla tehty tuore click- ja palveluasennus
@@ -93,7 +100,7 @@ Tunnetut harmittomat allekirjoitus-, poistokoukku- ja piilotetun daemon-kuvakkee
 sekä tekniset välitulosteet suodatetaan. Muut varoitukset ja virheet näkyvät;
 epäonnistumisessa näytetään myös suodatettuja lisätietoja. Poistokoukkujen
 viestit piilotetaan vain, kun poiston lopputila on varmennettu. Kaikki tulosteet:
-`python3 puhuri2-1.2.3-adb-installer/install-puhuri-adb.py --verbose`.
+`python3 puhuri2-1.2.4-adb-installer/install-puhuri-adb.py --verbose`.
 Onnistuminen merkitään vihreällä OK:lla vasta lopputilan ja siivouksen jälkeen.
 
 Viestit ja ilmoitukset uudelleenkäynnistyksen jälkeen on aiemmin testattu

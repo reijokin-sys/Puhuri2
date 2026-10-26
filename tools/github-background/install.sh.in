@@ -1,0 +1,60 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Computer-side launcher. Generated with a pinned release ZIP checksum.
+puhuri_main() {
+    set -eu
+    for puhuri_tool in curl python3 adb; do
+        if ! command -v "$puhuri_tool" >/dev/null 2>&1; then
+            printf 'Missing on computer / Tietokoneelta puuttuu: %s\n' "$puhuri_tool" >&2
+            return 1
+        fi
+    done
+    if [ "$(id -u)" = 0 ]; then
+        printf 'Run as normal user / Suorita tavallisena käyttäjänä, ilman sudoa.\n' >&2
+        return 1
+    fi
+    python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,8) else "Python 3.8+ required on computer")' || return 1
+    # Source can arrive on stdin via curl | sh. User input uses the terminal.
+    if ! ( : </dev/tty ) 2>/dev/null; then
+        printf 'Open a computer terminal / Avaa tietokoneen terminaali.\n' >&2
+        return 1
+    fi
+    umask 077
+    puhuri_tmp=$(mktemp -d "${TMPDIR:-/tmp}/puhuri-launch.XXXXXXXX") || return 1
+    trap 'rm -rf -- "$puhuri_tmp"' 0
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    printf 'Downloading installer / Ladataan asenninta…\n'
+    curl -fsSL --retry 3 -o "$puhuri_tmp/installer.zip" \
+        'https://github.com/reijokin-sys/Puhuri2/releases/download/v@VERSION@/puhuri2-@VERSION@-adb-installer.zip' || return 1
+    python3 - "$puhuri_tmp" <<'PY'
+import hashlib, stat, sys, zipfile
+from pathlib import Path, PurePosixPath
+folder = Path(sys.argv[1])
+archive = folder / 'installer.zip'
+if hashlib.sha256(archive.read_bytes()).hexdigest() != '@SHA256@':
+    raise SystemExit('Download checksum mismatch / Latauksen tarkistussumma ei täsmää')
+with zipfile.ZipFile(archive) as source:
+    entries = source.infolist()
+    if len(entries) > 32 or sum(item.file_size for item in entries) > 64 * 1024 * 1024:
+        raise SystemExit('Unexpected installer archive size')
+    seen = set()
+    for item in entries:
+        path = PurePosixPath(item.filename)
+        if (path.is_absolute() or '..' in path.parts or not path.parts
+                or path.parts[0] != 'puhuri2-@VERSION@-adb-installer'
+                or item.filename in seen
+                or stat.S_ISLNK(item.external_attr >> 16)):
+            raise SystemExit('Unexpected installer archive entry')
+        seen.add(item.filename)
+    source.extractall(folder)
+PY
+    # Stop if verification/extraction failed; never run an unverified download.
+    puhuri_status=$?
+    if [ "$puhuri_status" -ne 0 ]; then return "$puhuri_status"; fi
+    python3 "$puhuri_tmp/puhuri2-@VERSION@-adb-installer/install-puhuri-adb.py" "$@" </dev/tty
+}
+# A function keeps the complete shell program parsed before starting a child;
+# neither Python nor ADB consumes the curl source pipe as terminal input.
+puhuri_main "$@"

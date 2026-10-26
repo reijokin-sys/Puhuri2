@@ -8,7 +8,8 @@ import zipfile
 
 HERE = Path(__file__).resolve().parent
 PROJECT = HERE.parent.parent
-OUTPUT = PROJECT / 'dist/puhuri2-1.2.3-adb-installer'
+VERSION = '1.2.4'
+OUTPUT = PROJECT / ('dist/puhuri2-' + VERSION + '-adb-installer')
 OUTPUT.mkdir(exist_ok=False)
 inputs = {
     HERE / 'install-adb.py': 'install-puhuri-adb.py',
@@ -31,3 +32,16 @@ with zipfile.ZipFile(str(OUTPUT) + '.zip', 'x', compression=zipfile.ZIP_DEFLATED
         archive.writestr(info, path.read_bytes(), compress_type=zipfile.ZIP_DEFLATED)
 print('Built ' + str(OUTPUT.relative_to(PROJECT)) + '.zip')
 print('SHA-256 ' + hashlib.sha256(Path(str(OUTPUT) + '.zip').read_bytes()).hexdigest())
+
+# The launcher is a separate release asset to avoid a circular ZIP checksum.
+archive_digest = hashlib.sha256(Path(str(OUTPUT) + '.zip').read_bytes()).hexdigest()
+launcher = (HERE / 'install.sh.in').read_text().replace('@VERSION@', VERSION).replace('@SHA256@', archive_digest)
+assert '@VERSION@' not in launcher and '@SHA256@' not in launcher
+(PROJECT / 'dist' / ('install-puhuri-' + VERSION + '.sh')).write_text(launcher)
+print('Built pinned launcher install-puhuri-' + VERSION + '.sh (publish as install.sh)')
+
+# Workstation-only test entry: same hash/flow, ZIP read locally, no release URL.
+release_zip_url = ('https://github.com/reijokin-sys/Puhuri2/releases/download/v' + VERSION
+                   + '/puhuri2-' + VERSION + '-adb-installer.zip')
+local_launcher = launcher.replace(release_zip_url, Path(str(OUTPUT) + '.zip').as_uri())
+(PROJECT / 'dist' / ('install-puhuri-' + VERSION + '-local-test.sh')).write_text(local_launcher)
