@@ -25,6 +25,17 @@ class ADBInstallerTests(unittest.TestCase):
             HOST.main()
             perform.assert_not_called()
 
+    def test_one_selection_per_run_for_install_and_remove(self):
+        for action in ('install', 'remove'):
+            with self.subTest(action=action), \
+                 patch.object(HOST.sys, 'argv', ['installer']), \
+                 patch.object(HOST, 'choose_action', side_effect=[action, AssertionError('second menu')]) as choose, \
+                 patch.object(HOST, 'perform') as perform:
+                HOST.main()
+                choose.assert_called_once()
+                perform.assert_called_once()
+                self.assertEqual(action, perform.call_args.args[0])
+
     def test_requires_authorized_unique_device(self):
         with patch.object(HOST.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0,
                           stdout='List of devices attached\na unauthorized\nb offline\n')):
@@ -132,6 +143,45 @@ class ADBInstallerTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 phone.operate('install', Path('/synthetic-computer-assets'))
         self.assertEqual(['rm', '-rf', '--', '/tmp/puhuri-adb.TEST123'], calls[-1])
+
+
+class ConciseOutputTests(unittest.TestCase):
+    def run_runner(self, code, verbose=False):
+        with tempfile.TemporaryDirectory() as stage:
+            runner = HOST.OPERATION_RUNNER
+            if verbose:
+                runner = runner.replace('verbose = False', 'verbose = True')
+            result = subprocess.run([HOST.sys.executable, '-c', runner, stage, 'synthetic-token',
+                json.dumps([HOST.sys.executable, '-c', code])], capture_output=True, text=True)
+            record = json.loads((Path(stage) / 'operation-result.json').read_text())
+            return result, record
+
+    def test_known_warnings_hidden_unknown_errors_visible(self):
+        code = "print('WARNING:root:Signature check failed, but installing anyway as requested'); print(\"(process:123): lomiri-app-launch-WARNING **: 22:45:21.101: Desktop file '/opt/click.ubuntu.com/.click/users/phablet/fi.reijo.puhuri2/puhuri-daemon.desktop' is set to not display, not copying\"); print('ERROR: unrelated failure must remain visible')"
+        result, record = self.run_runner(code)
+        self.assertEqual(0, result.returncode)
+        self.assertNotIn('Signature check', result.stdout)
+        self.assertNotIn('not copying', result.stdout)
+        self.assertIn('ERROR: unrelated failure', result.stdout)
+        self.assertEqual(0, record['exit_code'])
+
+    def test_failed_child_replays_hidden_details_and_records_failure(self):
+        result, record = self.run_runner("import sys; print('WARNING:root:Signature check failed, but installing anyway as requested'); sys.exit(7)")
+        self.assertEqual(7, result.returncode)
+        self.assertIn('Signature check failed', result.stdout)
+        self.assertEqual(7, record['exit_code'])
+
+    def test_verbose_keeps_routine_output(self):
+        result, record = self.run_runner("print('Using staged background-1.2.0.tar.gz')", verbose=True)
+        self.assertIn('Using staged', result.stdout)
+        self.assertEqual(0, record['exit_code'])
+
+    def test_menu_colours_only_number_and_parenthesis(self):
+        with patch.object(HOST, 'terminal_input', return_value=nullcontext(io.StringIO('0\n'))), \
+             patch.object(HOST.sys, 'stdout', new_callable=io.StringIO) as output:
+            self.assertEqual('exit', HOST.choose_action())
+            for number in ('1', '2', '0'):
+                self.assertIn('\033[1;32m' + number + ')\033[0m ', output.getvalue())
 
 
 if __name__ == '__main__':

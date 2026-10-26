@@ -46,17 +46,48 @@ print(json.dumps({"architecture":"arm64","python_supported":True,
                   "ordinary_user":True,"session_bus":True,"systemd_user":True,
                   "dbus_gio_glib":True,"click_sudo":True}))
 '''
-OPERATION_RUNNER = '''import json,os,subprocess,sys
+OPERATION_RUNNER = r'''import collections,json,os,re,subprocess,sys
 from pathlib import Path
 stage=Path(sys.argv[1]); token=sys.argv[2]; command=json.loads(sys.argv[3])
-completed=subprocess.run(command)
-record={"token":token,"exit_code":completed.returncode}
+verbose = False
+routine = {
+    'Exact click already installed; updating background services only.',
+    'Removing background services', 'Removing click application',
+    'Removing inherited registration for this user',
+    'User services installed: 1.2.0; verify visible notification manually',
+    'User services removed; click, messages and keys retained; no archived payload',
+    '{"service_mode": true}',
+    'Puhuri 2 1.2.0 installed; temporary downloads removed.',
+    'Puhuri 2 1.2.0 removed; account, messages, attachments and OMEMO keys retained.',
+    'WARNING:root:Signature check failed, but installing anyway as requested',
+}
+def is_routine(line):
+    text=re.sub(r'\x1b\[[0-9;]*m', '', line).strip()
+    return (not text or text in routine or text=='=== Puhuri 2 - v1.2.0 ==='
+        or text in ('Using staged fi.reijo.puhuri2_1.2.0_arm64.click',
+                    'Using staged background-1.2.0.tar.gz')
+        or re.fullmatch(r"\(process:[0-9]+\): lomiri-app-launch-WARNING \*\*: [0-9:.]+: Desktop file '/opt/click.ubuntu.com/\.click/users/[^/]+/fi\.reijo\.puhuri2/puhuri-daemon\.desktop' is set to not display, not copying", text))
+# Only child program output is filtered. sudo still opens /dev/tty itself;
+# no terminal input/password is read, captured or stored by this wrapper.
+hidden=collections.deque(maxlen=40)
+with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                      text=True, errors='replace', bufsize=1) as child:
+    for line in child.stdout:
+        if not verbose and is_routine(line):
+            if line.strip(): hidden.append(line)
+        else:
+            print(line, end='', flush=True)
+    code=child.wait()
+if code and hidden:
+    print('Operation failed; preceding details / Toiminto epäonnistui, lisätiedot:', flush=True)
+    for line in hidden: print(line, end='', flush=True)
+record={"token":token,"exit_code":code}
 temporary=stage/"operation-result.new"
 with temporary.open("x") as stream:
     json.dump(record,stream)
 temporary.chmod(0o600)
 temporary.replace(stage/"operation-result.json")
-raise SystemExit(completed.returncode)
+raise SystemExit(code)
 '''
 POSTCONDITIONS = '''import json,os,subprocess,sys
 from pathlib import Path
@@ -137,7 +168,8 @@ def terminal_input():
 
 
 class Phone:
-    def __init__(self, adb, serial):
+    def __init__(self, adb, serial, verbose=False):
+        self.verbose = verbose
         self.command = [adb, '-s', serial]
 
     def shell(self, arguments, interactive=False, capture=False):
@@ -157,7 +189,8 @@ class Phone:
         token = uuid.uuid4().hex
         transport_error = None
         try:
-            self.shell(['/usr/bin/python3', '-c', OPERATION_RUNNER, stage, token,
+            runner = OPERATION_RUNNER.replace('verbose = False', 'verbose = True') if self.verbose else OPERATION_RUNNER
+            self.shell(['/usr/bin/python3', '-c', runner, stage, token,
                         json.dumps(arguments)], interactive=True)
         except subprocess.CalledProcessError as error:
             if error.returncode != 129:
@@ -175,21 +208,24 @@ class Phone:
         if (not isinstance(result, dict) or result.get('token') != token
                 or type(result.get('exit_code')) is not int or result['exit_code'] != 0):
             raise RuntimeError('Phone operation failed or completion result did not match')
-        if transport_error:
+        if transport_error and self.verbose:
             print('Phone operation completion independently verified after ADB terminal shutdown.', flush=True)
 
     def verify_postconditions(self, action):
-        self.shell(['/usr/bin/python3', '-c', POSTCONDITIONS, action])
+        self.shell(['/usr/bin/python3', '-c', POSTCONDITIONS, action], capture=not self.verbose)
 
     def operate(self, action, directory):
+        print('Checking phone / Tarkistetaan puhelin…', flush=True)
         self.check()
         stage = self.shell(['mktemp', '-d', '/tmp/puhuri-adb.XXXXXX'], capture=True).stdout.strip()
         if not re.fullmatch(r'/tmp/puhuri-adb\.[A-Za-z0-9]+', stage):
             raise RuntimeError('Unexpected phone staging directory; refusing transfer/cleanup')
         names = list(PAYLOADS) if action == 'install' else ['install-puhuri-1.2.0.py']
         try:
+            print('Transferring files / Siirretään tiedostot…', flush=True)
             for name in names:
-                subprocess.run(self.command + ['push', str(directory / name), stage + '/' + name], check=True)
+                subprocess.run(self.command + ['push', str(directory / name), stage + '/' + name], check=True,
+                               stdout=None if self.verbose else subprocess.DEVNULL)
             manifest = {name: PAYLOADS[name] for name in names}
             verification = '''import hashlib,json,sys
 from pathlib import Path
@@ -200,8 +236,10 @@ for name,digest in expected.items():
             raise SystemExit("ADB payload checksum mismatch")
 print("ADB payload checksums OK")
 '''
-            self.shell(['/usr/bin/python3', '-c', verification, stage, json.dumps(manifest)])
-            print('Phone sudo authentication, if requested, is entered directly below.', flush=True)
+            self.shell(['/usr/bin/python3', '-c', verification, stage, json.dumps(manifest)], capture=not self.verbose)
+            print(('Installing app and services / Asennetaan sovellus ja palvelut…' if action == 'install'
+                   else 'Removing app and services / Poistetaan sovellus ja palvelut…'), flush=True)
+            print('Phone password if requested / Anna puhelimen salasana pyydettäessä.', flush=True)
             # Inherit the terminal. No password is read by this program or
             # placed in process arguments, environment variables or log files.
             self.run_interactive(['env', 'PYTHONDONTWRITEBYTECODE=1', '/usr/bin/python3',
@@ -218,7 +256,9 @@ print("ADB payload checksums OK")
 
 
 def choose_action():
-    print('1) Install or update / Asenna tai päivitä\n2) Remove / Poista\n0) Exit / Lopeta')
+    print('\033[1;32m1)\033[0m Install or update / Asenna tai päivitä\n'
+          '\033[1;32m2)\033[0m Remove / Poista\n'
+          '\033[1;32m0)\033[0m Exit / Lopeta')
     with terminal_input() as terminal:
         while True:
             print('Choose / Valitse [1/2/0]: ', end='', flush=True)
@@ -237,18 +277,21 @@ def perform(action, args):
     if not adb:
         raise RuntimeError('Install Android platform-tools/adb on the COMPUTER and add adb to PATH.')
     serial = select_device(adb, args.serial)
-    phone = Phone(adb, serial)
+    phone = Phone(adb, serial, verbose=getattr(args, 'verbose', False))
     if action == 'check':
         print(json.dumps(phone.check(), indent=2))
         return
     phone.operate(action, args.assets_dir)
-    print('Completed over ADB; temporary phone payloads removed.', flush=True)
+    print('\033[1;32mOK\033[0m ' + ('Installed / Asennettu: Puhuri 2 v' + VERSION + ' + background services / taustapalvelut.'
+           if action == 'install' else
+           'Removed / Poistettu: Puhuri 2 + services / palvelut. Data retained / Omat tiedot säilytetty.'), flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', nargs='?', choices=['install', 'remove', 'check'])
     parser.add_argument('--assets-dir', type=Path, default=Path(__file__).resolve().parent)
+    parser.add_argument('--verbose', action='store_true', help='Show full installation output / Näytä kaikki tulosteet')
     parser.add_argument('--serial', help='Use this authorized ADB device when several are attached')
     args = parser.parse_args()
     if hasattr(os, 'geteuid') and os.geteuid() == 0:
@@ -258,12 +301,11 @@ def main():
     if args.action:
         perform(args.action, args)
         return
-    while True:
-        action = choose_action()
-        if action == 'exit':
-            print('Exit / Lopetettu.')
-            return
-        perform(action, args)
+    action = choose_action()
+    if action == 'exit':
+        print('Exit / Lopetettu.')
+        return
+    perform(action, args)
 
 
 if __name__ == '__main__':

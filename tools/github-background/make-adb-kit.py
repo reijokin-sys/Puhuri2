@@ -8,7 +8,7 @@ import zipfile
 
 HERE = Path(__file__).resolve().parent
 PROJECT = HERE.parent.parent
-OUTPUT = PROJECT / 'dist/puhuri2-1.2.1-adb-installer'
+OUTPUT = PROJECT / 'dist/puhuri2-1.2.2-adb-installer'
 OUTPUT.mkdir(exist_ok=False)
 inputs = {
     HERE / 'install-adb.py': 'install-puhuri-adb.py',
