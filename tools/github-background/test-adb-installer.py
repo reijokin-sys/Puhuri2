@@ -146,13 +146,13 @@ class ADBInstallerTests(unittest.TestCase):
 
 
 class ConciseOutputTests(unittest.TestCase):
-    def run_runner(self, code, verbose=False):
+    def run_runner(self, code, verbose=False, removing=False):
         with tempfile.TemporaryDirectory() as stage:
             runner = HOST.OPERATION_RUNNER
             if verbose:
                 runner = runner.replace('verbose = False', 'verbose = True')
             result = subprocess.run([HOST.sys.executable, '-c', runner, stage, 'synthetic-token',
-                json.dumps([HOST.sys.executable, '-c', code])], capture_output=True, text=True)
+                json.dumps([HOST.sys.executable, '-c', code] + (['remove'] if removing else []))], capture_output=True, text=True)
             record = json.loads((Path(stage) / 'operation-result.json').read_text())
             return result, record
 
@@ -175,6 +175,37 @@ class ConciseOutputTests(unittest.TestCase):
         result, record = self.run_runner("print('Using staged background-1.2.0.tar.gz')", verbose=True)
         self.assertIn('Using staged', result.stdout)
         self.assertEqual(0, record['exit_code'])
+
+    def test_removal_hook_messages_deferred_but_unknown_errors_visible(self):
+        messages = [
+            "Unable to find application for 'fi.reijo.puhuri2_puhuri_1.2.0': Unable to get Click manifest for package: fi.reijo.puhuri2",
+            "** (process:123): WARNING **: 23:00:58.155: Unable to get the Click package directory for fi.reijo.puhuri2: fi.reijo.puhuri2 does not exist in any database for user phablet",
+            "** (process:123): WARNING **: 23:00:58.197: user.vala:746: Error removing cache for 'fi.reijo.puhuri2': Error opening directory '/home/phablet/.cache/fi.reijo.puhuri2': No such file or directory",
+            "terminate called after throwing an instance of 'std::runtime_error'",
+            "  what():  Unable to connect to user bus: The connection is closed",
+            "** Message: 23:00:58.328: database.vala:345: Removing /opt/click.ubuntu.com/fi.reijo.puhuri2/1.2.0",
+            "ERROR: Error removing '/var/cache/apparmor/click_fi.reijo.puhuri2_puhuri_1.2.0'",
+        ]
+        code = 'print(' + repr('\n'.join(messages)) + "); print('ERROR: unrelated remains')"
+        result, record = self.run_runner(code, removing=True)
+        self.assertEqual('ERROR: unrelated remains\n', result.stdout)
+        self.assertEqual(len(messages), len(record['suppressed']))
+        result, _ = self.run_runner(code, removing=False)
+        self.assertIn('Error removing', result.stdout)
+        result, _ = self.run_runner(code + '; raise SystemExit(7)', removing=True)
+        self.assertIn('Error removing', result.stdout)
+
+    def test_postcondition_failure_replays_suppressed_details(self):
+        phone = HOST.Phone('adb', 'synthetic-device')
+        with patch.object(phone, 'check'), \
+             patch.object(phone, 'shell', return_value=subprocess.CompletedProcess([], 0, stdout='/tmp/puhuri-adb.TEST123\n')), \
+             patch.object(phone, 'run_interactive', return_value=['synthetic hook warning\n']), \
+             patch.object(phone, 'verify_postconditions', side_effect=RuntimeError('bad removal')), \
+             patch.object(HOST.subprocess, 'run'), \
+             patch.object(HOST.sys, 'stderr', new_callable=io.StringIO) as output:
+            with self.assertRaises(RuntimeError):
+                phone.operate('remove', Path('/synthetic'))
+            self.assertIn('synthetic hook warning', output.getvalue())
 
     def test_menu_colours_only_number_and_parenthesis(self):
         with patch.object(HOST, 'terminal_input', return_value=nullcontext(io.StringIO('0\n'))), \

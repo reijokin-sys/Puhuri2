@@ -50,6 +50,7 @@ OPERATION_RUNNER = r'''import collections,json,os,re,subprocess,sys
 from pathlib import Path
 stage=Path(sys.argv[1]); token=sys.argv[2]; command=json.loads(sys.argv[3])
 verbose = False
+removing = 'remove' in command
 routine = {
     'Exact click already installed; updating background services only.',
     'Removing background services', 'Removing click application',
@@ -67,21 +68,46 @@ def is_routine(line):
         or text in ('Using staged fi.reijo.puhuri2_1.2.0_arm64.click',
                     'Using staged background-1.2.0.tar.gz')
         or re.fullmatch(r"\(process:[0-9]+\): lomiri-app-launch-WARNING \*\*: [0-9:.]+: Desktop file '/opt/click.ubuntu.com/\.click/users/[^/]+/fi\.reijo\.puhuri2/puhuri-daemon\.desktop' is set to not display, not copying", text))
+def is_removal_warning(line):
+    if not removing:
+        return False
+    text=line.strip()
+    patterns = (
+        r"Unable to find application for 'fi\.reijo\.puhuri2_puhuri(?:-daemon)?_1\.2\.0': Unable to get Click manifest for package: fi\.reijo\.puhuri2",
+        r"\*\* \(process:[0-9]+\): WARNING \*\*: [0-9:.]+: Unable to get the Click package directory for fi\.reijo\.puhuri2: fi\.reijo\.puhuri2 does not exist in any database for user [A-Za-z0-9_-]+",
+        r"\*\* \(process:[0-9]+\): WARNING \*\*: [0-9:.]+: user\.vala:746: Error removing cache for 'fi\.reijo\.puhuri2': Error opening directory '/home/[^/]+/\.cache/fi\.reijo\.puhuri2': No such file or directory",
+        r"\*\* Message: [0-9:.]+: database\.vala:345: Removing /opt/click\.ubuntu\.com/fi\.reijo\.puhuri2/1\.2\.0",
+        r"ERROR: Error removing '/var/cache/apparmor/click_fi\.reijo\.puhuri2_puhuri(?:-daemon)?_1\.2\.0'",
+    )
+    return any(re.fullmatch(pattern, text) for pattern in patterns)
 # Only child program output is filtered. sudo still opens /dev/tty itself;
 # no terminal input/password is read, captured or stored by this wrapper.
 hidden=collections.deque(maxlen=40)
 with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                       text=True, errors='replace', bufsize=1) as child:
+    pending = None
     for line in child.stdout:
-        if not verbose and is_routine(line):
+        if pending is not None:
+            if line.strip() == 'what():  Unable to connect to user bus: The connection is closed':
+                hidden.extend((pending, line))
+                pending = None
+                continue
+            print(pending, end='', flush=True)
+            pending = None
+        if (not verbose and removing and
+                line.strip() == "terminate called after throwing an instance of 'std::runtime_error'"):
+            pending = line
+            continue
+        if not verbose and (is_routine(line) or is_removal_warning(line)):
             if line.strip(): hidden.append(line)
         else:
             print(line, end='', flush=True)
+    if pending is not None: print(pending, end='', flush=True)
     code=child.wait()
 if code and hidden:
     print('Operation failed; preceding details / Toiminto epäonnistui, lisätiedot:', flush=True)
     for line in hidden: print(line, end='', flush=True)
-record={"token":token,"exit_code":code}
+record={"token":token,"exit_code":code,"suppressed":list(hidden)}
 temporary=stage/"operation-result.new"
 with temporary.open("x") as stream:
     json.dump(record,stream)
@@ -208,8 +234,13 @@ class Phone:
         if (not isinstance(result, dict) or result.get('token') != token
                 or type(result.get('exit_code')) is not int or result['exit_code'] != 0):
             raise RuntimeError('Phone operation failed or completion result did not match')
+        suppressed = result.get('suppressed', [])
+        if not isinstance(suppressed, list) or len(suppressed) > 40 or not all(isinstance(line, str) for line in suppressed):
+            raise RuntimeError('Malformed phone diagnostic details')
         if transport_error and self.verbose:
             print('Phone operation completion independently verified after ADB terminal shutdown.', flush=True)
+
+        return suppressed
 
     def verify_postconditions(self, action):
         self.shell(['/usr/bin/python3', '-c', POSTCONDITIONS, action], capture=not self.verbose)
@@ -242,10 +273,17 @@ print("ADB payload checksums OK")
             print('Phone password if requested / Anna puhelimen salasana pyydettäessä.', flush=True)
             # Inherit the terminal. No password is read by this program or
             # placed in process arguments, environment variables or log files.
-            self.run_interactive(['env', 'PYTHONDONTWRITEBYTECODE=1', '/usr/bin/python3',
+            suppressed = self.run_interactive(['env', 'PYTHONDONTWRITEBYTECODE=1', '/usr/bin/python3',
                         stage + '/install-puhuri-1.2.0.py', action,
                         '--local-assets', stage], stage)
-            self.verify_postconditions(action)
+            try:
+                self.verify_postconditions(action)
+            except Exception:
+                if suppressed:
+                    print('Verification failed; phone details / Varmennus epäonnistui, puhelimen lisätiedot:', file=sys.stderr)
+                    for line in suppressed:
+                        print(line, end='', file=sys.stderr, flush=True)
+                raise
         finally:
             try:
                 self.shell(['rm', '-rf', '--', stage])

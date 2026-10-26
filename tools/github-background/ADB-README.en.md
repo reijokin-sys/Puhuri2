@@ -6,7 +6,7 @@ and English interfaces and three colour themes. Offline recovery depends on
 your XMPP server retaining messages.
 
 **Install from a COMPUTER with an authorized ADB connection to the PHONE.**
-This release contains installer **1.2.2** for the unchanged Puhuri 2 **1.2.0**
+This release contains installer **1.2.3** for the unchanged Puhuri 2 **1.2.0**
 application and background services. It replaces the withdrawn phone-side
 installation instructions. This is a GitHub distribution, not an OpenStore release.
 
@@ -28,14 +28,14 @@ All installation payloads are downloaded to the computer and transferred by ADB.
 Run this entire block in the **COMPUTER terminal**, as your normal user:
 
 ```sh
-curl -fL --retry 3 -o puhuri2-1.2.2-adb-installer.zip https://github.com/reijokin-sys/Puhuri2/releases/download/v1.2.2/puhuri2-1.2.2-adb-installer.zip &&
-python3 -m zipfile -e puhuri2-1.2.2-adb-installer.zip . &&
-python3 puhuri2-1.2.2-adb-installer/install-puhuri-adb.py
+curl -fsSL --retry 3 -o puhuri2-1.2.3-adb-installer.zip https://github.com/reijokin-sys/Puhuri2/releases/download/v1.2.3/puhuri2-1.2.3-adb-installer.zip &&
+python3 -m zipfile -e puhuri2-1.2.3-adb-installer.zip . &&
+python3 puhuri2-1.2.3-adb-installer/install-puhuri-adb.py
 ```
 
 The first line downloads the complete ZIP with curl; Python extracts it and
 starts the installer on the computer. Use an empty working folder for the download.
-You can also download the ZIP from the [release page](https://github.com/reijokin-sys/Puhuri2/releases/tag/v1.2.2),
+You can also download the ZIP from the [release page](https://github.com/reijokin-sys/Puhuri2/releases/tag/v1.2.3),
 extract it and run `python3 install-puhuri-adb.py` inside the extracted folder.
 
 Choose **1** to install/update, **2** to remove, or **0** to exit. The installer exits
@@ -46,7 +46,7 @@ After installation completes, open Puhuri 2 on the phone and sign in to your XMP
 To open the menu again from the same computer folder:
 
 ```sh
-python3 puhuri2-1.2.2-adb-installer/install-puhuri-adb.py
+python3 puhuri2-1.2.3-adb-installer/install-puhuri-adb.py
 ```
 
 Choose 2 to uninstall. Normal removal keeps your account, messages, attachments
@@ -71,7 +71,7 @@ a temporary path if cleanup fails. Installation rollback is not automatic.
 Check dependencies without installing:
 
 ```sh
-python3 puhuri2-1.2.2-adb-installer/install-puhuri-adb.py check
+python3 puhuri2-1.2.3-adb-installer/install-puhuri-adb.py check
 ```
 
 For multiple devices add `--serial SERIAL`. SHA256SUMS inside the ZIP covers
@@ -82,13 +82,17 @@ its files; the release also includes the ZIP's checksum.
 The computer/curl/ADB path passed service update, removal and exit tests,
 then fresh click/service installation using the published ZIP. The user also
 confirmed testing this version's concise output, green menu choices and OK
-marker, and single-operation exit. Fourteen isolated checks and a synthetic
+marker, and single-operation exit. Sixteen isolated checks and a synthetic
 controlling-terminal password-prompt check pass.
 
-Known harmless unsigned-click and hidden daemon desktop-entry warnings and
+The user also tested this version’s installation and removal as separate runs;
+both ended with a clean OK line and returned to the shell.
+
+Known harmless unsigned-click, removal-hook and hidden daemon desktop-entry warnings and
 routine diagnostics are filtered. Other warnings/errors remain visible; failed
-operations also replay suppressed details. Show full output with:
-`python3 puhuri2-1.2.2-adb-installer/install-puhuri-adb.py --verbose`.
+operations also replay suppressed details. Removal-hook diagnostics are hidden
+only after successful final-state verification. Show full output with:
+`python3 puhuri2-1.2.3-adb-installer/install-puhuri-adb.py --verbose`.
 A green OK appears only after final-state verification and cleanup succeed.
 
 Incoming messages/notifications after reboot were previously tested on the
