@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """Install or remove Puhuri 2 1.2.0 and its background services."""
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -71,6 +72,8 @@ def unpack(archive, directory):
 
 
 def click_already_matches(bundle):
+    if registered_version() != VERSION:
+        return False
     meta = json.loads((bundle / 'bundle.json').read_text())
     root = CLICK_ROOT
     for name, expected in meta['click_files'].items():
@@ -83,12 +86,51 @@ def click_already_matches(bundle):
     return True
 
 
+def registered_version():
+    result = subprocess.run(['click', 'list'], check=True, capture_output=True, text=True)
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[0] == 'fi.reijo.puhuri2':
+            return fields[1]
+    return None
+
+
+def root_click_command(*arguments):
+    user = pwd.getpwuid(os.getuid())
+    runtime = '/run/user/' + str(os.getuid())
+    return ['sudo', '--', 'env', 'HOME=' + user.pw_dir,
+            'XDG_CACHE_HOME=' + user.pw_dir + '/.cache', 'XDG_RUNTIME_DIR=' + runtime,
+            'DBUS_SESSION_BUS_ADDRESS=unix:path=' + runtime + '/bus', 'click', *arguments]
+
+
+@contextmanager
+def click_session(path=None):
+    # click's user.vala reads this legacy session-env file when temporarily
+    # dropping root privileges. Newer UT provides the bus socket but not the
+    # file. Create it only for this operation, without changing existing files.
+    path = path or Path('/run/user') / str(os.getuid()) / 'dbus-session'
+    created = False
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        pass
+    else:
+        with os.fdopen(fd, 'w') as stream:
+            stream.write('DBUS_SESSION_BUS_ADDRESS=unix:path=' + str(path.parent / 'bus') + '\n')
+        created = True
+    try:
+        yield
+    finally:
+        if created:
+            path.unlink(missing_ok=True)
+
+
 def click_install_command(click):
     if shutil.which('pkcon'):
         return ['pkcon', 'install-local', '--allow-untrusted', str(click)]
     if shutil.which('click') and shutil.which('sudo'):
-        return ['sudo', '--', 'click', 'install', '--user',
-                pwd.getpwuid(os.getuid()).pw_name, '--allow-unauthenticated', str(click)]
+        return root_click_command('install', '--user', pwd.getpwuid(os.getuid()).pw_name,
+                                  '--allow-unauthenticated', str(click))
     raise RuntimeError('Installing a new click requires pkcon or click with sudo')
 
 
@@ -128,8 +170,11 @@ def remove_installation():
     base = Path.home() / '.local/share/fi.reijo.puhuri2-background'
     state_path = base / 'installed.json'
     manifest_path = CLICK_ROOT / '.click/info/fi.reijo.puhuri2.manifest'
-    click_present = manifest_path.is_file()
+    registered = registered_version()
+    click_present = registered is not None
     if click_present:
+        if registered != VERSION:
+            raise RuntimeError('This installer removes only Puhuri 2 v' + VERSION)
         manifest = json.loads(manifest_path.read_text())
         if manifest.get('name') != 'fi.reijo.puhuri2' or manifest.get('version') != VERSION:
             raise RuntimeError('This installer removes only Puhuri 2 v' + VERSION)
@@ -144,10 +189,12 @@ def remove_installation():
         subprocess.run(['/usr/bin/python3', str(payload / 'manage.py'), 'remove'], check=True)
     if click_present:
         print('Removing click application', flush=True)
-        with open('/dev/tty') as terminal:
-            subprocess.run(['sudo', '--', 'click', 'unregister', '--user',
-                            pwd.getpwuid(os.getuid()).pw_name, 'fi.reijo.puhuri2', VERSION],
+        with click_session(), open('/dev/tty') as terminal:
+            subprocess.run(root_click_command('unregister', '--user',
+                            pwd.getpwuid(os.getuid()).pw_name, 'fi.reijo.puhuri2', VERSION),
                            stdin=terminal, check=True)
+        if registered_version() is not None:
+            raise RuntimeError('Click still registered; removal did not finish')
     # The manager has exited, so its now-unused lock and empty directories can
     # be removed. Never recursively delete a home/config/data directory.
     (base / 'manager.lock').unlink(missing_ok=True)
@@ -159,20 +206,37 @@ def remove_installation():
     print('Puhuri 2 ' + VERSION + ' removed; account, messages, attachments and OMEMO keys retained.', flush=True)
 
 
+def choose_action():
+    print('1) Install or update / Asenna tai päivitä\n2) Remove / Poista\n0) Exit / Lopeta', flush=True)
+    with open('/dev/tty') as terminal:
+        while True:
+            print('Choose / Valitse [1/2/0]: ', end='', flush=True)
+            answer = terminal.readline()
+            if not answer:
+                raise RuntimeError('No terminal selection received')
+            choice = {'1': 'install', '2': 'remove', '0': 'exit'}.get(answer.strip())
+            if choice:
+                return choice
+            print('Choose 1, 2 or 0.', flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', nargs='?', choices=['install', 'remove'], default='install')
+    parser.add_argument('action', nargs='?', choices=['install', 'remove'])
     parser.add_argument('--plan', action='store_true', help='Show pinned assets; no downloads or changes')
     parser.add_argument('--local-assets', type=Path, help='Test with staged packages instead of network downloads')
     args = parser.parse_args()
     if args.plan:
-        print(json.dumps({'action': args.action, 'version': VERSION, 'base_url': BASE_URL, 'sha256': ASSETS,
+        print(json.dumps({'action': args.action or 'ask', 'version': VERSION, 'base_url': BASE_URL, 'sha256': ASSETS,
                           'phone_archives': False}, indent=2))
         return
     print('\033[1;32m=== Puhuri 2 - v' + VERSION + ' ===\033[0m', flush=True)
+    action = args.action or choose_action()
+    if action == 'exit':
+        return
     os.umask(0o077)
     managed = preflight()
-    if args.action == 'remove':
+    if action == 'remove':
         remove_installation()
         return
     # Download and verify both assets before changing any installed component.
@@ -194,8 +258,10 @@ def main():
             if matches:
                 print('Exact click already installed; updating background services only.', flush=True)
             else:
-                with open('/dev/tty') as terminal:
+                with click_session(), open('/dev/tty') as terminal:
                     subprocess.run(install_command, stdin=terminal, check=True)
+                if not click_already_matches(bundle):
+                    raise RuntimeError('Click registration or installed files do not match after installation')
             subprocess.run(['/usr/bin/python3', str(bundle / 'manage.py'), 'install'], check=True)
             subprocess.run(['/usr/bin/python3', str(bundle / 'manage.py'), 'status'], check=True)
         except Exception:

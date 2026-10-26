@@ -28,3 +28,7 @@ docs/artifacts/livewire-comparison-20261025/*.log whitespace=-blank-at-eof,-blan
 # Keep verified Git blob snapshots and archived, redacted HTML formatting.
 docs/artifacts/livewire-comparison-20261025/upstream/** -whitespace
 docs/artifacts/livewire-comparison-20261025/blocked-downloads/** -whitespace
+
+# Preserve upstream source reference and native release check output.
+docs/artifacts/release-1.2.0/click-user-reference.vala -whitespace
+docs/artifacts/release-1.2.0/*.log whitespace=-blank-at-eof,-blank-at-eol

@@ -2,6 +2,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """Isolated install/remove/rollback checks; never calls systemd or sudo."""
 import importlib.util
+from contextlib import nullcontext
+import hashlib
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -90,17 +93,59 @@ class InstallerTests(unittest.TestCase):
             with patch.object(Path, 'home', return_value=home), \
                  patch.object(installer.shutil, 'which', return_value='/usr/bin/tool'), \
                  patch('builtins.open', create=True) as tty, \
+                 patch.object(installer, 'click_session', side_effect=lambda: nullcontext()), \
+                 patch.object(installer, 'registered_version', side_effect=['1.2.0', None]) as registration, \
                  patch.object(installer.subprocess, 'run') as run, \
                  patch.object(installer, 'download', side_effect=AssertionError('No download during removal')):
                 installer.remove_installation()
                 command = run.call_args.args[0]
-                self.assertEqual(['sudo', '--', 'click', 'unregister'], command[:4])
+                self.assertEqual(['sudo', '--', 'env'], command[:3])
+                self.assertIn('unregister', command)
+                self.assertTrue(any(x.startswith('HOME=') for x in command))
+                self.assertTrue(any(x.startswith('DBUS_SESSION_BUS_ADDRESS=') for x in command))
                 self.assertEqual(['fi.reijo.puhuri2', '1.2.0'], command[-2:])
                 manifest.write_text(json.dumps({'name': 'fi.reijo.puhuri2', 'version': '9.0.0'}))
                 run.reset_mock()
+                registration.side_effect = None
+                registration.return_value = '9.0.0'
                 with self.assertRaises(RuntimeError):
                     installer.remove_installation()
                 run.assert_not_called()
+
+    def test_leftover_click_files_do_not_count_as_user_registration(self):
+        installer = module('registration_under_test', 'install-release.py')
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            installer.CLICK_ROOT = root
+            (root / 'puhuri.py').write_bytes(b'synthetic source')
+            (root / 'bundle.json').write_text(json.dumps({'click_files': {
+                'puhuri.py': hashlib.sha256(b'synthetic source').hexdigest()}}))
+            with patch.object(installer, 'registered_version', return_value=None):
+                self.assertFalse(installer.click_already_matches(root))
+            with patch.object(installer, 'registered_version', return_value='1.2.0'):
+                self.assertTrue(installer.click_already_matches(root))
+
+    def test_menu_retries_invalid_input_and_returns_requested_action(self):
+        installer = module('menu_under_test', 'install-release.py')
+        with patch('builtins.open', return_value=io.StringIO('invalid\n2\n')):
+            self.assertEqual('remove', installer.choose_action())
+        with patch('builtins.open', return_value=io.StringIO('1\n')):
+            self.assertEqual('install', installer.choose_action())
+        with patch('builtins.open', return_value=io.StringIO('0\n')):
+            self.assertEqual('exit', installer.choose_action())
+
+    def test_click_session_compatibility_is_temporary_and_preserves_existing_file(self):
+        installer = module('session_under_test', 'install-release.py')
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'dbus-session'
+            with installer.click_session(path):
+                self.assertEqual('DBUS_SESSION_BUS_ADDRESS=unix:path=' + str(path.parent / 'bus') + '\n', path.read_text())
+                self.assertEqual(0o600, path.stat().st_mode & 0o777)
+            self.assertFalse(path.exists())
+            path.write_text('existing-session')
+            with installer.click_session(path):
+                self.assertEqual('existing-session', path.read_text())
+            self.assertEqual('existing-session', path.read_text())
 
 
 if __name__ == '__main__':

@@ -14,16 +14,17 @@ automatic startup and checks their status. The services run unconfined with
 the logged-in user's access; the app keeps its click policy. No push bridge
 is required. Without the service add-on, the app receives messages on opening.
 
-## Install
+## Install or remove
 
 For Ubuntu Touch 24.04 on arm64. Close Puhuri 2 first. Open the phone's Terminal
 and run this command as the ordinary user, **without adding sudo**:
 
 ```sh
-bash -o pipefail -c 'curl -fsSL https://github.com/reijokin-sys/Puhuri2/releases/download/v1.2.0/install-puhuri-1.2.0.py | python3 - install'
+bash -o pipefail -c 'curl -fsSL https://github.com/reijokin-sys/Puhuri2/releases/download/v1.2.0/install-puhuri-1.2.0.py | python3 -'
 ```
 
-The installer downloads the matching click and background add-on, verifies
+After the green heading, choose **1** to install/update, **2** to remove, or
+**0** to exit. For installation, the installer downloads the matching click and background add-on, verifies
 their SHA-256 checksums, installs them and removes the temporary downloads.
 It may ask for installation confirmation or your phone password through sudo.
 An already matching click is kept, and the services are installed again.
@@ -33,7 +34,8 @@ is required. Old manually installed development services need separate migration
 
 ## Remove
 
-Close Puhuri 2, then run:
+Close Puhuri 2, run the same command and choose **2**. For an explicit removal
+command, you can also run:
 
 ```sh
 bash -o pipefail -c 'curl -fsSL https://github.com/reijokin-sys/Puhuri2/releases/download/v1.2.0/install-puhuri-1.2.0.py | python3 - remove'

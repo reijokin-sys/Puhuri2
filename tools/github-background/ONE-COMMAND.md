@@ -27,3 +27,20 @@ Prior tests confirmed the exact-click/add-on-reinstall path and green banner.
 The new install/remove cycle is awaiting the user's manual test. It is not a
 GitHub download test. Isolated tests cover service install, failure rollback,
 removal/data retention and matching-version removal command selection.
+
+## Interactive menu and registration correction
+
+Normal invocation without an action asks immediately after the green heading:
+1 install/update, 2 remove, 0 exit. It reads the choice from /dev/tty so the
+streamed GitHub installer still works. Explicit install/remove remain available
+for scripting. The default staged wrapper now also shows the menu.
+
+A matching click means both a current-user `click list` registration and exact
+file hashes. Leftover files after unregister are never enough to skip install.
+The installer verifies registration/files after installing and verifies absence
+from click list after unregister. A temporary legacy dbus-session environment
+file supports click's user-session stopping hook; it is removed on exit if the
+installer created it, and existing session files are untouched. Root click gets
+the real user's HOME/cache and bus environment. No persistent phone fix or
+backup is added. Tests cover missing registration, menu choices and session
+file creation/cleanup in addition to install/remove/rollback.
