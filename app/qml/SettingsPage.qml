@@ -100,7 +100,8 @@ Page {
             Label {
                 width: parent.width
                 wrapMode: Text.WordWrap
-                text: tr("settings.openToReceive")
+                text: page.device && page.device.service_mode === true
+                      ? tr("settings.serviceReceiver") : tr("settings.openToReceive")
             }
 
             Label { text: tr("settings.account"); font.pixelSize: Fonts.bigger(FontUtils.sizeToPixels("large")) }

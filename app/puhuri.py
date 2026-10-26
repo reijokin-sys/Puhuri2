@@ -47,6 +47,10 @@ def ensure_confined_helpers():
     This removes the URL dispatcher, generated systemd units and profile
     transition. The inherited labels still need verification on-device.
     """
+    # A managed receiver is restarted by systemd. Never race it with a UI
+    # child during installation, updates, or a temporary service failure.
+    if os.path.exists(os.path.join(CONFIG_DIR, "service-managed")):
+        return
     for name, arguments in (
         ("puhurid", ["--engine", "xmpp"]),
     ):

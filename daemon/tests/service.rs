@@ -6,7 +6,7 @@
 //! logging in, injecting an incoming message, reading it back and sending a
 //! reply - without touching an XMPP server.
 
-use puhurid::engine::FakeEngineHolder;
+use puhurid::engine::*;
 use puhurid::protocol::{Request, Response};
 use puhurid::server::Server;
 use puhurid::store::Store;
@@ -29,6 +29,50 @@ fn start(name: &str) -> TestService {
 /// Start the service, letting the caller configure the store (the same SQLite
 /// file the service will use) before it does.
 fn start_with(name: &str, configure: impl FnOnce(&Store)) -> TestService {
+    start_options(name, configure, false)
+}
+
+// A test-only engine whose pause is observable. FakeEngine's default pause
+// is intentionally a no-op, so it cannot detect a server lifecycle regression.
+struct PausingEngine(Arc<dyn Engine>);
+impl Engine for PausingEngine {
+    fn pause(&self) -> EngineResult<()> { self.0.disconnect() }
+    fn name(&self) -> &'static str { self.0.name() }
+    fn status(&self) -> Status { self.0.status() }
+    fn connect(&self, jid: &str, password: &str) -> EngineResult<()> { self.0.connect(jid, password) }
+    fn disconnect(&self) -> EngineResult<()> { self.0.disconnect() }
+    fn conversations(&self) -> EngineResult<Vec<Conversation>> { self.0.conversations() }
+    fn roster(&self) -> EngineResult<Vec<Contact>> { self.0.roster() }
+    fn messages(&self, thread: &str, limit: usize) -> EngineResult<Vec<Message>> { self.0.messages(thread, limit) }
+    fn send(&self, thread: &str, text: &str) -> EngineResult<Message> { self.0.send(thread, text) }
+    fn send_encrypted(&self, thread: &str, text: &str) -> EngineResult<Message> { self.0.send_encrypted(thread, text) }
+    fn stage_image(&self, thread: &str, path: &str) -> EngineResult<AttachmentDraft> { self.0.stage_image(thread, path) }
+    fn start_voice(&self, thread: &str) -> EngineResult<()> { self.0.start_voice(thread) }
+    fn stop_voice(&self) -> EngineResult<AttachmentDraft> { self.0.stop_voice() }
+    fn draft(&self) -> EngineResult<Option<AttachmentDraft>> { self.0.draft() }
+    fn send_draft(&self, caption: &str) -> EngineResult<Message> { self.0.send_draft(caption) }
+    fn cancel_draft(&self) -> EngineResult<()> { self.0.cancel_draft() }
+    fn mark_read(&self, thread: &str) -> EngineResult<()> { self.0.mark_read(thread) }
+    fn send_typing(&self, thread: &str, typing: bool) -> EngineResult<()> { self.0.send_typing(thread, typing) }
+    fn delete_message(&self, thread: &str, id: &str, for_everyone: bool) -> EngineResult<()> { self.0.delete_message(thread, id, for_everyone) }
+    fn delete_conversation(&self, thread: &str) -> EngineResult<()> { self.0.delete_conversation(thread) }
+    fn poll_events(&self) -> Vec<EngineEvent> { self.0.poll_events() }
+    fn omemo_devices(&self, thread: &str) -> EngineResult<Vec<PeerDevice>> { self.0.omemo_devices(thread) }
+    fn omemo_trust(&self, thread: &str) -> EngineResult<Vec<TrustedDevice>> { self.0.omemo_trust(thread) }
+    fn omemo_verify(&self, thread: &str, device_id: i32, verified: bool) -> EngineResult<()> { self.0.omemo_verify(thread, device_id, verified) }
+    fn omemo_accept_identity(&self, thread: &str, device_id: i32) -> EngineResult<()> { self.0.omemo_accept_identity(thread, device_id) }
+    fn omemo_forget_device(&self, thread: &str, device_id: i32) -> EngineResult<u32> { self.0.omemo_forget_device(thread, device_id) }
+    fn encrypted_threads(&self) -> EngineResult<Vec<String>> { self.0.encrypted_threads() }
+    fn set_encrypted(&self, thread: &str, encrypted: bool) -> EngineResult<()> { self.0.set_encrypted(thread, encrypted) }
+    fn push_settings(&self) -> EngineResult<Option<PushSettings>> { self.0.push_settings() }
+    fn enable_push(&self, jid: &str, node: &str, module: &str) -> EngineResult<PushSettings> { self.0.enable_push(jid, node, module) }
+    fn disable_push(&self) -> EngineResult<()> { self.0.disable_push() }
+    fn wake(&self) -> EngineResult<bool> { self.0.wake() }
+    fn poll_seconds(&self) -> EngineResult<Option<u32>> { self.0.poll_seconds() }
+    fn set_poll_seconds(&self, seconds: Option<u32>) -> EngineResult<()> { self.0.set_poll_seconds(seconds) }
+}
+
+fn start_options(name: &str, configure: impl FnOnce(&Store), service_mode: bool) -> TestService {
     let dir = std::env::temp_dir().join(format!("puhuri-it-{}-{}", std::process::id(), name));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -40,7 +84,8 @@ fn start_with(name: &str, configure: impl FnOnce(&Store)) -> TestService {
     configure(&store);
     let fake = Arc::new(FakeEngineHolder::new(Arc::clone(&store)));
     let purge_marker = dir.with_extension("purge-ui-dirs");
-    let server = Server::new(fake.engine(), Some(Arc::clone(&fake)), store, dir.clone())
+    let server = Server::new(Arc::new(PausingEngine(fake.engine())), Some(Arc::clone(&fake)), store, dir.clone())
+        .with_service_mode(service_mode)
         .with_purge_marker(Some(purge_marker.clone()), false);
     let socket_for_thread = socket.clone();
     std::thread::spawn(move || {
@@ -57,6 +102,32 @@ fn start_with(name: &str, configure: impl FnOnce(&Store)) -> TestService {
         dir,
         purge_marker,
     }
+}
+
+#[test]
+fn persistent_receiver_survives_ui_pause_but_honors_logout() {
+    let service = start_options("persistent-lifecycle", |_| {}, true);
+    result_of(call(&service.socket, 1, "account.login",
+        json!({"jid":"me@puhuri.test","password":"test-password"})));
+    let hidden = result_of(call(&service.socket, 2, "lifecycle.active",
+        json!({"active":false,"service_mode":false})));
+    assert_eq!(hidden["service_mode"], json!(true));
+    let status = result_of(call(&service.socket, 3, "status", json!({})));
+    assert_eq!(status["connected"], json!(true));
+    result_of(call(&service.socket, 4, "account.logout", json!({})));
+    let status = result_of(call(&service.socket, 5, "status", json!({})));
+    assert_eq!(status["connected"], json!(false));
+}
+
+#[test]
+fn ordinary_receiver_still_pauses_with_ui() {
+    let service = start("ordinary-lifecycle");
+    result_of(call(&service.socket, 1, "account.login",
+        json!({"jid":"me@puhuri.test","password":"test-password"})));
+    result_of(call(&service.socket, 2, "lifecycle.active", json!({"active":false})));
+    let status = result_of(call(&service.socket, 3, "status", json!({})));
+    assert_eq!(status["connected"], json!(false));
+    assert_eq!(status["service_mode"], json!(false));
 }
 
 impl Drop for TestService {

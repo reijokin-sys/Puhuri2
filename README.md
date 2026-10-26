@@ -1,51 +1,60 @@
-# Puhuri 2
+# Puhuri 2 v1.2.0
 
-Puhuri 2 is an XMPP messenger for Ubuntu Touch. It is a separate application
-with its own click identity (`fi.reijo.puhuri2`), configuration and application
-data. The original Puhuri project is not required.
+Puhuri 2 is an XMPP messenger for Ubuntu Touch (arm64). It supports private
+one-to-one chats, OMEMO encryption, offline message recovery through MAM,
+delivery receipts, unread indicators, pictures and voice messages. The
+interface is available in English and Finnish with three colour themes.
+Offline recovery depends on your XMPP server retaining messages.
 
-Version 1.1.6 receives messages when you open the app or return to it.
-It does not provide closed-app push notifications. The GitHub package is
-separate from the OpenStore listing; this version has not been submitted
-to OpenStore.
+Background reception and notifications use two separate user services:
+`puhurid2.service` keeps the XMPP receiver running, and
+`puhuri2-indicator.service` provides notifications and the messaging menu.
+The installer installs the click application and both services, enables their
+automatic startup and checks their status. The services run unconfined with
+the logged-in user's access; the app keeps its click policy. No push bridge
+is required. Without the service add-on, the app receives messages on opening.
 
-Puhuri 2 supports one-to-one XMPP chat, OMEMO encryption, message archive
-management (MAM), image attachments and voice messages. The interface is
-available in English and Finnish, with blue-black, red and green themes.
+## Install
 
-## Receiving messages
+For Ubuntu Touch 24.04 on arm64. Close Puhuri 2 first. Open the phone's Terminal
+and run this command as the ordinary user, **without adding sudo**:
 
-Puhuri 2 connects when you open it and retrieves messages retained by your
-XMPP server. Offline recovery requires the server to retain messages;
-MAM support and archive policy determine which history can be recovered.
-Existing messages, attachments and OMEMO keys remain in the app's storage.
+```sh
+bash -o pipefail -c 'curl -fsSL https://github.com/reijokin-sys/Puhuri2/releases/download/v1.2.0/install-puhuri-1.2.0.py | python3 - install'
+```
 
-The conversation list refreshes after a successful local read marker.
-New messages loaded into the active foreground conversation are marked read;
-hidden conversations and background loading do not mark them read.
+The installer downloads the matching click and background add-on, verifies
+their SHA-256 checksums, installs them and removes the temporary downloads.
+It may ask for installation confirmation or your phone password through sudo.
+An already matching click is kept, and the services are installed again.
+Existing accounts, messages, attachments and OMEMO keys are retained.
+Terminal access to Bash, curl, Python 3 and the normal user systemd/session bus
+is required. Old manually installed development services need separate migration.
 
-Delivery receipts are queued when a newly received message requests one,
-including new offline messages recovered from MAM after receipt activation.
-They use the original sender's message ID and are independent of reading a
-conversation. Previously imported history and carbon copies do not trigger
-new receipts. Receipt activation does not backfill older archive history.
+## Remove
 
-There is no push bridge, push registration or closed-app notification hook
-in this candidate. No notification is promised while the app is closed.
-Returning to the foreground reconnects and synchronizes messages. The app
-uses its bundled confined daemon and installs no systemd services or
-unconfined setup helpers.
+Close Puhuri 2, then run:
 
-## Build
+```sh
+bash -o pipefail -c 'curl -fsSL https://github.com/reijokin-sys/Puhuri2/releases/download/v1.2.0/install-puhuri-1.2.0.py | python3 - remove'
+```
 
-Use `PUHURI_FEATURES=omemo tools/build-daemon.sh` followed by `tools/build.sh`.
-The click includes the QML/Python UI, arm64 Qt 5 recorder and Rust XMPP daemon.
-Third-party licence texts are bundled in `THIRD_PARTY_LICENSES.txt` with the
-inventory in `THIRD_PARTY_NOTICES.md`. Own source: `AGPL-3.0-or-later`.
+This stops/disables and removes the background services and their code, then
+uninstalls the v1.2.0 click. Account settings, messages, attachments and OMEMO
+keys stay on the phone. This is not a data purge. No backup/version archives
+are left on the phone. The version-pinned installer refuses to remove a newer
+click. If interrupted, rerun the matching command; automatic click rollback
+is not provided.
 
-## Privacy and limitations
+## Validation and source
 
-Account configuration, message history, attachments and OMEMO state are
-stored in Puhuri 2's own application directories. The original Puhuri app
-is separate. Server compatibility and voice recording still require testing
-on the intended ordinary Ubuntu Touch installation.
+Message reception and notifications, including after reboot without opening
+the app, were confirmed on one development phone. A clean Ubuntu Touch test
+was not performed. Long sleep and network-loss checks remain open. The
+background services can increase battery use; behaviour during sleep depends
+on the device and network.
+
+Own source is licensed under AGPL-3.0-or-later. The click and add-on include
+`LICENSE`, `THIRD_PARTY_NOTICES.md` and `THIRD_PARTY_LICENSES.txt`.
+Build with `PUHURI_FEATURES=omemo tools/build-daemon.sh` and `tools/build.sh`;
+Qt 5 recorder build details are in `tools/build-qaudio-plugin.sh`.

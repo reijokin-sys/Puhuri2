@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! The background service.
 //!
-//!     puhurid [--data-dir DIR] [--socket PATH] [--engine xmpp|fake]
+//!     puhurid [--data-dir DIR] [--socket PATH] [--engine xmpp|fake] [--service-mode]
 //!
 //! Puhuri 2's confined UI launches it as a child process. It can also run by
 //! hand for development and debugging.
@@ -18,10 +18,12 @@ fn main() {
     let mut data_dir = default_data_dir();
     let mut socket_path = default_socket_path();
     let mut engine_name = "xmpp".to_string();
+    let mut service_mode = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--service-mode" => service_mode = true,
             "--data-dir" => {
                 data_dir = PathBuf::from(args.next().unwrap_or_else(|| usage()));
             }
@@ -49,6 +51,18 @@ fn main() {
     }
 
     std::fs::create_dir_all(&data_dir).expect("tietohakemiston luonti epäonnistui");
+    // Hold ownership before opening SQLite or starting XMPP. The UI fallback
+    // and systemd must never operate two writers on the same data directory.
+    use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+    let _instance_lock = std::fs::OpenOptions::new()
+        .read(true).write(true).create(true).truncate(false).mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(data_dir.join("daemon.lock"))
+        .expect("daemon-lukon avaus epäonnistui");
+    if unsafe { libc::flock(_instance_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        eprintln!("puhurid: tietovarastolla on jo daemon; toista ei käynnistetä");
+        std::process::exit(1);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -62,8 +76,9 @@ fn main() {
                     .name("puhuri-click-watchdog".to_string())
                     .spawn(move || loop {
                         std::thread::sleep(std::time::Duration::from_secs(2));
-                        if !root.join("lib/aarch64-linux-gnu/bin/puhurid").exists() {
-                            eprintln!("puhurid: click poistettu; taustapalvelu lopetetaan");
+                        let current = std::fs::canonicalize(root.join("lib/aarch64-linux-gnu/bin/puhurid"));
+                        if current.as_ref().ok() != Some(&executable) {
+                            eprintln!("puhurid: click poistettu tai päivitetty; taustapalvelu lopetetaan");
                             std::process::exit(0);
                         }
                     })
@@ -112,6 +127,7 @@ fn main() {
     });
     let exit_after_purge = std::env::var_os("PUHURI_RESTART_AFTER_PURGE").is_some();
     let server = Server::new(engine, fake, store, data_dir)
+        .with_service_mode(service_mode)
         .with_purge_marker(purge_marker, exit_after_purge);
     if let Err(error) = server.run(&socket_path) {
         eprintln!("puhurid: palvelin pysähtyi: {error}");
@@ -122,7 +138,7 @@ fn main() {
 fn usage() -> ! {
     eprintln!(
         "käyttö: puhurid [--data-dir DIR] [--socket PATH] [--engine xmpp|fake] \
-         [--print-paths] [--version]"
+         [--service-mode] [--print-paths] [--version]"
     );
     std::process::exit(2)
 }

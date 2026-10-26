@@ -28,6 +28,8 @@ pub struct Server {
     purge_marker: Option<PathBuf>,
     exit_after_purge: bool,
     purge_requested: Arc<AtomicBool>,
+    /// Chosen by the process launcher, never writable over the UI socket.
+    service_mode: bool,
 }
 
 impl Server {
@@ -46,12 +48,18 @@ impl Server {
             purge_marker: None,
             exit_after_purge: false,
             purge_requested: Arc::new(AtomicBool::new(false)),
+            service_mode: false,
         }
     }
 
     pub fn with_purge_marker(mut self, marker: Option<PathBuf>, exit_after: bool) -> Self {
         self.purge_marker = marker;
         self.exit_after_purge = exit_after;
+        self
+    }
+
+    pub fn with_service_mode(mut self, enabled: bool) -> Self {
+        self.service_mode = enabled;
         self
     }
 
@@ -113,6 +121,7 @@ impl Server {
             purge_marker: self.purge_marker.clone(),
             exit_after_purge: self.exit_after_purge,
             purge_requested: Arc::clone(&self.purge_requested),
+            service_mode: self.service_mode,
         })
     }
 
@@ -208,7 +217,11 @@ impl Server {
 
     fn dispatch_inner(&self, request: &Request) -> Result<Value, String> {
         match request.cmd.as_str() {
-            "status" => Ok(json!(self.engine.status())),
+            "status" => {
+                let mut status = json!(self.engine.status());
+                status["service_mode"] = json!(self.service_mode);
+                Ok(status)
+            }
             "account.login" => {
                 let jid = arg_str(request, "jid")?;
                 let password = arg_str(request, "password")?;
@@ -502,12 +515,12 @@ impl Server {
             }
             "lifecycle.active" => {
                 let active=request.args.get("active").and_then(Value::as_bool).unwrap_or(true);
-                if !active {
+                if !active && !self.service_mode {
                     self.engine.pause()?;
                 } else if active && !self.engine.status().connected {
                     if let Some((jid,password))=self.store.account() {self.engine.connect(&jid,&password)?;}
                 }
-                Ok(json!({"active":active}))
+                Ok(json!({"active":active,"service_mode":self.service_mode}))
             }
             "push.notice.state" => {
                 let account=self.privacy_account()?;

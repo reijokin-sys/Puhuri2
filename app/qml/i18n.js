@@ -120,6 +120,7 @@ var strings = {
         "settings.openToReceive": "Messages are fetched when you open Puhuri 2. No notifications arrive while the app is closed. Offline recovery depends on your XMPP server retaining messages.",
         "settings.account": "Account",
         "settings.connected": "The connection is open.",
+        "settings.serviceReceiver": "Background receiver mode is active. Notifications require the separate notification service. Battery use and reception during sleep depend on the device.",
         "settings.polling": "Battery-saving mode: the connection is shut and "
                             + "opened every ",
         "settings.pollingSuffix": " seconds.",
@@ -265,6 +266,7 @@ var strings = {
         "settings.openToReceive": "Viestit haetaan, kun avaat Puhuri 2:n. Sovelluksen ollessa suljettuna ilmoituksia ei tule. Viestien palautuminen edellyttää, että XMPP-palvelin säilyttää ne.",
         "settings.account": "Tili",
         "settings.connected": "Yhteys on auki.",
+        "settings.serviceReceiver": "Taustavastaanottimen tila on käytössä. Ilmoitukset edellyttävät erillistä ilmoituspalvelua. Virrankulutus ja vastaanotto levossa riippuvat laitteesta.",
         "settings.polling": "Akkua säästävä tila: yhteys on kiinni ja avataan ",
         "settings.pollingSuffix": " sekunnin välein.",
         "settings.disconnected": "Yhteys ei ole auki.",
