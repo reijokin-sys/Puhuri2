@@ -6,9 +6,15 @@ ja ääniviestit. Käyttöliittymän kielet ovat suomi ja englanti, ja väriteem
 on kolme. Offline-viestien haku riippuu XMPP-palvelimen viestihistoriatuesta.
 
 **Asennus tehdään TIETOKONEELLA, josta on hyväksytty ADB-yhteys PUHELIMEEN.**
-Julkaisu sisältää asentimen **1.2.5**, joka asentaa muuttumattoman Puhuri 2
+Julkaisu sisältää asentimen **1.2.5**, joka asentaa Puhuri 2
 **1.2.4** -sovelluksen ja taustapalvelut. Tämä korvaa poistetun julkaisun
 puhelimessa ajettavan asennusohjeen. Jakelu tapahtuu GitHubista.
+
+## Tässä versiossa
+
+- Pysyvä mustavihreä P-kuvake.
+- Ensimmäisen OMEMO-viestin palautuminen viestipyynnön hyväksymisen jälkeen.
+- Ilmoitus uudesta viestipyynnöstä ennen hyväksymistä.
 
 ## Vaatimukset
 
@@ -81,31 +87,21 @@ tiedostojen tarkistussummat; julkaisussa on myös ZIPin tarkistussumma.
 
 ## Testauksen rajaus
 
-Käyttäjä vahvisti tämän käynnistimen toimivaksi paikallisella paketilla.
-Neljä curl-putkituksen ja terminaalin testiä läpäistiin: valinta toimii,
-lataus- ja tarkistussummavirhe estävät käynnistyksen, argumentit välittyvät ja
-tietokoneen väliaikaistiedostot siivotaan. Käynnistin ei asenna Pythonia tai ADB:tä.
+Sovellus1.2.4 ja taustapalvelut päivitettiin kehityspuhelimeen ADB:llä.
+Kaikki89 pakettitiedostoa ja8 palvelutiedostoa vastaavat rakennettua pakettia;
+palvelut ovat käynnissä. Käyttäjä vahvisti uuden kuvakkeen näkyvän oikein.
+Ensimmäisen OMEMO-viestin korjaus testattiin käyttäjän puhelimessa1.2.1:llä
+ja viestipyyntöilmoitus1.2.2:lla; samat korjaukset sisältyvät tähän pakettiin.
+Asentimen18 eristettyä testiä, palveluasentimen8 testiä ja käynnistimen4
+curl/terminaalitestiä läpäistiin. Aiemmat asennus/poistokokeet koskevat
+vanhempia versioita; uudella paketilla tehtiin päivitys, ei uutta poistokoetta.
+Puhdasta Ubuntu Touch-/OpenStore-koetta ei tehty. Muut puhelinmallit, pitkä
+lepotila ja verkkokatkokset ovat avoimia. Aiempi uudelleenkäynnistyksen
+jälkeinen viesti-/ilmoitustulos koskee vanhempaa versiota.
 
-
-Tietokone/curl/ADB-polun palvelupäivitys, poisto ja lopetus testattiin ensin.
-Sen jälkeen GitHubista ladatulla paketilla tehty tuore click- ja palveluasennus
-onnistui. Käyttäjä vahvisti myös tämän version tiiviin tulosteen, vihreät valikon
-numerot ja OK-merkinnän sekä yhden toiminnon jälkeen päättymisen testatuiksi.
-16 eristettyä testiä ja synteettinen terminaalin salasanakyselykoe läpäistiin.
-
-Käyttäjä testasi myös tämän version asennuksen ja poiston erillisinä ajoina:
-molemmat päättyivät siistiin OK-riviin ja komentokehotteeseen.
-
-Tunnetut harmittomat allekirjoitus-, poistokoukku- ja piilotetun daemon-kuvakkeen varoitukset
-sekä tekniset välitulosteet suodatetaan. Muut varoitukset ja virheet näkyvät;
-epäonnistumisessa näytetään myös suodatettuja lisätietoja. Poistokoukkujen
-viestit piilotetaan vain, kun poiston lopputila on varmennettu. Kaikki tulosteet:
-`python3 puhuri2-1.2.5-adb-installer/install-puhuri-adb.py --verbose`.
-Onnistuminen merkitään vihreällä OK:lla vasta lopputilan ja siivouksen jälkeen.
-
-Viestit ja ilmoitukset uudelleenkäynnistyksen jälkeen on aiemmin testattu
-kehityspuhelimessa. Puhdasta Ubuntu Touch -asennusta ei testattu. Muut laitteet,
-pitkä lepotila ja verkkokatkoista palautuminen ovat vielä varmentamatta.
+Tunnettuja click-poistokoukun varoituksia suodatetaan vasta varmennetun
+onnistumisen jälkeen. Virhetilanteessa lisätiedot näytetään; kaikki tulosteet
+saa valinnalla --verbose. Päivitys säilyttää tilin, viestit ja avaimet.
 
 ## Lisenssi
 

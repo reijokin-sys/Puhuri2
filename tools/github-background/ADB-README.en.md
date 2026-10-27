@@ -88,31 +88,19 @@ its files; the release also includes the ZIP's checksum.
 
 ## Test scope
 
-The user confirmed this launcher works with the local package. Four real
-curl-pipe/terminal tests passed: terminal choice, download/checksum failure
-blocking, argument forwarding and temporary computer file cleanup. The launcher
-does not install Python or adb.
+Application1.2.4 and background services were updated over ADB on the development
+phone. All89 click files and8 service files match; services are running. User
+confirmed the new icon. First-contact OMEMO recovery was user-tested on1.2.1;
+message-request notifications were user-tested on1.2.2. Those fixes are included.
+18 isolated host installer checks,8 service manager tests and4 real curl/PTY
+launcher checks pass. Previous install/remove tests cover earlier versions;
+this package was tested by update, without a new removal cycle. No clean Ubuntu
+Touch/OpenStore test was performed. Other devices, long sleep and network-loss
+recovery remain open. Earlier reboot notification tests concern an older build.
 
-
-The computer/curl/ADB path passed service update, removal and exit tests,
-then fresh click/service installation using the published ZIP. The user also
-confirmed testing this version's concise output, green menu choices and OK
-marker, and single-operation exit. Sixteen isolated checks and a synthetic
-controlling-terminal password-prompt check pass.
-
-The user also tested this version’s installation and removal as separate runs;
-both ended with a clean OK line and returned to the shell.
-
-Known harmless unsigned-click, removal-hook and hidden daemon desktop-entry warnings and
-routine diagnostics are filtered. Other warnings/errors remain visible; failed
-operations also replay suppressed details. Removal-hook diagnostics are hidden
-only after successful final-state verification. Show full output with:
-`python3 puhuri2-1.2.5-adb-installer/install-puhuri-adb.py --verbose`.
-A green OK appears only after final-state verification and cleanup succeed.
-
-Incoming messages/notifications after reboot were previously tested on the
-development phone. No clean Ubuntu Touch installation test was done; other
-devices, long sleep and network-loss recovery remain unverified.
+Known click hook diagnostics are suppressed only after verified success;
+failures replay additional details. Use --verbose for full output. Updates
+retain accounts, messages and keys.
 
 ## Licence
 
