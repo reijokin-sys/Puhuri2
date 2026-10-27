@@ -5,7 +5,7 @@ Terminal=false
 Name=Puhuri 2
 Comment=Natiivi XMPP-viestinsovellus
 Exec=qmlscene -I . %U qml/Main.qml
-Icon=assets/puhuri.png
+Icon=assets/puhuri-black-green.png
 X-Ubuntu-Touch=true
 # Kaynnistysikkunan vari (2026-10-16 ilta 8, ks. docs/TEEMAT.md).
 #

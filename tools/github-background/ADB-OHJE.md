@@ -6,8 +6,8 @@ ja ääniviestit. Käyttöliittymän kielet ovat suomi ja englanti, ja väriteem
 on kolme. Offline-viestien haku riippuu XMPP-palvelimen viestihistoriatuesta.
 
 **Asennus tehdään TIETOKONEELLA, josta on hyväksytty ADB-yhteys PUHELIMEEN.**
-Julkaisu sisältää asentimen **1.2.4**, joka asentaa muuttumattoman Puhuri 2
-**1.2.0** -sovelluksen ja taustapalvelut. Tämä korvaa poistetun julkaisun
+Julkaisu sisältää asentimen **1.2.5**, joka asentaa muuttumattoman Puhuri 2
+**1.2.4** -sovelluksen ja taustapalvelut. Tämä korvaa poistetun julkaisun
 puhelimessa ajettavan asennusohjeen. Jakelu tapahtuu GitHubista.
 
 ## Vaatimukset
@@ -29,7 +29,7 @@ kirjoitettavaksi. Kaikki asennustiedostot haetaan tietokoneelle ja siirretään 
 Aja TIETOKONEEN terminaalissa tavallisena käyttäjänä:
 
 ```sh
-curl -fsSL https://github.com/reijokin-sys/Puhuri2/releases/download/v1.2.4/install.sh | sh
+curl -fsSL https://github.com/reijokin-sys/Puhuri2/releases/download/v1.2.5/install.sh | sh
 ```
 
 Käynnistin näyttää ”Ladataan asenninta…”, lataa ja tarkistaa koko paketin,
@@ -57,7 +57,7 @@ python3 install-puhuri-adb.py
 ## Mitä asennetaan
 
 Asennin tarkistaa tiedostojen SHA-256-tarkistussummat, siirtää ne puhelimen
-väliaikaishakemistoon, varmistaa siirron ja asentaa Puhuri 2 v1.2.0 -clickin
+väliaikaishakemistoon, varmistaa siirron ja asentaa Puhuri 2 v1.2.4 -clickin
 sekä kaksi automaattisesti käynnistyvää käyttäjäpalvelua:
 
 - `puhurid2.service`: jatkuva XMPP-vastaanotin.
@@ -73,7 +73,7 @@ jos siivous ei onnistu. Automaattista asennuksen palautusta ei ole.
 Pelkkä vaatimusten tarkistus:
 
 ```sh
-python3 puhuri2-1.2.4-adb-installer/install-puhuri-adb.py check
+python3 puhuri2-1.2.5-adb-installer/install-puhuri-adb.py check
 ```
 
 Jos laitteita on useita, lisää `--serial SERIAL`. ZIPin SHA256SUMS sisältää sen
@@ -100,7 +100,7 @@ Tunnetut harmittomat allekirjoitus-, poistokoukku- ja piilotetun daemon-kuvakkee
 sekä tekniset välitulosteet suodatetaan. Muut varoitukset ja virheet näkyvät;
 epäonnistumisessa näytetään myös suodatettuja lisätietoja. Poistokoukkujen
 viestit piilotetaan vain, kun poiston lopputila on varmennettu. Kaikki tulosteet:
-`python3 puhuri2-1.2.4-adb-installer/install-puhuri-adb.py --verbose`.
+`python3 puhuri2-1.2.5-adb-installer/install-puhuri-adb.py --verbose`.
 Onnistuminen merkitään vihreällä OK:lla vasta lopputilan ja siivouksen jälkeen.
 
 Viestit ja ilmoitukset uudelleenkäynnistyksen jälkeen on aiemmin testattu

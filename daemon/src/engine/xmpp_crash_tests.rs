@@ -2276,3 +2276,315 @@ async fn upload_recovery_envelope_and_ratchet_rollback_then_replay_same_bytes() 
     let after=OmemoStore::open(dir.path()).unwrap().load_session("peer@test",peer_device).unwrap();
     assert_eq!(before,after,"stored stanza replay advanced the ratchet");
 }
+
+/// New-sender pre-key message survives consent without an outgoing message.
+#[test]
+fn first_contact_request_decrypts_after_approval_without_outgoing_message() {
+    let (dir, receiver, device) = install("first-contact-consent");
+    let bundle = receiver.bundle().unwrap();
+    let (_sender_dir, sender, sender_device) = install("first-contact-sender");
+    let envelope = sender.encrypt_message(
+        &[RecipientDevice { jid: "me@test".into(), device_id: device, bundle }],
+        b"first-contact-fixture",
+    ).unwrap();
+    drop(receiver);
+    let store = Arc::new(Store::open(dir.path()).unwrap());
+    let receiver = Omemo::open_shared(store.shared_db(), dir.path()).unwrap();
+    store.privacy_init("me@test").unwrap();
+    let shared = Arc::new(Shared {
+        status: Mutex::new(Status::default()),
+        events: Mutex::new(Vec::new()),
+        store_errors: AtomicU64::new(0),
+        roster: Mutex::new(HashMap::new()),
+        upload_service: Mutex::new(None),
+    });
+    let own: BareJid = "me@test".parse().unwrap();
+    let id = queue_fixture_inbox(&store, &envelope);
+    let row = store.pending_stanzas("me@test", 1).unwrap().remove(0);
+    let Stanza::Message(raw) = inbox::parse(&row).unwrap() else { panic!("not a message") };
+    assert!(!admit_stanza_with_inbox(&raw, &own, &store, &shared, row.received_at, Some(id)).unwrap());
+    assert_eq!(store.privacy_requests("me@test").unwrap().len(), 1);
+    assert!(store.messages("sender@test", 10).is_empty());
+    assert!(!receiver.has_session("sender@test", sender_device).unwrap());
+    store.privacy_set_contact("me@test", "sender@test", "approved").unwrap();
+    assert_eq!(store.privacy_requeue_ready("me@test").unwrap(), 1);
+    let row = store.pending_stanzas("me@test", 1).unwrap().remove(0);
+    let Stanza::Message(raw) = inbox::parse(&row).unwrap() else { panic!("not a message") };
+    assert!(admit_stanza_with_inbox(&raw, &own, &store, &shared, row.received_at, Some(row.id)).unwrap());
+    inbox::message(raw, &row, &own, &store, &shared, Some(&receiver), &mut Vec::new()).unwrap();
+    let messages = store.messages("sender@test", 10);
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].text, "first-contact-fixture");
+    assert!(!messages[0].outgoing);
+    assert!(receiver.has_session("sender@test", sender_device).unwrap());
+    assert!(store.pending_stanzas("me@test", 1).unwrap().is_empty());
+    assert!(store.privacy_requests("me@test").unwrap().is_empty());
+}
+
+fn recovery_shared() -> Arc<Shared> {
+    Arc::new(Shared { status:Mutex::new(Status::default()),events:Mutex::new(Vec::new()),
+        store_errors:AtomicU64::new(0),roster:Mutex::new(HashMap::new()),upload_service:Mutex::new(None) })
+}
+fn recovery_receive(store:&Arc<Store>, receiver:&Omemo, envelope:&omemo_xml::Encrypted, message_id:&str) {
+    let mut raw=ParsedMessage::chat(None);
+    raw.from=Some("sender@test".parse().unwrap());
+    raw.id=Some(xmpp_parsers::message::Id(message_id.into()));
+    raw.payloads.push(encrypted_element(envelope));
+    let id=queue_fixture_inbox(store,envelope);
+    // Replace the synthetic row XML to keep stable stanza ids during retries.
+    store.shared_db().lock().execute("UPDATE xmpp_inbox SET xml=?1 WHERE id=?2",rusqlite::params![stanza_xml(&raw),id]).unwrap();
+    let row=store.pending_stanzas("me@test",100).unwrap().into_iter().find(|r|r.id==id).unwrap();
+    inbox::message(raw,&row,&"me@test".parse().unwrap(),store,&recovery_shared(),Some(receiver),&mut Vec::new()).unwrap();
+}
+
+#[test]
+fn omemo_recovery_missing_device_sends_only_key_transport_then_receives_reply() {
+    let (_old_dir,old,old_device)=install("old-recipient");
+    let (dir,receiver,device)=install("new-recipient");
+    let (_sender_dir,sender,sender_device)=install("remote-first-contact");
+    let wrong=sender.encrypt_message(&[RecipientDevice{jid:"me@test".into(),device_id:old_device,bundle:old.bundle().unwrap()}],b"old-device-only").unwrap();
+    let receiver_bundle=receiver.bundle().unwrap();
+    drop(receiver);
+    let store=Arc::new(Store::open(dir.path()).unwrap());
+    let receiver=Omemo::open_shared(store.shared_db(),dir.path()).unwrap();
+    store.privacy_set_contact("me@test","sender@test","approved").unwrap();
+    recovery_receive(&store,&receiver,&wrong,"first-wrong");
+    assert!(store.pending_stanzas("me@test",10).unwrap().is_empty());
+    assert!(store.messages("sender@test",10)[0].text.contains("ei salattu tälle laitteelle"));
+    let retained:String=store.shared_db().lock().query_row("SELECT xml FROM omemo_failed",[],|r|r.get(0)).unwrap();
+    assert!(retained.contains("encrypted"));
+    receiver.remember_bundle("sender@test",&sender.bundle().unwrap()).unwrap();
+    assert!(store.reserve_omemo_repair("me@test","sender@test",sender_device,1000).unwrap());
+    omemo_recovery::queue_control(&receiver,&store,&"me@test".parse().unwrap(),&"sender@test".parse().unwrap(),sender_device).unwrap();
+    let job=store.omemo_repairs("me@test",1000).unwrap().pop().unwrap();
+    let xml=job.xml.unwrap();
+    assert!(!xml.contains("<body"));
+    let mut message=ParsedMessage::try_from(xml.parse::<xmpp_parsers::minidom::Element>().unwrap()).unwrap();
+    let envelope=message.extract_valid_payload::<omemo_xml::Encrypted>().unwrap();
+    assert!(envelope.payload.is_none());
+    let decoded=sender.decrypt_and_store("me@test",&envelope,|_,_|Ok(())).unwrap();
+    assert!(decoded.is_none());
+    let reply=sender.encrypt_message(&[RecipientDevice{jid:"me@test".into(),device_id:device,bundle:receiver_bundle}],b"response-after-handshake").unwrap();
+    recovery_receive(&store,&receiver,&reply,"working-response");
+    assert!(store.messages("sender@test",10).iter().any(|m|m.text=="response-after-handshake"));
+    assert!(store.messages("sender@test",10).iter().all(|m|!m.outgoing));
+    assert!(store.is_omemo_retry("me@test",store.pending_stanzas("me@test",10).unwrap()[0].id).unwrap());
+    // Original was encrypted to a different device: do not claim it recovered.
+    let row=store.pending_stanzas("me@test",1).unwrap().remove(0);
+    let Stanza::Message(raw)=inbox::parse(&row).unwrap() else{panic!("not message")};
+    inbox::message(raw,&row,&"me@test".parse().unwrap(),&store,&recovery_shared(),Some(&receiver),&mut Vec::new()).unwrap();
+    assert_eq!(store.messages("sender@test",10).len(),2);
+}
+
+#[test]
+fn omemo_recovery_missing_session_survives_restart_and_bounds_retries() {
+    let (dir,receiver,device)=install("delayed-prekey-recipient");
+    let (_sender_dir,sender,sender_device)=install("delayed-prekey-sender");
+    let target=RecipientDevice{jid:"me@test".into(),device_id:device,bundle:receiver.bundle().unwrap()};
+    let first=sender.encrypt_message(std::slice::from_ref(&target),b"first-prekey").unwrap();
+    // Obtain an ordinary Signal message from the established sender session,
+    // modelling an out-of-order arrival after a pre-key acknowledgement.
+    // A raw normal message requires a matching receiver session to exist.
+    // Decode first in a separate snapshot to acknowledge at the sender, then
+    // delete only the synthetic receiver session before delivering the reply.
+    receiver.decrypt_and_store("sender@test",&first,|_,_|Ok(())).unwrap();
+    let ack=receiver.encrypt_message(&[RecipientDevice{jid:"sender@test".into(),device_id:sender_device,bundle:sender.bundle().unwrap()}],b"ack-fixture").unwrap();
+    sender.decrypt_and_store("me@test",&ack,|_,_|Ok(())).unwrap();
+    let normal=sender.encrypt_message(std::slice::from_ref(&target),b"normal-ciphertext").unwrap();
+    drop(receiver);
+    let store=Arc::new(Store::open(dir.path()).unwrap());
+    store.shared_db().lock().execute("DELETE FROM sessions WHERE name='sender@test'",[]).unwrap();
+    let receiver=Omemo::open_shared(store.shared_db(),dir.path()).unwrap();
+    store.privacy_set_contact("me@test","sender@test","approved").unwrap();
+    recovery_receive(&store,&receiver,&normal,"sessionless");
+    assert!(store.messages("sender@test",10)[0].text.contains("salausistunto puuttuu"));
+    assert_eq!(store.shared_db().lock().query_row("SELECT reason FROM omemo_failed",[],|r|r.get::<_,String>(0)).unwrap(),"missing_session");
+    // A successful new pre-key cannot necessarily decrypt old ciphertext:
+    // instead verify a retained failure survives restart and bounds retry.
+    drop(receiver);drop(store);
+    let store=Store::open(dir.path()).unwrap();
+    assert_eq!(store.shared_db().lock().query_row("SELECT count(*) FROM omemo_failed",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    store.retry_omemo_peer("me@test","sender@test",sender_device).unwrap();
+    store.retry_omemo_peer("me@test","sender@test",sender_device).unwrap();
+    store.retry_omemo_peer("me@test","sender@test",sender_device).unwrap();
+    assert_eq!(store.pending_stanzas("me@test",10).unwrap().len(),1);
+    assert_eq!(store.shared_db().lock().query_row("SELECT retries FROM omemo_failed",[],|r|r.get::<_,i64>(0)).unwrap(),2);
+}
+
+#[test]
+fn omemo_recovery_retry_replaces_notice_atomically_without_extra_unread() {
+    let (dir,receiver,device)=install("retry-replacement");
+    let (_sender_dir,sender,_)=install("retry-replacement-sender");
+    let sender_device=sender.device_id().unwrap();
+    let envelope=sender.encrypt_message(&[RecipientDevice{jid:"me@test".into(),device_id:device,bundle:receiver.bundle().unwrap()}],b"recovered-first-message").unwrap();
+    drop(receiver);
+    let store=Arc::new(Store::open(dir.path()).unwrap());
+    let receiver=Omemo::open_shared(store.shared_db(),dir.path()).unwrap();
+    store.privacy_set_contact("me@test","sender@test","approved").unwrap();
+    let prekeys:Vec<(i64,Vec<u8>)>={
+        let db=store.shared_db();let lock=db.lock();
+        let mut stmt=lock.prepare("SELECT id,record FROM pre_keys").unwrap();
+        stmt.query_map([],|r|Ok((r.get(0)?,r.get(1)?))).unwrap().collect::<Result<Vec<_>,_>>().unwrap()
+    };
+    store.shared_db().lock().execute("DELETE FROM pre_keys",[]).unwrap();
+    recovery_receive(&store,&receiver,&envelope,"retained-initial");
+    assert!(store.messages("sender@test",10)[0].text.contains("salausavain"));
+    let unread=store.conversations()[0].unread;
+    // Restore only the deliberately removed SYNTHETIC fixture prekeys.
+    for (id,record) in prekeys {store.shared_db().lock().execute("INSERT INTO pre_keys(id,record) VALUES (?1,?2)",rusqlite::params![id,record]).unwrap();}
+    store.retry_omemo_peer("me@test","sender@test",sender_device).unwrap();
+    let row=store.pending_stanzas("me@test",1).unwrap().remove(0);
+    let Stanza::Message(raw)=inbox::parse(&row).unwrap() else{panic!("not message")};
+    // Failed inbox completion must roll the plaintext AND ratchet back,
+    // leaving both the original ciphertext and placeholder intact.
+    store.shared_db().lock().execute_batch("CREATE TRIGGER refuse_recovery_finish BEFORE DELETE ON xmpp_inbox BEGIN SELECT RAISE(FAIL,'fixture'); END;").unwrap();
+    assert!(inbox::message(raw.clone(),&row,&"me@test".parse().unwrap(),&store,&recovery_shared(),Some(&receiver),&mut Vec::new()).is_err());
+    assert!(store.messages("sender@test",10)[0].text.contains("salausavain"));
+    assert!(store.is_omemo_retry("me@test",row.id).unwrap());
+    store.shared_db().lock().execute_batch("DROP TRIGGER refuse_recovery_finish").unwrap();
+    inbox::message(raw,&row,&"me@test".parse().unwrap(),&store,&recovery_shared(),Some(&receiver),&mut Vec::new()).unwrap();
+    let messages=store.messages("sender@test",10);
+    assert_eq!(messages.len(),1);
+    assert_eq!(messages[0].text,"recovered-first-message");
+    assert_eq!(store.conversations()[0].unread,unread);
+    assert!(!store.is_omemo_retry("me@test",row.id).unwrap());
+    assert!(store.pending_stanzas("me@test",1).unwrap().is_empty());
+}
+
+#[test]
+fn omemo_recovery_is_consent_gated_rate_limited_and_ciphertext_replayed() {
+    let (dir,receiver,device)=install("recovery-policy");
+    let (_sender_dir,sender,sender_device)=install("recovery-policy-sender");
+    let mut envelope=sender.encrypt_message(&[RecipientDevice{jid:"me@test".into(),device_id:device,bundle:receiver.bundle().unwrap()}],b"fixture").unwrap();
+    envelope.header.keys.clear(); // Missing recipient key: retain and repair.
+    drop(receiver);
+    let store=Arc::new(Store::open(dir.path()).unwrap());
+    let receiver=Omemo::open_shared(store.shared_db(),dir.path()).unwrap();
+    receiver.remember_bundle("sender@test",&sender.bundle().unwrap()).unwrap();
+    store.privacy_set_contact("me@test","sender@test","approved").unwrap();
+    recovery_receive(&store,&receiver,&envelope,"policy-fixture");
+    assert!(store.reserve_omemo_repair("me@test","sender@test",sender_device,1000).unwrap());
+    assert!(!store.reserve_omemo_repair("me@test","sender@test",sender_device,1001).unwrap());
+    omemo_recovery::queue_control(&receiver,&store,&"me@test".parse().unwrap(),&"sender@test".parse().unwrap(),sender_device).unwrap();
+    let xml=store.omemo_repairs("me@test",1001).unwrap()[0].xml.clone().unwrap();
+    assert!(!store.reserve_omemo_repair("me@test","sender@test",sender_device,2000).unwrap());
+    drop(receiver);drop(store);
+    let store=Arc::new(Store::open(dir.path()).unwrap());
+    assert_eq!(store.omemo_repairs("me@test",2000).unwrap()[0].xml.as_deref(),Some(xml.as_str()));
+    store.finish_omemo_control("me@test","sender@test",sender_device,"wrong ciphertext").unwrap();
+    assert!(store.omemo_repairs("me@test",2000).unwrap()[0].xml.is_some());
+    store.finish_omemo_control("me@test","sender@test",sender_device,&xml).unwrap();
+    assert!(store.reserve_omemo_repair("me@test","sender@test",sender_device,2000).unwrap());
+    assert!(!store.reserve_omemo_repair("me@test","sender@test",sender_device,3000).unwrap());
+    store.retry_omemo_peer("me@test","sender@test",sender_device).unwrap();
+    assert_eq!(store.pending_stanzas("me@test",10).unwrap().len(),1);
+    store.privacy_set_contact("me@test","sender@test","blocked").unwrap();
+    assert!(store.pending_stanzas("me@test",10).unwrap().is_empty());
+    let receiver=Omemo::open_shared(store.shared_db(),dir.path()).unwrap();
+    assert!(omemo_recovery::queue_control(&receiver,&store,&"me@test".parse().unwrap(),&"sender@test".parse().unwrap(),sender_device).is_err());
+    assert!(store.omemo_repairs("me@test",3000).unwrap().is_empty());
+}
+
+#[test]
+fn omemo_recovery_refuses_changed_identity_and_rolls_back_control_failure() {
+    let (dir,receiver,device)=install("recovery-trust");
+    let (_remote,sender,sender_device)=install("recovery-trust-remote");
+    let mut envelope=sender.encrypt_message(&[RecipientDevice{jid:"me@test".into(),device_id:device,bundle:receiver.bundle().unwrap()}],b"fixture").unwrap();
+    envelope.header.keys.clear();drop(receiver);
+    let store=Arc::new(Store::open(dir.path()).unwrap());
+    let receiver=Omemo::open_shared(store.shared_db(),dir.path()).unwrap();
+    store.privacy_set_contact("me@test","sender@test","approved").unwrap();
+    recovery_receive(&store,&receiver,&envelope,"trust-fixture");
+    receiver.remember_bundle("sender@test",&sender.bundle().unwrap()).unwrap();
+    store.shared_db().lock().execute_batch("CREATE TRIGGER refuse_control BEFORE UPDATE OF xml ON omemo_repairs BEGIN SELECT RAISE(FAIL,'fixture'); END;").unwrap();
+    assert!(omemo_recovery::queue_control(&receiver,&store,&"me@test".parse().unwrap(),&"sender@test".parse().unwrap(),sender_device).is_err());
+    assert!(!receiver.has_session("sender@test",sender_device).unwrap());
+    store.shared_db().lock().execute_batch("DROP TRIGGER refuse_control").unwrap();
+    let key_store=OmemoStore::open_shared(store.shared_db(),dir.path()).unwrap();
+    let conflicting=vec![5u8;33];
+    key_store.save_identity("sender@test",sender_device,&conflicting).unwrap();
+    assert!(omemo_recovery::queue_control(&receiver,&store,&"me@test".parse().unwrap(),&"sender@test".parse().unwrap(),sender_device).is_err());
+    assert_eq!(key_store.trusted_identity("sender@test",sender_device).unwrap(),Some(conflicting));
+    assert!(!receiver.has_session("sender@test",sender_device).unwrap());
+    assert!(store.omemo_repairs("me@test",1000).unwrap()[0].xml.is_none());
+}
+
+#[test]
+fn omemo_recovery_additive_v12_upgrade_preserves_data_without_phone_archive() {
+    let dir=Dir::new("recovery-migration");
+    let store=Store::open(dir.path()).unwrap();
+    store.shared_db().lock().execute_batch("INSERT INTO conversations(id,name) VALUES ('fixture@test','Fixture'); DROP TABLE omemo_failed; DROP TABLE omemo_repairs; PRAGMA user_version=12;").unwrap();
+    drop(store);
+    let store=Store::open(dir.path()).unwrap();
+    assert_eq!(store.conversations().len(),1);
+    assert_eq!(store.shared_db().lock().query_row("PRAGMA user_version",[],|r|r.get::<_,i64>(0)).unwrap(),13);
+    assert!(std::fs::read_dir(dir.path()).unwrap().all(|p|!p.unwrap().file_name().to_string_lossy().contains("backup-v12")));
+    assert!(store.omemo_repairs("me@test",1000).unwrap().is_empty());
+}
+
+#[test]
+fn omemo_recovery_delete_does_not_resurrect_retained_message() {
+    for entire_conversation in [false,true] {
+        let (dir,receiver,device)=install("recovery-delete");
+        let (_remote,sender,sender_device)=install("recovery-delete-remote");
+        let mut envelope=sender.encrypt_message(&[RecipientDevice{jid:"me@test".into(),device_id:device,bundle:receiver.bundle().unwrap()}],b"fixture").unwrap();
+        envelope.header.keys.clear();drop(receiver);
+        let store=Arc::new(Store::open(dir.path()).unwrap());
+        let receiver=Omemo::open_shared(store.shared_db(),dir.path()).unwrap();
+        store.privacy_set_contact("me@test","sender@test","approved").unwrap();
+        recovery_receive(&store,&receiver,&envelope,"deleted-fixture");
+        store.retry_omemo_peer("me@test","sender@test",sender_device).unwrap();
+        if entire_conversation {store.delete_conversation("sender@test");}
+        else {let id=store.messages("sender@test",10)[0].id.clone();assert!(store.delete_message("sender@test",&id).is_some());}
+        assert!(store.messages("sender@test",10).is_empty());
+        assert!(store.pending_stanzas("me@test",10).unwrap().is_empty());
+        assert_eq!(store.shared_db().lock().query_row("SELECT count(*) FROM omemo_failed",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        assert!(store.omemo_repairs("me@test",1000).unwrap().is_empty());
+    }
+}
+
+#[test]
+fn omemo_recovery_archive_retry_and_attachment_replacement_keep_one_row() {
+    for attachment in [false,true] {
+        let (dir,receiver,device)=install("recovery-archive");
+        let (_remote,sender,sender_device)=install("recovery-archive-remote");
+        let attachment_payload=format!("aesgcm://example.test/file#{}","00".repeat(44));
+        let payload=if attachment {attachment_payload.as_str()} else {"archive-recovered"};
+        let envelope=sender.encrypt_message(&[RecipientDevice{jid:"me@test".into(),device_id:device,bundle:receiver.bundle().unwrap()}],payload.as_bytes()).unwrap();
+        drop(receiver);
+        let store=Arc::new(Store::open(dir.path()).unwrap());
+        let receiver=Omemo::open_shared(store.shared_db(),dir.path()).unwrap();
+        store.privacy_set_contact("me@test","sender@test","approved").unwrap();
+        let prekeys:Vec<(i64,Vec<u8>)>={
+            let db=store.shared_db();let lock=db.lock();let mut stmt=lock.prepare("SELECT id,record FROM pre_keys").unwrap();
+            stmt.query_map([],|r|Ok((r.get(0)?,r.get(1)?))).unwrap().collect::<Result<Vec<_>,_>>().unwrap()
+        };
+        store.shared_db().lock().execute("DELETE FROM pre_keys",[]).unwrap();
+        let query=store.register_mam_query("me@test",None,false).unwrap();
+        let content=encrypted_element(&envelope);let mut bytes=Vec::new();content.write_to(&mut bytes).unwrap();
+        let xml=format!("<message xmlns='jabber:client'><result xmlns='urn:xmpp:mam:2' queryid='{}' id='archive-fixture'><forwarded xmlns='urn:xmpp:forward:0'><delay xmlns='urn:xmpp:delay' stamp='2026-10-26T12:00:00Z'/><message xmlns='jabber:client' from='sender@test' to='me@test' id='recovery-archive'>{}</message></forwarded></result></message>",query.id,String::from_utf8(bytes).unwrap());
+        let raw=ParsedMessage::try_from(xml.parse::<xmpp_parsers::minidom::Element>().unwrap()).unwrap();
+        store.commit_transport_ingress("me@test",1000,Some(&Stanza::Message(raw.clone())),tokio_xmpp::stanzastream::IngressContext{jid:own_jid().into(),ready:false,state:tokio_xmpp::stanzastream::DetachedState{sm:None,pending:vec![]}}).unwrap();
+        let row=store.pending_stanzas("me@test",1).unwrap().remove(0);
+        let own:BareJid="me@test".parse().unwrap();
+        assert!(admit_stanza_with_inbox(&raw,&own,&store,&recovery_shared(),row.received_at,Some(row.id)).unwrap());
+        inbox::message(raw,&row,&own,&store,&recovery_shared(),Some(&receiver),&mut Vec::new()).unwrap();
+        assert!(store.is_omemo_retry("me@test",row.id).unwrap());
+        // The old archive query may already have finished and been cleaned.
+        store.shared_db().lock().execute("DELETE FROM xmpp_mam_inbox WHERE account='me@test' AND inbox_id=?1",[row.id]).unwrap();
+        store.shared_db().lock().execute("DELETE FROM xmpp_mam_queries WHERE account='me@test' AND query_id=?1",[query.id]).unwrap();
+        for (id,record) in prekeys {store.shared_db().lock().execute("INSERT INTO pre_keys(id,record) VALUES (?1,?2)",rusqlite::params![id,record]).unwrap();}
+        store.retry_omemo_peer("me@test","sender@test",sender_device).unwrap();
+        let row=store.pending_stanzas("me@test",1).unwrap().remove(0);
+        let Stanza::Message(raw)=inbox::parse(&row).unwrap() else{panic!("not message")};
+        assert!(admit_stanza_with_inbox(&raw,&own,&store,&recovery_shared(),row.received_at,Some(row.id)).unwrap());
+        let mut downloads=Vec::new();
+        inbox::message(raw,&row,&own,&store,&recovery_shared(),Some(&receiver),&mut downloads).unwrap();
+        let messages=store.messages("sender@test",10);
+        assert_eq!(messages.len(),1);
+        assert_eq!(store.conversations()[0].unread,1);
+        assert_eq!(downloads.len(),usize::from(attachment));
+        if !attachment {assert_eq!(messages[0].text,payload);}
+        assert!(!store.is_omemo_retry("me@test",row.id).unwrap());
+    }
+}

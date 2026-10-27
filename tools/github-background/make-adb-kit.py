@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""Package the computer-side ADB installer with the unchanged v1.2.0 payloads."""
+"""Package the computer-side ADB installer with the versioned application payloads."""
 import hashlib
 from pathlib import Path
 import shutil
@@ -8,18 +8,32 @@ import zipfile
 
 HERE = Path(__file__).resolve().parent
 PROJECT = HERE.parent.parent
-VERSION = '1.2.4'
+VERSION = '1.2.5'
+APP_VERSION = '1.2.4'
 OUTPUT = PROJECT / ('dist/puhuri2-' + VERSION + '-adb-installer')
 OUTPUT.mkdir(exist_ok=False)
 inputs = {
-    HERE / 'install-adb.py': 'install-puhuri-adb.py',
     HERE / 'ADB-README.en.md': 'README.md',
     HERE / 'ADB-OHJE.md': 'OHJE.md',
 }
 for name in ('LICENSE', 'THIRD_PARTY_NOTICES.md', 'THIRD_PARTY_LICENSES.txt'):
     inputs[PROJECT / name] = name
-for name in ('install-puhuri-1.2.0.py', 'fi.reijo.puhuri2_1.2.0_arm64.click', 'background-1.2.0.tar.gz'):
-    inputs[PROJECT / 'dist' / name] = name
+click = PROJECT / ('dist/fi.reijo.puhuri2_' + APP_VERSION + '_arm64.click')
+background = PROJECT / ('dist/background-' + APP_VERSION + '.tar.gz')
+click_hash = hashlib.sha256(click.read_bytes()).hexdigest()
+background_hash = hashlib.sha256(background.read_bytes()).hexdigest()
+def stamp(source):
+    return source.replace('1.2.0', APP_VERSION).replace(
+        '1f7a5efe839966f04ce14f08564b17d71de35f36cfd8f0989410dbd3bb544571', click_hash).replace(
+        '4ca739abda186a3d5253ff3eb814f32d750b7857b030a5edc67790df07db552b', background_hash)
+phone = stamp((HERE / 'install-release.py').read_text())
+(OUTPUT / ('install-puhuri-' + APP_VERSION + '.py')).write_text(phone)
+host = stamp((HERE / 'install-adb.py').read_text()).replace(
+    '22b80af0d51a72e4330ac94f8003e3167d176da15007c4429749daee7e9f18b6',
+    hashlib.sha256(phone.encode()).hexdigest())
+(OUTPUT / 'install-puhuri-adb.py').write_text(host)
+inputs[click] = click.name
+inputs[background] = background.name
 for source, name in inputs.items():
     shutil.copy2(source, OUTPUT / name)
 checksums = ''.join(hashlib.sha256(path.read_bytes()).hexdigest() + '  ' + path.name + '\n'

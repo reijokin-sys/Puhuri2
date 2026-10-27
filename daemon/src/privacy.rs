@@ -192,6 +192,14 @@ impl Store {
         tx.execute("INSERT INTO privacy_contacts(account,jid,state,server_sync) VALUES (?1,?2,?3,?4)
             ON CONFLICT(account,jid) DO UPDATE SET state=excluded.state,server_sync=excluded.server_sync", params![account,jid,state,sync]).map_err(|e| e.to_string())?;
         if state != "approved" {
+            let queued={
+                let mut stmt=tx.prepare("SELECT f.inbox_id FROM omemo_failed f JOIN xmpp_inbox i ON i.id=f.inbox_id AND i.account=f.account WHERE f.account=?1 AND f.peer=?2").map_err(|_|"OMEMO-poiston luku epäonnistui")?;
+                let rows=stmt.query_map(params![account,jid],|r|r.get::<_,i64>(0)).map_err(|_|"OMEMO-poiston luku epäonnistui")?;
+                rows.collect::<Result<Vec<_>,_>>().map_err(|_|"OMEMO-poiston luku epäonnistui")?
+            };
+            for id in queued { Self::finish_stanza_in(&tx,account,id)?; }
+            tx.execute("DELETE FROM omemo_repairs WHERE account=?1 AND peer=?2",params![account,jid]).map_err(|_|"OMEMO-palautumispyynnön poisto epäonnistui")?;
+            tx.execute("DELETE FROM omemo_failed WHERE account=?1 AND peer=?2",params![account,jid]).map_err(|_|"OMEMO-palautumisviestien poisto epäonnistui")?;
             tx.execute(
                 "DELETE FROM message_requests WHERE account=?1 AND jid=?2",
                 params![account, jid],
@@ -290,6 +298,7 @@ impl Store {
                 params![account, jid, xml, ts],
             )
             .map_err(|e| e.to_string())?;
+        if added > 0 && count == 0 {Self::record_request_notice_in(db,account)?;}
         Ok(added > 0)
     }
 

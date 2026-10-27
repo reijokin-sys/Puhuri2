@@ -15,8 +15,8 @@ import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
-LAUNCHER = ROOT / 'dist/install-puhuri-1.2.4.sh'
-ARCHIVE = ROOT / 'dist/puhuri2-1.2.4-adb-installer.zip'
+LAUNCHER = ROOT / 'dist/install-puhuri-1.2.5.sh'
+ARCHIVE = ROOT / 'dist/puhuri2-1.2.5-adb-installer.zip'
 
 
 class LauncherTests(unittest.TestCase):

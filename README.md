@@ -6,9 +6,16 @@ and English interfaces and three colour themes. Offline recovery depends on
 your XMPP server retaining messages.
 
 **Install from a COMPUTER with an authorized ADB connection to the PHONE.**
-This release contains installer **1.2.4** for the unchanged Puhuri 2 **1.2.0**
+This release contains installer **1.2.5** for Puhuri 2 **1.2.4**
 application and background services. It replaces the withdrawn phone-side
 installation instructions. This is a GitHub distribution, not an OpenStore release.
+
+## Changes in this release
+
+- New black/green P icon.
+- First-contact OMEMO recovery after accepting a message request.
+- Generic notifications for new message requests before approval.
+- Retains the one-choice install/update, remove and exit menu.
 
 ## Requirements
 
@@ -20,6 +27,9 @@ installation instructions. This is a GitHub distribution, not an OpenStore relea
   the phone and keep the ordinary phone user session available. `adb devices`
   on the computer must list the phone as `device`. Close Puhuri 2 before installation.
 
+Updates from application 1.2.0 migrate local schema 12 to 13 without creating
+a phone backup. Older schemas and downgrades are refused. Account data is retained.
+
 No curl, apt installation or root filesystem remount is needed on the phone.
 All installation payloads are downloaded to the computer and transferred by ADB.
 
@@ -28,7 +38,7 @@ All installation payloads are downloaded to the computer and transferred by ADB.
 Run in the COMPUTER terminal as the normal user:
 
 ```sh
-curl -fsSL https://github.com/reijokin-sys/Puhuri2/releases/download/v1.2.4/install.sh | sh
+curl -fsSL https://github.com/reijokin-sys/Puhuri2/releases/download/v1.2.5/install.sh | sh
 ```
 
 The launcher prints “Downloading installer…”, downloads and verifies the complete
@@ -56,7 +66,7 @@ python3 install-puhuri-adb.py
 
 The installer verifies pinned SHA-256 hashes, transfers the click and background
 bundle to a private temporary phone directory, verifies the transfer, installs
-Puhuri 2 1.2.0 and enables two automatically started user services:
+Puhuri 2 1.2.4 and enables two automatically started user services:
 
 - `puhurid2.service`: persistent XMPP reception.
 - `puhuri2-indicator.service`: notifications and messaging-menu integration.
@@ -70,7 +80,7 @@ a temporary path if cleanup fails. Installation rollback is not automatic.
 Check dependencies without installing:
 
 ```sh
-python3 puhuri2-1.2.4-adb-installer/install-puhuri-adb.py check
+python3 puhuri2-1.2.5-adb-installer/install-puhuri-adb.py check
 ```
 
 For multiple devices add `--serial SERIAL`. SHA256SUMS inside the ZIP covers
@@ -97,7 +107,7 @@ Known harmless unsigned-click, removal-hook and hidden daemon desktop-entry warn
 routine diagnostics are filtered. Other warnings/errors remain visible; failed
 operations also replay suppressed details. Removal-hook diagnostics are hidden
 only after successful final-state verification. Show full output with:
-`python3 puhuri2-1.2.4-adb-installer/install-puhuri-adb.py --verbose`.
+`python3 puhuri2-1.2.5-adb-installer/install-puhuri-adb.py --verbose`.
 A green OK appears only after final-state verification and cleanup succeed.
 
 Incoming messages/notifications after reboot were previously tested on the

@@ -45,12 +45,43 @@ def notify(bus, body='Uusi viesti / New message'):
         'org.freedesktop.Notifications', '/org/freedesktop/Notifications',
         'org.freedesktop.Notifications', 'Notify', 'susssasa{sv}i',
         ('Puhuri 2', dbus.UInt32(0),
-         os.path.join(CLICK_ROOT, 'assets/puhuri.png'),
+         os.path.join(CLICK_ROOT, 'assets/puhuri-black-green.png'),
          'Puhuri 2', body, dbus.Array([], signature='s'),
          dbus.Dictionary({'sound-file': dbus.String(
              '/usr/share/sounds/lomiri/notifications/Sintonia.ogg'),
              'desktop-entry': dbus.String(DESKTOP_ID)},
              signature='sv'), dbus.Int32(5000)))
+
+
+def update_notifications(bus, indicator, state, rows, requests, enabled):
+    """Requests have their own durable watermark; never read sender/content."""
+    current = {str(row['id']): (int(row.get('unread') or 0),
+                               int(row.get('last_ts') or 0)) for row in rows}
+    count = int(requests.get('count') or 0)
+    sequence = int(requests.get('sequence') or 0)
+    emitted = int(requests.get('emitted') or 0)
+    visible = list(rows)
+    if count > 0:
+        visible.append({'id': 'requests://pending', 'kind': 'request',
+                        'unread': count, 'last_ts': int(requests.get('last_ts') or 0)})
+    total = sum(value[0] for value in current.values()) + count
+    newest = max((int(row.get('last_ts') or 0) for row in visible), default=0)
+    indicator.update(total if enabled else 0, newest, visible,
+                     request_revision=(requests.get('scope'), sequence))
+    if state['seen'] is not None and enabled:
+        if any(unread > state['seen'].get(key, (0, 0))[0]
+               for key, (unread, stamp) in current.items()):
+            notify(bus)
+            print('notification sent', flush=True)
+    if sequence > emitted:
+        if enabled and count > 0:
+            notify(bus, 'Uusi viestipyyntö / New message request')
+            print('request notification sent', flush=True)
+        # Do not acknowledge before a successful Notify. scope prevents an
+        # account switch from acknowledging a different account's request.
+        request('privacy.requests.notice.ack',
+                {'scope': requests['scope'], 'sequence': sequence})
+    state['seen'] = current
 
 
 def main():
@@ -98,20 +129,9 @@ def main():
             if not status.get('service_mode') and not status.get('connected'):
                 request('lifecycle.active', {'active': True})
             rows = request('conversations.indicator') or []
-            current = {str(row['id']): (int(row.get('unread') or 0),
-                                       int(row.get('last_ts') or 0)) for row in rows}
+            requests = request('privacy.requests.indicator') or {}
             enabled = bool(request('settings.get').get('notifications', True))
-            indicator.update(sum(value[0] for value in current.values()) if enabled else 0,
-                             max((value[1] for value in current.values()), default=0), rows)
-            if state['seen'] is not None and enabled:
-                changed = any(unread > state['seen'].get(key, (0, 0))[0]
-                              for key, (unread, stamp) in current.items())
-                if changed:
-                    notify(bus)
-                    print('notification sent', flush=True)
-            # Failed Notify leaves the previous snapshot intact for retry.
-            # Baseline existing unread messages silently on each start.
-            state['seen'] = current
+            update_notifications(bus, indicator, state, rows, requests, enabled)
         except Exception:
             # Do not log exception text: RPC/DBus errors may include data.
             if time.monotonic() - state['last_error'] > 30:

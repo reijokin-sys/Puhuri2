@@ -51,6 +51,21 @@ from pathlib import Path
 stage=Path(sys.argv[1]); token=sys.argv[2]; command=json.loads(sys.argv[3])
 verbose = False
 removing = 'remove' in command
+changing = removing or 'install' in command
+target_version = '1.2.0'
+cleanup_versions = {target_version}
+if changing:
+    try:
+        manifest = json.loads(Path('/opt/click.ubuntu.com/fi.reijo.puhuri2/current/.click/info/fi.reijo.puhuri2.manifest').read_text())
+        if not isinstance(manifest, dict):
+            manifest = {}
+        previous = manifest.get('version', '')
+        if manifest.get('name') == 'fi.reijo.puhuri2' and re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', previous):
+            cleanup_versions.add(previous)
+    except (OSError, ValueError, TypeError):
+        pass
+cleanup_version_pattern = '(?:' + '|'.join(re.escape(v) for v in sorted(cleanup_versions)) + ')'
+
 routine = {
     'Exact click already installed; updating background services only.',
     'Removing background services', 'Removing click application',
@@ -68,18 +83,20 @@ def is_routine(line):
         or text in ('Using staged fi.reijo.puhuri2_1.2.0_arm64.click',
                     'Using staged background-1.2.0.tar.gz')
         or re.fullmatch(r"\(process:[0-9]+\): lomiri-app-launch-WARNING \*\*: [0-9:.]+: Desktop file '/opt/click.ubuntu.com/\.click/users/[^/]+/fi\.reijo\.puhuri2/puhuri-daemon\.desktop' is set to not display, not copying", text))
-def is_removal_warning(line):
-    if not removing:
+def is_cleanup_warning(line):
+    if not changing:
         return False
     text=line.strip()
     patterns = (
-        r"Unable to find application for 'fi\.reijo\.puhuri2_puhuri(?:-daemon)?_1\.2\.0': Unable to get Click manifest for package: fi\.reijo\.puhuri2",
+        r"Unable to find application for 'fi\.reijo\.puhuri2_puhuri(?:-daemon)?_{version}': Unable to get Click manifest for package: fi\.reijo\.puhuri2",
         r"\*\* \(process:[0-9]+\): WARNING \*\*: [0-9:.]+: Unable to get the Click package directory for fi\.reijo\.puhuri2: fi\.reijo\.puhuri2 does not exist in any database for user [A-Za-z0-9_-]+",
         r"\*\* \(process:[0-9]+\): WARNING \*\*: [0-9:.]+: user\.vala:746: Error removing cache for 'fi\.reijo\.puhuri2': Error opening directory '/home/[^/]+/\.cache/fi\.reijo\.puhuri2': No such file or directory",
-        r"\*\* Message: [0-9:.]+: database\.vala:345: Removing /opt/click\.ubuntu\.com/fi\.reijo\.puhuri2/1\.2\.0",
-        r"ERROR: Error removing '/var/cache/apparmor/click_fi\.reijo\.puhuri2_puhuri(?:-daemon)?_1\.2\.0'",
+        r"\*\* Message: [0-9:.]+: database\.vala:345: Removing /opt/click\.ubuntu\.com/fi\.reijo\.puhuri2/{version}",
+        r"ERROR: Error removing '/var/cache/apparmor/click_fi\.reijo\.puhuri2_puhuri(?:-daemon)?_{version}'",
     )
-    return any(re.fullmatch(pattern, text) for pattern in patterns)
+    if re.fullmatch(r"\(process:[0-9]+\): lomiri-app-launch-WARNING \*\*: [0-9:.]+: Manifest 'fi\.reijo\.puhuri2' version '" + re.escape(target_version) + r"' doesn't match AppID version '" + cleanup_version_pattern + "'", text):
+        return True
+    return any(re.fullmatch(pattern.replace('{version}', cleanup_version_pattern), text) for pattern in patterns)
 # Only child program output is filtered. sudo still opens /dev/tty itself;
 # no terminal input/password is read, captured or stored by this wrapper.
 hidden=collections.deque(maxlen=40)
@@ -88,17 +105,17 @@ with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     pending = None
     for line in child.stdout:
         if pending is not None:
-            if line.strip() == 'what():  Unable to connect to user bus: The connection is closed':
+            if re.fullmatch(r'what\(\):\s+Unable to connect to user bus: The connection is closed', line.strip()):
                 hidden.extend((pending, line))
                 pending = None
                 continue
             print(pending, end='', flush=True)
             pending = None
-        if (not verbose and removing and
+        if (not verbose and changing and
                 line.strip() == "terminate called after throwing an instance of 'std::runtime_error'"):
             pending = line
             continue
-        if not verbose and (is_routine(line) or is_removal_warning(line)):
+        if not verbose and (is_routine(line) or is_cleanup_warning(line)):
             if line.strip(): hidden.append(line)
         else:
             print(line, end='', flush=True)

@@ -134,6 +134,12 @@ def discard_payload(value):
         shutil.rmtree(path)
 
 
+def schema_update_supported(previous, current):
+    # Only this additive, transaction-tested v12 -> v13 migration is allowed.
+    # It retains existing data/keys and creates no archive on the phone.
+    return previous == current or (previous, current) == (12, 13)
+
+
 def install():
     meta = metadata()
     root = installed_root(meta)
@@ -144,7 +150,7 @@ def install():
     old = snapshot([*units, FLAG, STATE])
     if old[STATE] is not None:
         previous = json.loads(old[STATE])
-        if previous.get('schema_version') != meta['schema_version']:
+        if not schema_update_supported(previous.get('schema_version'), meta['schema_version']):
             raise RuntimeError('Schema-changing update requires a separate migration plan')
     for path in units:
         if old[path] is not None and not old[path].startswith(MARK.encode()):

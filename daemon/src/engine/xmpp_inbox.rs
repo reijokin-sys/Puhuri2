@@ -63,7 +63,7 @@ pub(super) fn message(
     let thread = peer.to_string();
     let client_id = inner.id.as_ref().map(|id| id.0.clone());
     let server_id = server_stanza_id(&inner, own).or(archived);
-    if store.inbox_message_exists(
+    if !store.is_omemo_retry(&account, row.id)? && store.inbox_message_exists(
         &thread,
         server_id.as_deref(),
         if outgoing { client_id.as_deref() } else { None },
@@ -123,6 +123,7 @@ pub(super) fn message(
             outgoing,
         ) {
             Ok(OmemoOutcome::Stored(message)) => {
+                if !outgoing { store.retry_omemo_peer(&account,&thread,envelope.header.sid as i32)?; }
                 if outgoing {
                     shared.push(EngineEvent::StateChanged);
                 } else {
@@ -131,13 +132,39 @@ pub(super) fn message(
                 return Ok(());
             }
             Ok(_) => {
+                if !outgoing { store.retry_omemo_peer(&account,&thread,envelope.header.sid as i32)?; }
                 shared.push(EngineEvent::StateChanged);
                 return Ok(());
             }
             Err(super::super::omemo::ReceiveError::Store(error)) => return Err(error),
-            Err(super::super::omemo::ReceiveError::Decrypt(_)) => {
+            Err(super::super::omemo::ReceiveError::Decrypt(error)) => {
+                let device = envelope.header.sid as i32;
+                let own_device = omemo.device_id()? as u32;
+                let key = envelope.header.keys.iter().find(|key|key.rid==own_device);
+                let has_session = omemo.has_session(crypto_sender.as_str(),device)?;
+                let (reason,note,repair) = if key.is_none() {
+                    ("missing_recipient_key", "🔒 Tätä viestiä ei salattu tälle laitteelle. Pyydä lähettäjää lähettämään se uudelleen.", true)
+                } else if !key.unwrap().prekey && !has_session {
+                    ("missing_session", "🔒 Tämän viestin salausistunto puuttuu. Yhteyttä yritetään palauttaa; pyydä viesti tarvittaessa uudelleen.", true)
+                } else if error.is_unknown_prekey() {
+                    ("unknown_prekey", "🔒 Viestin salausavain ei ole enää käytettävissä. Pyydä lähettäjää lähettämään viesti uudelleen.", !has_session)
+                } else {
+                    ("decrypt_failed", "🔒 Salattua viestiä ei voitu purkaa. Pyydä lähettäjää lähettämään se uudelleen.", false)
+                };
+                // Log classifications only: no addresses, ids, raw XML or keys.
+                eprintln!("puhurid: OMEMO receive failure class={reason} code={}",error.code);
+                if !outgoing {
+                    let message=Message {
+                        id:format!("in-{ts}-{}",client_id.clone().unwrap_or_default()),
+                        thread:thread.clone(),outgoing:false,sender:name.clone(),text:note.into(),
+                        ts,delivered:false,state:crate::engine::message_state_complete(),attachment:None,
+                    };
+                    store.defer_omemo(&account,row,&thread,device,reason,repair,&message,&name,true,server_id.as_deref())?;
+                    shared.push(EngineEvent::MessageReceived(message));
+                    return Ok(());
+                }
                 receipt_eligible = false;
-                text = Some("🔒 Saapui salattu viesti, jota tämä laite ei voi purkaa.".to_string())
+                text = Some(note.to_string());
             }
         }
     }

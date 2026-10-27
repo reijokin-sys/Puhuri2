@@ -146,13 +146,17 @@ class ADBInstallerTests(unittest.TestCase):
 
 
 class ConciseOutputTests(unittest.TestCase):
-    def run_runner(self, code, verbose=False, removing=False):
+    def run_runner(self, code, verbose=False, removing=False, installing=False, target_version="1.2.0", previous_version=None):
         with tempfile.TemporaryDirectory() as stage:
-            runner = HOST.OPERATION_RUNNER
+            runner = HOST.OPERATION_RUNNER.replace("target_version = '1.2.0'", "target_version = " + repr(target_version))
+            manifest = Path(stage) / 'manifest.json'
+            if previous_version:
+                manifest.write_text(json.dumps({'name':'fi.reijo.puhuri2','version':previous_version}))
+            runner = runner.replace('/opt/click.ubuntu.com/fi.reijo.puhuri2/current/.click/info/fi.reijo.puhuri2.manifest', str(manifest))
             if verbose:
                 runner = runner.replace('verbose = False', 'verbose = True')
             result = subprocess.run([HOST.sys.executable, '-c', runner, stage, 'synthetic-token',
-                json.dumps([HOST.sys.executable, '-c', code] + (['remove'] if removing else []))], capture_output=True, text=True)
+                json.dumps([HOST.sys.executable, '-c', code] + (['remove'] if removing else (['install'] if installing else [])))], capture_output=True, text=True)
             record = json.loads((Path(stage) / 'operation-result.json').read_text())
             return result, record
 
@@ -194,6 +198,36 @@ class ConciseOutputTests(unittest.TestCase):
         self.assertIn('Error removing', result.stdout)
         result, _ = self.run_runner(code + '; raise SystemExit(7)', removing=True)
         self.assertIn('Error removing', result.stdout)
+
+    def test_new_version_removal_filters_escaped_version_patterns(self):
+        messages = [
+            "Unable to find application for 'fi.reijo.puhuri2_puhuri_1.2.1': Unable to get Click manifest for package: fi.reijo.puhuri2",
+            "Unable to find application for 'fi.reijo.puhuri2_puhuri-daemon_1.2.1': Unable to get Click manifest for package: fi.reijo.puhuri2",
+            "** Message: 10:17:27.118: database.vala:345: Removing /opt/click.ubuntu.com/fi.reijo.puhuri2/1.2.1",
+            "ERROR: Error removing '/var/cache/apparmor/click_fi.reijo.puhuri2_puhuri_1.2.1'",
+            "ERROR: Error removing '/var/cache/apparmor/click_fi.reijo.puhuri2_puhuri-daemon_1.2.1'",
+        ]
+        result, record = self.run_runner('print(' + repr('\n'.join(messages)) + ')', removing=True, target_version='1.2.1')
+        self.assertEqual('', result.stdout)
+        self.assertEqual(len(messages), len(record['suppressed']))
+
+    def test_upgrade_defers_only_known_previous_and_target_cleanup(self):
+        messages = [
+            "(process:6041): lomiri-app-launch-WARNING **: 10:16:52.305: Manifest 'fi.reijo.puhuri2' version '1.2.1' doesn't match AppID version '1.2.0'",
+            "terminate called after throwing an instance of 'std::runtime_error'",
+            "  what():  Unable to connect to user bus: The connection is closed",
+            "** Message: 10:16:52.492: database.vala:345: Removing /opt/click.ubuntu.com/fi.reijo.puhuri2/1.2.0",
+            "ERROR: Error removing '/var/cache/apparmor/click_fi.reijo.puhuri2_puhuri_1.2.0'",
+        ]
+        unexpected = "ERROR: Error removing '/var/cache/apparmor/click_fi.reijo.puhuri2_puhuri_9.9.9'"
+        code = 'print(' + repr('\n'.join(messages + [unexpected])) + ')'
+        result, record = self.run_runner(code, installing=True, target_version='1.2.1', previous_version='1.2.0')
+        self.assertEqual(unexpected + '\n', result.stdout)
+        self.assertEqual(len(messages), len(record['suppressed']))
+        result, _ = self.run_runner(code + '; raise SystemExit(7)', installing=True, target_version='1.2.1', previous_version='1.2.0')
+        self.assertEqual(7, result.returncode)
+        self.assertIn("Manifest 'fi.reijo.puhuri2'", result.stdout)
+        self.assertIn('The connection is closed', result.stdout)
 
     def test_postcondition_failure_replays_suppressed_details(self):
         phone = HOST.Phone('adb', 'synthetic-device')

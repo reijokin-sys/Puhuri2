@@ -833,6 +833,8 @@ pub struct RatchetError {
 }
 
 impl RatchetError {
+    pub fn is_unknown_prekey(&self) -> bool { self.code == ffi::SG_ERR_INVALID_KEY_ID }
+
     fn new(code: c_int) -> Self {
         Self {
             code,

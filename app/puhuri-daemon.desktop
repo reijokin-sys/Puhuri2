@@ -5,6 +5,6 @@ Terminal=false
 Name=Puhuri 2 message engine
 Comment=Message engine launched by Puhuri 2
 Exec=lib/aarch64-linux-gnu/bin/puhurid --engine xmpp
-Icon=assets/puhuri.png
+Icon=assets/puhuri-black-green.png
 NoDisplay=true
 X-Lomiri-Touch=true

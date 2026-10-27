@@ -175,5 +175,14 @@ class InstallerTests(unittest.TestCase):
                 self.assertTrue(all('--all-users' not in c.args[0] for c in run.call_args_list))
 
 
+class RecoveryMigrationPolicy(unittest.TestCase):
+    def test_only_additive_v12_to_v13_or_same_schema_is_supported(self):
+        manager = module('recovery_manager', 'manage.py')
+        self.assertTrue(manager.schema_update_supported(12, 13))
+        self.assertTrue(manager.schema_update_supported(13, 13))
+        for previous, current in [(13, 12), (11, 13), (13, 14), (None, 13)]:
+            self.assertFalse(manager.schema_update_supported(previous, current))
+
+
 if __name__ == '__main__':
     unittest.main()

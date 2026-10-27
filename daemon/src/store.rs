@@ -6,12 +6,18 @@
 //! service's data directory. Attachments live next to it under
 //! `attachments/`, also private to the user.
 
+#[path = "omemo_recovery.rs"]
+mod omemo_recovery;
+pub use omemo_recovery::OmemoRepair;
 #[path = "upload_jobs.rs"]
 mod upload_jobs;
 pub use upload_jobs::UploadJob;
 #[path = "iq_cache.rs"]
 mod iq_cache;
 pub use iq_cache::IqCacheQuery;
+#[path = "request_notice.rs"]
+mod request_notice;
+pub use request_notice::RequestNotice;
 #[path = "push_notice.rs"]
 mod push_notice;
 #[path = "privacy.rs"]
@@ -84,7 +90,8 @@ pub struct Store {
 /// * **10 - ordered MAM completion (2026-10-25)**: bounded result ledger and account cursor.
 /// * **11 - durable MAM final-IQ decisions (2026-10-25)**.
 /// * **12 - durable first-reception XEP-0184 reply ledger (2026-10-26)**.
-pub const SCHEMA_VERSION: i64 = 12;
+/// * **13 - bounded retained OMEMO failures and consent-gated key transport**.
+pub const SCHEMA_VERSION: i64 = 13;
 
 /// Open (or create) `puhuri.db` and bring its schema up to
 /// [`SCHEMA_VERSION`]. `Store` and `OmemoStore` both go through here, so they
@@ -132,7 +139,10 @@ pub(crate) fn open_db(data_dir: &Path) -> std::io::Result<Arc<Db>> {
     if version < SCHEMA_VERSION {
         // A database that was already there is copied aside first; a brand new
         // one has nothing to lose.
-        if existed {
+        // v12 -> v13 only adds recovery tables in the migration transaction.
+        // The user forbids phone archives; this additive upgrade needs no copy.
+        // Older, structural migrations retain their existing backup behaviour.
+        if existed && !(version == 12 && SCHEMA_VERSION == 13) {
             let stamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|duration| duration.as_secs())
@@ -226,6 +236,7 @@ fn upgrade_to_current(connection: &Connection) -> Result<(), String> {
                 .map_err(|error| error.to_string())?;
         }
         privacy::create_schema(connection)?;
+        omemo_recovery::create_schema(connection)?;
         handoff::create_schema(connection)?;
         mam_handoff::create_schema(connection)?;
         mam_page::create_schema(connection)?;
@@ -986,6 +997,21 @@ impl Store {
             .ok()
             .flatten();
         if let Some(message) = &message {
+            let cancelled=(|| -> Result<(),String> {
+                let ids={
+                    let mut stmt=transaction.prepare("SELECT f.account,f.inbox_id FROM omemo_failed f JOIN messages m ON m.id=f.notice_id WHERE m.thread=?1 AND m.ts=?2").map_err(|_|"OMEMO-poiston luku epäonnistui")?;
+                    let rows=stmt.query_map(params![thread,message.ts],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?))).map_err(|_|"OMEMO-poiston luku epäonnistui")?;
+                    rows.collect::<Result<Vec<_>,_>>().map_err(|_|"OMEMO-poiston luku epäonnistui")?
+                };
+                for (account,id) in ids {
+                    let pending:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM xmpp_inbox WHERE account=?1 AND id=?2)",params![account,id],|r|r.get(0)).map_err(|_|"OMEMO-poiston luku epäonnistui")?;
+                    if pending {Self::finish_stanza_in(&transaction,&account,id)?;}
+                }
+                transaction.execute("DELETE FROM omemo_failed WHERE notice_id IN (SELECT id FROM messages WHERE thread=?1 AND ts=?2)",params![thread,message.ts]).map_err(|_|"OMEMO-viestin poisto epäonnistui")?;
+                transaction.execute("DELETE FROM omemo_repairs WHERE peer=?1 AND NOT EXISTS(SELECT 1 FROM omemo_failed f WHERE f.account=omemo_repairs.account AND f.peer=omemo_repairs.peer AND f.device=omemo_repairs.device)",[thread]).map_err(|_|"OMEMO-palautumisen poisto epäonnistui")?;
+                Ok(())
+            })();
+            if cancelled.is_err() {return None;}
             if transaction
                 .execute(
                     "DELETE FROM messages WHERE thread = ?1 AND ts = ?2",
@@ -1022,6 +1048,24 @@ impl Store {
             Ok(transaction) => transaction,
             Err(_) => return removed,
         };
+        // Do not let retained encrypted rows resurrect a deleted conversation.
+        let deferred = (|| -> Result<(), rusqlite::Error> {
+            let ids = {
+                let mut stmt=transaction.prepare("SELECT account,inbox_id FROM omemo_failed WHERE peer=?1")?;
+                let rows=stmt.query_map([thread],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?)))?;
+                rows.collect::<Result<Vec<_>,_>>()?
+            };
+            for (account,id) in ids {
+                let pending:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM xmpp_inbox WHERE account=?1 AND id=?2)",params![account,id],|r|r.get(0))?;
+                if pending {
+                    Self::finish_stanza_in(&transaction,&account,id).map_err(|_|rusqlite::Error::InvalidQuery)?;
+                }
+            }
+            transaction.execute("DELETE FROM omemo_failed WHERE peer=?1",[thread])?;
+            transaction.execute("DELETE FROM omemo_repairs WHERE peer=?1",[thread])?;
+            Ok(())
+        })();
+        if deferred.is_err() {return removed;}
         let deleted = transaction
             .execute("DELETE FROM messages WHERE thread = ?1", params![thread])
             .and_then(|_| {
@@ -1175,6 +1219,8 @@ impl Store {
             "xmpp_mam_queries",
             "xmpp_mam_cursors",
             "delivery_receipts",
+            "omemo_failed",
+            "omemo_repairs",
             "xmpp_inbox",
             "xmpp_handoff",
             "identity",
@@ -2179,6 +2225,8 @@ fn message(id: &str, thread: &str, ts: i64, outgoing: bool, text: &str) -> Messa
             "read_markers",
             "encrypted_threads",
             "settings",
+            "omemo_failed",
+            "omemo_repairs",
             "identity",
             "identities",
             "sessions",
@@ -2192,6 +2240,9 @@ fn message(id: &str, thread: &str, ts: i64, outgoing: bool, text: &str) -> Messa
         {
             let connection = store.lock();
             for table in tables {
+                // Plain builds intentionally have no Signal/OMEMO key tables.
+                let exists: bool=connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",[table],|r|r.get(0)).unwrap();
+                if !cfg!(feature="omemo") && !exists {continue;}
                 let count: i64 = connection
                     .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get(0))
                     .unwrap();

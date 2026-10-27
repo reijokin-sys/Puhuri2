@@ -32,3 +32,9 @@ docs/artifacts/livewire-comparison-20261025/blocked-downloads/** -whitespace
 # Preserve upstream source reference and native release check output.
 docs/artifacts/release-1.2.0/click-user-reference.vala -whitespace
 docs/artifacts/release-1.2.0/*.log whitespace=-blank-at-eof,-blank-at-eol
+
+# Preserve exact distributed licence texts and archived initial kit bytes.
+dist/puhuri2-1.2.0-adb-installer/LICENSE -whitespace
+dist/puhuri2-1.2.0-adb-installer/THIRD_PARTY_LICENSES.txt -whitespace
+dist/tested-candidates/adb-kit-initial-20261026/** -whitespace
+docs/artifacts/adb-computer-installer-20261026/*.log whitespace=-blank-at-eof,-blank-at-eol

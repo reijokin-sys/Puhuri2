@@ -270,6 +270,17 @@ impl Server {
                     "blocking_status":self.store.privacy_blocking_status(&account)?,
                     "contacts":contacts,"requests":self.store.privacy_requests(&account)?}))
             }
+            "privacy.requests.indicator" => {
+                let account=self.privacy_account()?;
+                Ok(json!(self.store.request_notice_state(&account)?))
+            }
+            "privacy.requests.notice.ack" => {
+                let account=self.privacy_account()?;
+                let scope=arg_str(request,"scope")?;
+                let sequence=request.args.get("sequence").and_then(Value::as_i64).ok_or("Ilmoituslaskuri puuttuu")?;
+                self.store.acknowledge_request_notice(&account,&scope,sequence)?;
+                Ok(json!({"ok":true}))
+            }
             "privacy.mode" => {
                 let account = self.privacy_account()?;
                 self.store.privacy_set_mode(&account,&arg_str(request,"mode")?)?;

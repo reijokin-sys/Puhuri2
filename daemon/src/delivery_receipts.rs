@@ -76,7 +76,7 @@ impl Store {
             }
             let correlated: bool = db
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM xmpp_mam_inbox WHERE account=?1 AND inbox_id=?2)",
+                    "SELECT EXISTS(SELECT 1 FROM xmpp_mam_inbox WHERE account=?1 AND inbox_id=?2) OR EXISTS(SELECT 1 FROM omemo_failed WHERE account=?1 AND inbox_id=?2)",
                     params![account, inbox_id],
                     |r| r.get(0),
                 )

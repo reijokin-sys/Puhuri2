@@ -865,3 +865,24 @@ fn the_status_names_the_saved_account() {
     let status = result_of(call(&service.socket, 5, "status", json!({})));
     assert_eq!(status["account"], json!(null));
 }
+
+#[test]
+fn request_notification_rpc_exports_only_counters_and_scoped_ack() {
+    let service=start_options("request-notice",|store| {
+        store.privacy_queue("me@test","unapproved@test","<private-request-canary/>",100).unwrap();
+    },true);
+    result_of(call(&service.socket,1,"account.login",json!({"jid":"me@test","password":"synthetic"})));
+    let notice=result_of(call(&service.socket,2,"privacy.requests.indicator",json!({})));
+    assert_eq!(notice["count"],json!(1));
+    assert_eq!(notice["sequence"],json!(1));
+    assert_eq!(notice["emitted"],json!(0));
+    for private in ["unapproved@test","me@test","private-request-canary"] {assert!(!notice.to_string().contains(private));}
+    assert_eq!(notice.as_object().unwrap().len(),5);
+    let wrong=call(&service.socket,3,"privacy.requests.notice.ack",json!({"scope":"wrong-scope","sequence":1}));
+    assert!(!wrong.ok);
+    result_of(call(&service.socket,4,"privacy.requests.notice.ack",json!({"scope":notice["scope"],"sequence":1})));
+    let acked=result_of(call(&service.socket,5,"privacy.requests.indicator",json!({})));
+    assert_eq!(acked["emitted"],json!(1));
+    result_of(call(&service.socket,6,"privacy.contact",json!({"jid":"unapproved@test","action":"approve"})));
+    assert_eq!(result_of(call(&service.socket,7,"privacy.requests.indicator",json!({})))["count"],json!(0));
+}

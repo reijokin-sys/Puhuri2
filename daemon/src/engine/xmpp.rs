@@ -18,6 +18,9 @@ mod inbox;
 #[path = "xmpp_upload.rs"]
 mod upload_runtime;
 #[cfg(feature="omemo")]
+#[path="xmpp_omemo_recovery.rs"]
+mod omemo_recovery;
+#[cfg(feature="omemo")]
 #[path="xmpp_iq_cache.rs"]
 mod iq_cache;
 #[cfg(feature="omemo")]
@@ -771,7 +774,8 @@ fn receive_omemo_inbox_direction(
     outgoing: bool,
 ) -> Result<OmemoOutcome, super::omemo::ReceiveError> {
     if let Some(id) = server_id {
-        if store.has_stanza_id(thread, id) {
+        let retry = match inbox { Some((account,row)) => store.is_omemo_retry(account,row).map_err(super::omemo::ReceiveError::Store)?, None => false };
+        if !retry && store.has_stanza_id(thread, id) {
             if let Some((account, id)) = inbox {
                 store
                     .finish_pending_disposition(account, id)
@@ -815,7 +819,7 @@ fn receive_omemo_inbox_direction(
                     state: crate::engine::message_state_complete(),
                     attachment: None,
                 };
-                if let Some((account,_))=inbox {Store::record_inbox_notice_in(connection,account,&placeholder,unread)?;}
+                if let Some((account,id))=inbox {Store::prepare_omemo_replacement_in(connection,account,id,&placeholder.id)?;Store::record_inbox_notice_in(connection,account,&placeholder,unread)?;}
                 if let Some((account,id))=inbox { Store::queue_inbox_receipt_in(connection,account,id)?; }
                 Store::record_downloading_in(connection, &placeholder, name, &url, unread)?;
                 committed_downloads.push((sender.clone(), url, text, Some(row)));
@@ -835,7 +839,7 @@ fn receive_omemo_inbox_direction(
                 state: crate::engine::message_state_complete(),
                 attachment: None,
             };
-            if let Some((account,_))=inbox {Store::record_inbox_notice_in(connection,account,&message,unread)?;}
+            if let Some((account,id))=inbox {Store::prepare_omemo_replacement_in(connection,account,id,&message.id)?;Store::record_inbox_notice_in(connection,account,&message,unread)?;}
             if let Some((account,id))=inbox { Store::queue_inbox_receipt_in(connection,account,id)?; }
             Store::record_in(connection, &message, name, unread, server_id.as_deref())?;
             Ok(OmemoOutcome::Stored(message))
@@ -1563,14 +1567,19 @@ fn decide_stanza_admission(
     if let Some(result) = mam.as_ref() {
         let current_floor = store.mam_floor_checked()?;
         let floor = if let Some(id) = inbox_id {
-            let Some(query) = store.mam_inbox_query(&account, id)? else {
-                return Ok(StanzaAdmission::Discard);
-            };
-            if result.queryid.as_ref().map(|id| id.0.as_str()) != Some(query.id.as_str()) {
+            if let Some(query) = store.mam_inbox_query(&account, id)? {
+                if result.queryid.as_ref().map(|id| id.0.as_str()) != Some(query.id.as_str()) {
+                    return Ok(StanzaAdmission::Discard);
+                }
+                current_floor.max(query.floor)
+            } else if store.is_omemo_retry(&account,id)? {
+                // Original correlation was completed atomically on transfer
+                // into the retained ciphertext queue. Only that exact owned
+                // row may replay after the old query ledger is cleaned up.
+                current_floor
+            } else {
                 return Ok(StanzaAdmission::Discard);
             }
-            // A newer safety floor (e.g. after a key reset) still applies.
-            current_floor.max(query.floor)
         } else {
             current_floor
         };
@@ -1898,6 +1907,8 @@ async fn connection(
     // journal into noise - but the limitation is not hidden either.
     #[cfg(feature = "omemo")]
     let mut warned_no_stanza_id = false;
+    #[cfg(feature="omemo")]
+    let mut crypto_recovery = omemo_recovery::Recovery::default();
     let mut last_receipt = 0;
     while !stop {
         let receipt_pending = if online {
@@ -1907,6 +1918,13 @@ async fn connection(
             }
         } else { false };
         if online {
+            #[cfg(feature="omemo")]
+            if let Some(crypto) = omemo.as_ref() {
+                if let Err(message) = crypto_recovery.tick(&mut client,&jid,&store,&shared,crypto,&mut omemo_fetches,&mut omemo_fetch_counter).await {
+                    shared.push(EngineEvent::Error{code:"omemo_recovery".into(),message});
+                    end=SessionEnd::Wait(5);break;
+                }
+            }
             if !short_lived {
                 if let Err(message)=upload_runtime::resume(&mut client,&jid,&shared,&store,&mut uploads,&mut upload_counter,#[cfg(feature="omemo")] &omemo).await {
                     shared.push(EngineEvent::Error{code:"store".into(),message});end=SessionEnd::Wait(5);break;
@@ -1931,7 +1949,7 @@ async fn connection(
                 }
             }else{false};
             #[cfg(feature = "omemo")]
-            let fetch_pending = !omemo_fetches.is_empty() || blocking.needs_tick() || upload_pending || receipt_pending;
+            let fetch_pending = !omemo_fetches.is_empty() || blocking.needs_tick() || upload_pending || receipt_pending || crypto_recovery.pending();
             #[cfg(not(feature = "omemo"))]
             let fetch_pending = blocking.needs_tick() || upload_pending || receipt_pending;
             let event = tokio::select! {

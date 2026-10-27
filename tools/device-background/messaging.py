@@ -4,7 +4,9 @@ import dbus
 import dbus.service
 OBJECT_PATH = '/fi/reijo/puhuri/indicator'
 SOURCE_ID = 'inbox'
-def summary_text():
+def summary_text(kind=None):
+    if kind == 'request':
+        return 'Uusi viestipyyntö / New message request'
     return 'Uusi viesti / New message'
 
 class Indicator(dbus.service.Object):
@@ -21,6 +23,7 @@ class Indicator(dbus.service.Object):
         self._messages = {}
         self._newest = 0
         self._dismissed_until = 0
+        self._request_revision = None
 
     @staticmethod
     def _source_value(unread, newest):
@@ -45,7 +48,7 @@ class Indicator(dbus.service.Object):
             dbus.Array([], signature="v"),
             title,
             "",
-            summary_text(),
+            summary_text(conversation.get("kind")),
             dbus.Int64(max(newest, 0)),
             dbus.Array([], signature="a{sv}"),
             dbus.Boolean(True),
@@ -123,7 +126,10 @@ class Indicator(dbus.service.Object):
     def MessageRemoved(self, message_id):
         pass
 
-    def update(self, unread, newest, conversations=None):
+    def update(self, unread, newest, conversations=None, request_revision=None):
+        if request_revision is not None and request_revision != self._request_revision:
+            self._dismissed_until = 0
+            self._request_revision = request_revision
         self._newest = max(newest, 0)
         if unread <= 0 or self._newest <= self._dismissed_until:
             self._clear()

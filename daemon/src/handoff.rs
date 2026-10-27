@@ -320,6 +320,8 @@ impl Store {
             return Err("XMPP-jonon kuittaus vaatii käsittelytransaktion".into());
         }
         Self::complete_mam_inbox_in(db, account, id)?;
+        db.execute("DELETE FROM omemo_failed WHERE account=?1 AND inbox_id=?2", params![account,id])
+            .map_err(|_| "OMEMO-uusinnan kuittaus epäonnistui")?;
         let changed = db
             .execute(
                 "DELETE FROM xmpp_inbox WHERE account=?1 AND id=?2",
